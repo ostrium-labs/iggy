@@ -296,9 +296,9 @@ async fn fetch_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn fetch_unsupported_version_above_max_closes_connection() {
-    // Fetch v13+ response shape differs from the v12 encoder; a clamped body is unparsable.
+    // Above v18 there is no schema to encode a response at.
     assert!(
-        handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker())
+        handle_request(API_KEY_FETCH, 19, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "Fetch above encoder max must close rather than return a clamped body"

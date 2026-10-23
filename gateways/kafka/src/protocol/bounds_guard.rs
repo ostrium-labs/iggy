@@ -477,7 +477,10 @@ pub fn validate_fetch_shape(version: i16, body: &Bytes, max_frame_size: usize) -
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 12;
 
-    let _replica_id = c.read_i32()?;
+    if version <= 14 {
+        // v15 moves it into the tagged `ReplicaState` (KIP-903).
+        let _replica_id = c.read_i32()?;
+    }
     let _max_wait_ms = c.read_i32()?;
     let _min_bytes = c.read_i32()?;
     if version >= 3 {
@@ -497,7 +500,9 @@ pub fn validate_fetch_shape(version: i16, body: &Bytes, max_frame_size: usize) -
         c.legacy_array_count()?
     };
     for _ in 0..topics_count {
-        if flexible {
+        if version >= 13 {
+            c.skip(16)?; // topic_id replaces the name (KIP-516)
+        } else if flexible {
             c.compact_string(false)?;
         } else {
             c.legacy_string(false)?;
@@ -536,7 +541,14 @@ pub fn validate_fetch_shape(version: i16, body: &Bytes, max_frame_size: usize) -
             c.legacy_array_count_nullable()?
         };
         for _ in 0..forgotten_count {
-            if flexible {
+            if version >= 13 {
+                c.skip(16)?;
+                let partitions_count = c.compact_array_count()?;
+                for _ in 0..partitions_count {
+                    let _partition = c.read_i32()?;
+                }
+                c.tagged_fields()?;
+            } else if flexible {
                 c.compact_string(true)?;
                 let partitions_count = c.compact_array_count()?;
                 for _ in 0..partitions_count {

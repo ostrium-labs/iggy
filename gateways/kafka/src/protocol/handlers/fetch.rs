@@ -30,8 +30,8 @@ use iggy::prelude::{
 };
 use kafka_protocol::indexmap::IndexSet;
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
-use kafka_protocol::messages::{FetchRequest, FetchResponse};
-use kafka_protocol::protocol::Encodable;
+use kafka_protocol::messages::{FetchRequest, FetchResponse, TopicName};
+use kafka_protocol::protocol::{Encodable, StrBytes};
 use kafka_protocol::records::Record;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
@@ -50,7 +50,7 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_fetch_shape;
 use crate::protocol::handlers::{
     CODEC_OFF_WORKER_BYTES, COPY_OFF_WORKER_BYTES, decode_guarded, decode_request, encode_message,
-    off_worker, respond_or_close,
+    learn_topic_ids, off_worker, respond_or_close,
 };
 use crate::protocol::probe_board::{PROBE_INTERVAL, Snapshot, recent};
 use crate::records::{
@@ -60,8 +60,11 @@ use crate::records::{
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_FETCH,
     min_version: 4,
-    max_version: 12,
+    max_version: 18,
 };
+
+/// First version that names topics by id instead of by name (KIP-516).
+const TOPIC_ID_MIN_VERSION: i16 = 13;
 
 /// Longest wait. Leaves 2 s for the last probe and read, so a long wait does not end in 6.
 const MAX_WAIT: Duration = REQUEST_DEADLINE.saturating_sub(Duration::from_secs(2));
@@ -115,7 +118,7 @@ pub async fn handle(
         encode_error_response,
         "Fetch",
     );
-    let request = match decoded {
+    let mut request = match decoded {
         Ok(request) => request,
         Err(outcome) => return outcome,
     };
@@ -135,7 +138,13 @@ pub async fn handle(
         );
     }
 
-    let (responses, slot) = fetch(bridge, state, connection, &request).await;
+    let unnamed = if api_version >= TOPIC_ID_MIN_VERSION {
+        name_topics(state, bridge, &mut request).await
+    } else {
+        Vec::new()
+    };
+    let (mut responses, slot) = fetch(bridge, state, connection, &request).await;
+    responses.extend(unnamed);
     let record_bytes: usize = responses
         .iter()
         .flat_map(|topic| &topic.partitions)
@@ -148,6 +157,39 @@ pub async fn handle(
     // The slot covers the read and the encode. A slow socket must not hold it.
     drop(slot);
     respond_or_close(encoded, "Fetch")
+}
+
+/// From v13 a request names its topics by id. Gives each topic the name its id belongs to, and
+/// takes out the topics whose id no topic has, answered here with `UNKNOWN_TOPIC_ID` on each
+/// partition, as Kafka does. An id this gateway has not reported yet is looked up by listing the
+/// topics once.
+async fn name_topics(
+    state: &GatewayState,
+    bridge: &IggyBridge,
+    request: &mut FetchRequest,
+) -> Vec<FetchableTopicResponse> {
+    let ids = request.topics.iter().map(|topic| topic.topic_id);
+    let refusal = learn_topic_ids(state, bridge, ids, PROBE_WAIT).await;
+    let mut unnamed = Vec::new();
+    request.topics.retain_mut(|topic| {
+        if let Some(name) = state.topic_ids.name(&topic.topic_id) {
+            topic.topic = TopicName(StrBytes::from_string(name));
+            return true;
+        }
+        unnamed.push(
+            FetchableTopicResponse::default()
+                .with_topic_id(topic.topic_id)
+                .with_partitions(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|partition| refused(partition.partition, refusal))
+                        .collect(),
+                ),
+        );
+        false
+    });
+    unnamed
 }
 
 /// Well-formed Fetch response. Uses top-level `error_code` at v7+, or a single
@@ -180,6 +222,7 @@ pub fn encode_response(version: i16, req: &FetchRequest) -> Result<Bytes> {
         .map(|topic| {
             FetchableTopicResponse::default()
                 .with_topic(topic.topic.clone())
+                .with_topic_id(topic.topic_id)
                 .with_partitions(
                     topic
                         .partitions
@@ -1700,7 +1743,8 @@ fn group(
             open = Some(want.entry);
             responses.push(
                 FetchableTopicResponse::default()
-                    .with_topic(request.topics[want.entry].topic.clone()),
+                    .with_topic(request.topics[want.entry].topic.clone())
+                    .with_topic_id(request.topics[want.entry].topic_id),
             );
         }
         if let Some(response) = responses.last_mut() {

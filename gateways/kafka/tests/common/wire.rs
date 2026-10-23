@@ -395,7 +395,9 @@ pub fn build_fetch_empty_topics_request(version: i16) -> Bytes {
     let flexible = version >= 12;
     let mut enc = Encoder::with_capacity(64);
 
-    enc.write_i32(-1); // replica_id
+    if version <= 14 {
+        enc.write_i32(-1); // replica_id, a tagged `ReplicaState` from v15
+    }
     enc.write_i32(100); // max_wait_ms
     enc.write_i32(1); // min_bytes
     if version >= 3 {

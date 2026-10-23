@@ -27,7 +27,7 @@ use iggy_gateway_kafka::protocol::api::BrokerAdvertise;
 /// row against this one.
 pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (0, "Produce", 3, 9),
-    (1, "Fetch", 4, 12),
+    (1, "Fetch", 4, 18),
     (2, "ListOffsets", 1, 7),
     (3, "Metadata", 0, 13),
     (8, "OffsetCommit", 2, 9),
