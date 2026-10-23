@@ -271,9 +271,12 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
         // `OperationNotRetained` comes only from resolving the earlier operation that blocks a
         // call. That call was not sent, so unlike `RequestTooOld` a retry cannot write it twice.
+        // `LaneBlocked`: an earlier write of the same client is still in doubt, so this one was
+        // not sent. Retriable, as the earlier one's 7 was.
         IggyError::TransientNotCommitted
         | IggyError::OperationUncertain(_)
-        | IggyError::OperationNotRetained(_) => ERROR_REQUEST_TIMED_OUT,
+        | IggyError::OperationNotRetained(_)
+        | IggyError::LaneBlocked(_) => ERROR_REQUEST_TIMED_OUT,
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -307,6 +310,12 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
 mod tests {
     use super::*;
     use iggy::prelude::Identifier;
+
+    #[test]
+    fn lane_blocked_maps_to_request_timed_out() {
+        let err = BridgeError::Iggy(IggyError::LaneBlocked(42));
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
+    }
 
     #[test]
     fn stream_id_not_found_maps_to_unknown_topic_or_partition() {

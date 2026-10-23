@@ -229,6 +229,8 @@ each landed. Produce checks every batch that carries a producer id and a sequenc
 | A new epoch that does not start at 0 | 45 | No |
 | A producer with no state here (new, forgotten, or from before a restart) | as the send answers | Yes |
 | A retry of a batch whose send still runs | `REQUEST_TIMED_OUT` (7) | No |
+| A retry of a batch whose send Iggy never answered | `NONE` (0) once a replay proves it landed, 7 while the replay gets no answer either | Only by the replay, which Iggy applies at most once |
+| The batch after one whose send Iggy never answered | as the send answers, once a replay proves the earlier one landed; 45 if it was refused | Yes, after the earlier one |
 
 The rules are Kafka's (`ProducerAppendInfo.checkSequence`, `findDuplicateBatch`), and the oracle
 suite (`tests/oracle_wire_diff_tests.rs`, scenario `idempotent_producer`) checks them against
@@ -237,12 +239,43 @@ check and its send never race another batch of the same producer. The bridge rep
 send ended (`IggyBridge::send_records_observed`), also when it ends after its request answered 7,
 so the retry that follows is checked against the truth.
 
+### Sends in doubt (part 2)
+
+The SDK seams this document asked for above were built upstream in another shape. The SDK keeps
+one logical session per client across reconnects, and a mutation that left the client without an
+answer stays *retained* in its lane: the call ends with `OperationUncertain(op)`, later calls in
+that lane get `LaneBlocked(op)`, and `Client::resolve_operation(op, deadline)` replays the frozen
+frame, with its client id and request id, until Iggy answers (`core/sdk/src/driver.rs`,
+`core/sdk/src/session_owner/lanes.rs`). Iggy's `ClientTable` answers a replay of a request that
+already committed as a duplicate, so the frame lands at most once whatever the first send did. No
+SDK change is needed; the gateway had only to use it:
+
+- A send that ends with `OperationUncertain` leaves its batch *in doubt*, holding the operation
+  and the client that retains it (`bridge::InDoubt`). Before part 2 the bridge read that error as
+  a refusal, forgot the batch, and the retry wrote it again after the SDK replayed the first send
+  ahead of it: two copies.
+- A retry of a batch in doubt replays the retained request (`IggyBridge::resolve_send`) instead of
+  sending the batch. Landed: answered `NONE`; Iggy's answer to a replay names no offset, so the
+  base offset is `-1` (part 3 looks it up in the log). Refused: the batch is sent again. No answer
+  yet: 7, and the producer retries.
+- The batch after one in doubt replays it first, so it cannot land ahead of it, and is refused with
+  45 if the earlier one never landed. A send in doubt keeps its lane in the SDK, so only the newest
+  batch of a producer and partition can be in doubt.
+- A send of another batch that meets `LaneBlocked` and cannot resolve the blocker sent nothing,
+  and answers 7.
+
+`produce_real_bridge_tests.rs` (`given_a_send_in_doubt_that_landed_late_...`) holds the bridge's
+connection to Iggy in a relay until the SDK gives up on a send, lets the send land late, and
+checks that the producer's retry is answered without a second copy.
+
 What this does not close yet:
 
-- A send that ended without saying whether it landed (the connection to Iggy broke, or the send
-  was cut off at the slot limit) leaves its batch unknown. Its retry is written again, so that
-  one case stays at-least-once. Part 2 (the SDK seams above) closes it by replaying the send as
-  the same Iggy request.
+- A send whose request nothing keeps any more leaves its batch unknown: one cut off at the slot
+  limit (its client is closed), one whose Iggy session was replaced before the replay (the SDK
+  drops retained operations then), and one whose Produce session closed (idle for
+  `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS`, 10 minutes by default, far past a producer's 2 minute
+  `delivery.timeout.ms`). Its retry is written again, so those cases stay at-least-once. Part 3
+  narrows them by looking the batch up in the log.
 - State lives in the gateway's memory. After a restart, or on another gateway, a producer has no
   state and its next batch is accepted at any sequence, as Kafka accepts a producer whose state
   expired. Part 3 rebuilds state from the log.

@@ -266,10 +266,11 @@ Delivery through this gateway is **at-least-once**. In the Ostrium fork, an idem
 producer's retries are deduplicated and kept in order, as on Kafka: a retry of a batch that
 landed is answered with its offset and not written again, and a batch out of sequence is refused
 with `OUT_OF_ORDER_SEQUENCE_NUMBER` (45), which the Java producer relies on to keep one key's
-order. Two cases stay at-least-once: a retry of a send whose outcome the gateway never learned
-(its connection to Iggy broke during the send), and a retry that spans a gateway restart, since
-producer state is in memory. [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the rules and what
-closes the rest.
+order. A retry of a batch whose send Iggy never answered replays that same Iggy request, which
+Iggy deduplicates, so it is not written twice either. Two cases stay at-least-once: a retry of a
+send whose request the SDK no longer keeps (the send was cut off at the slot limit, or its Iggy
+session was replaced), and a retry that spans a gateway restart, since producer state is in
+memory. [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the rules and what closes the rest.
 
 Transactions are **not supported**, and will not be. AddPartitionsToTxn (24), AddOffsetsToTxn
 (25), EndTxn (26) and TxnOffsetCommit (28) are never advertised, so a conforming client never
