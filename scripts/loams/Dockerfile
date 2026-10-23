@@ -62,8 +62,11 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json \
 COPY . .
 COPY --from=web /web/build/static /app/web/build/static
 COPY --from=web /web/node_modules /app/web/node_modules
-# third-party-licenses.sh renders the web's npm licenses with Node.
+# third-party-licenses.sh renders the web's npm licenses with Node, npm and npx.
 COPY --from=web /usr/local/bin/node /usr/local/bin/node
+COPY --from=web /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 RUN cargo build --release --locked \
     --bin iggy-server --bin iggy --bin iggy-gateway-kafka && \
     cp target/release/iggy-server target/release/iggy target/release/iggy-gateway-kafka /app/
