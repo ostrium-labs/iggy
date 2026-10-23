@@ -1,3 +1,5 @@
+> **Ostrium Labs fork.** This is [ostrium-labs/iggy](https://github.com/ostrium-labs/iggy), a fork of [apache/iggy](https://github.com/apache/iggy) for Kafka wire compatibility work in `gateways/kafka/` for [Loams](https://github.com/ostrium-labs/loams). It is not an Apache release. See [docs/loams/README.md](docs/loams/README.md).
+
 <p align="center">
     <a href="https://trendshift.io/repositories/14204" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14204" alt="apache%2Figgy | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>

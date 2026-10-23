@@ -1,0 +1,142 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Ostrium Labs fork only (ostrium-labs/iggy, branch `loams`). Upstream's own
+# workflows are disabled in this fork (docs/loams/README.md); this one builds
+# and tests the Kafka gateway and nothing else, so the fork stays inside the
+# organisation's shared GitHub Actions concurrency.
+name: Loams Kafka gateway
+
+on:
+  pull_request:
+    branches: [loams]
+  push:
+    branches: [loams]
+  schedule:
+    # Nightly full run. Cron fires on the default branch, which is `loams`.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: loams-kafka-gateway-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  IGGY_CI_BUILD: true
+
+jobs:
+  changes:
+    name: "Gateway: changes"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Docs-only pull requests skip the build. Anything else, and every
+          # push, schedule or dispatch, runs it.
+          if [[ "$EVENT" != pull_request ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed=$(git diff --name-only "$BASE"...HEAD); then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qvE '(^docs/loams/|\.md$)' <<< "$changed"; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  gateway:
+    name: "Gateway: lint and test"
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
+        with:
+          install-nextest: "true"
+          shared-key: loams-kafka-gateway
+          save-cache: ${{ github.event_name != 'pull_request' }}
+
+      - name: Setup Java (host javac for the real-client probes)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (gateway)
+        run: cargo clippy --locked -p iggy-gateway-kafka --all-targets -- -D warnings
+
+      - name: Build iggy-server
+        run: cargo build --locked -p server --bin iggy-server
+
+      - name: Wire fixtures
+        run: ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+
+      - name: Pull client images
+        shell: bash
+        run: |
+          # The suites run containers with --pull never; read every pinned
+          # image tag out of the test sources so a bump cannot desync.
+          images=$(grep -rhoP '^(pub )?const [A-Z0-9_]*_IMAGE: &str = "\K[^"]+' gateways/kafka/tests | sort -u)
+          for image in $images; do
+            timeout 600 docker pull -q "$image"
+          done
+
+      - name: Test (gateway)
+        env:
+          KAFKA_FIXTURES_REQUIRED: "1"
+          KAFKA_E2E_REQUIRED: "1"
+        run: cargo nextest run --locked -p iggy-gateway-kafka --profile ci --no-fail-fast
+
+  required:
+    name: Kafka gateway required
+    needs: [changes, gateway]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - shell: bash
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          GATEWAY: ${{ needs.gateway.result }}
+        run: |
+          echo "changes=$CHANGES gateway=$GATEWAY"
+          [[ "$CHANGES" == success ]] || exit 1
+          [[ "$GATEWAY" == success || "$GATEWAY" == skipped ]] || exit 1

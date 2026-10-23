@@ -10,3 +10,9 @@ The Iggy project code was originally created, designed, developed by Piotr Ganki
 It was released as an open-source project under MIT License, later converted to Apache 2.0 License,
 and donated by LaserData, Inc. to the Apache Software Foundation (ASF) in February 2025.
 Copyright April 2023 - February 2025 Piotr Gankiewicz, LaserData, Inc.
+
+================================================================
+
+This copy is the Ostrium Labs fork of Apache Iggy (https://github.com/ostrium-labs/iggy).
+Changes made in this fork are Copyright 2026 Ostrium Labs and are licensed under the
+Apache License, Version 2.0. It is not a release of The Apache Software Foundation.
