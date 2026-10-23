@@ -33,13 +33,19 @@
 //!
 //! The produce path writes the batches of one producer one at a time (its turn on its Iggy
 //! session), so a check and the send that follows it never race another batch of that producer.
-//! A send whose outcome is unknown, because the connection to Iggy broke during it or it was cut
-//! off, leaves its batch [`Landing::Unknown`]: a retry of it is written again rather than refused,
-//! so delivery stays at-least-once in that case only.
+//!
+//! A send that Iggy never answered leaves its batch [`Landing::InDoubt`]: the SDK keeps the
+//! request, and a retry of the batch replays it ([`Verdict::Resolve`]) instead of writing it
+//! again, so Iggy's own deduplication decides. A send whose request nothing keeps (the connection
+//! was cut off at the slot limit, or the session was replaced) leaves it [`Landing::Unknown`]: a
+//! retry of it is written again rather than refused, so delivery stays at-least-once in that
+//! case only.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::bridge::InDoubt;
 
 /// Batches kept per producer and partition. Kafka keeps five, one per request a producer may have
 /// in flight (`max.in.flight.requests.per.connection` is at most 5 with idempotence).
@@ -52,17 +58,19 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 pub const DEFAULT_EXPIRY: Duration = Duration::from_hours(24);
 
 /// Where a batch's write stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     /// Its send runs.
     Pending,
     /// It landed. `None` when Iggy named no offset.
     Landed(Option<u64>),
-    /// The send ended without saying whether it landed.
+    /// The send ended without an answer, and the SDK keeps its request for a replay.
+    InDoubt(InDoubt),
+    /// The send ended without saying whether it landed, and nothing keeps its request.
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Batch {
     first: i32,
     last: i32,
@@ -77,7 +85,7 @@ struct Entry {
 }
 
 /// What to do with a batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Write it. Call [`ProducerStates::begin`] before the send and [`ProducerStates::finish`]
     /// with its outcome.
@@ -90,6 +98,12 @@ pub enum Verdict {
     InvalidEpoch,
     /// A retry of a batch whose send still runs. Answer retriable `REQUEST_TIMED_OUT` (7).
     InFlight,
+    /// A retry of a batch whose send Iggy never answered. Replay that send
+    /// (`IggyBridge::resolve_send`) and record what it proved with [`ProducerStates::resolved`].
+    Resolve(InDoubt),
+    /// The next batch after one whose send Iggy never answered. Replay that send first: this
+    /// batch follows it if it landed, and is out of sequence (45) if it was refused.
+    ResolveFirst(InDoubt),
 }
 
 /// One idempotent batch: its producer, epoch and sequence range.
@@ -179,6 +193,32 @@ impl ProducerStates {
         finish_in(&mut self.lock(), key, epoch, first, landing);
     }
 
+    /// Records what the replay of a batch in doubt proved: `Some(landing)` replaces its
+    /// [`Landing::InDoubt`], and `None` (it was refused, so nothing was written) forgets it.
+    ///
+    /// Only the batch that `in_doubt` was for: a batch sent again since is left alone.
+    pub fn resolved(&self, key: &BatchKey, in_doubt: &InDoubt, landing: Option<Landing>) {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(key) else {
+            return;
+        };
+        let Some(position) = entry
+            .batches
+            .iter()
+            .position(|batch| matches!(&batch.landing, Landing::InDoubt(held) if held == in_doubt))
+        else {
+            return;
+        };
+        if let Some(landing) = landing {
+            entry.batches[position].landing = landing;
+            return;
+        }
+        entry.batches.remove(position);
+        if entry.batches.is_empty() {
+            entries.remove(key);
+        }
+    }
+
     /// Entries held, for tests and metrics.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -217,9 +257,10 @@ fn verdict(entry: Option<&Entry>, epoch: i16, first: i32, last: i32) -> Verdict 
         .iter()
         .find(|batch| batch.first == first && batch.last == last)
     {
-        return match batch.landing {
-            Landing::Landed(offset) => Verdict::Duplicate(offset),
+        return match &batch.landing {
+            Landing::Landed(offset) => Verdict::Duplicate(*offset),
             Landing::Pending => Verdict::InFlight,
+            Landing::InDoubt(in_doubt) => Verdict::Resolve(in_doubt.clone()),
             // Whether it landed is unknown: write it again rather than refuse a batch that may
             // not exist. At-least-once, as before producer state.
             Landing::Unknown => Verdict::Append,
@@ -227,6 +268,11 @@ fn verdict(entry: Option<&Entry>, epoch: i16, first: i32, last: i32) -> Verdict 
     }
     match entry.batches.back() {
         Some(newest) if !in_sequence(newest.last, first) => Verdict::OutOfOrder,
+        // A send in doubt keeps its lane in Iggy's SDK, so it is always the newest batch.
+        Some(Batch {
+            landing: Landing::InDoubt(in_doubt),
+            ..
+        }) => Verdict::ResolveFirst(in_doubt.clone()),
         _ => Verdict::Append,
     }
 }
@@ -426,6 +472,53 @@ mod tests {
         states.finish(&key(0), 0, 0, Some(Landing::Unknown));
         assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Append);
         assert_eq!(states.check(&key(0), 0, 2, 2), Verdict::Append);
+    }
+
+    fn in_doubt(states: &ProducerStates, first: i32, last: i32, operation: u64) -> InDoubt {
+        let in_doubt = InDoubt::detached(operation);
+        states.begin(&key(0), 0, first, last);
+        states.finish(&key(0), 0, first, Some(Landing::InDoubt(in_doubt.clone())));
+        in_doubt
+    }
+
+    #[test]
+    fn given_a_send_in_doubt_when_its_batch_is_retried_should_replay_it() {
+        let states = ProducerStates::default();
+        land(&states, 0, 0, 0, 1);
+        let held = in_doubt(&states, 1, 2, 9);
+        assert_eq!(states.check(&key(0), 0, 1, 2), Verdict::Resolve(held));
+        assert_eq!(
+            states.check(&key(0), 0, 3, 3),
+            Verdict::ResolveFirst(InDoubt::detached(9)),
+            "the batch after it waits for what the one in doubt did"
+        );
+    }
+
+    #[test]
+    fn given_a_replay_that_landed_when_retried_again_should_answer_a_duplicate() {
+        let states = ProducerStates::default();
+        let held = in_doubt(&states, 0, 1, 9);
+        states.resolved(&key(0), &held, Some(Landing::Landed(None)));
+        assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Duplicate(None));
+    }
+
+    #[test]
+    fn given_a_replay_that_was_refused_should_accept_the_batch_again() {
+        let states = ProducerStates::default();
+        land(&states, 0, 0, 0, 1);
+        let held = in_doubt(&states, 1, 1, 9);
+        states.resolved(&key(0), &held, None);
+        assert_eq!(states.check(&key(0), 0, 1, 1), Verdict::Append);
+        assert_eq!(states.check(&key(0), 0, 2, 2), Verdict::OutOfOrder);
+    }
+
+    #[test]
+    fn given_a_batch_sent_again_since_when_an_old_replay_ends_should_keep_the_new_send() {
+        let states = ProducerStates::default();
+        let held = in_doubt(&states, 0, 0, 9);
+        states.begin(&key(0), 0, 0, 0);
+        states.resolved(&key(0), &held, Some(Landing::Landed(Some(4))));
+        assert_eq!(states.check(&key(0), 0, 0, 0), Verdict::InFlight);
     }
 
     #[test]
