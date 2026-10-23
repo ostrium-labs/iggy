@@ -68,6 +68,7 @@ filter = '''
     + binary_id(iggy-gateway-kafka::delete_topics_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::create_partitions_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::metadata_real_bridge_tests)
+    + binary_id(iggy-gateway-kafka::membership_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::phase1_e2e_tests)
 '''
@@ -82,8 +83,14 @@ test-group = "kafka_bridge"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests)'
+filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests) + binary_id(iggy-gateway-kafka::multi_gateway_oracle_tests)'
 test-group = "kafka_client_e2e"
+
+# The failover scenario starts three gateways and a three-broker Kafka, and waits out a
+# coordinator move on each.
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::multi_gateway_oracle_tests)'
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # The chaos monkey runs a five-node cluster for minutes (IGGY_TEST_CHAOS_DURATION_SECS, 120 by
 # default), then drains and verifies. It needs the whole box, so its kill and restart timing is

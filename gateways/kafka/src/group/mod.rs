@@ -23,8 +23,9 @@
 //! wire messages into the request types here, and `state` holds the synchronous state machine
 //! those requests drive.
 //!
-//! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
-//! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
+//! Membership is process memory, not Iggy state. Among several gateways each group has one
+//! coordinator (`crate::membership`), and the others answer `NOT_COORDINATOR` (16) for it, so
+//! its members find the coordinator again and rejoin there; see `docs/CONSUMER_GROUPS.md`.
 
 mod offset_work;
 mod state;
@@ -47,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::group::offset_work::OffsetWork;
 use crate::group::state::{GroupState, Step};
+use crate::membership::Membership;
 use crate::protocol::api::{
     ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
 };
@@ -552,6 +554,8 @@ pub struct GroupCoordinator {
     /// Resolves parked waiters on shutdown drain instead of holding it open for a full rebalance
     /// timeout.
     shutdown: CancellationToken,
+    /// Which groups this gateway coordinates. A gateway that runs alone coordinates all of them.
+    membership: Arc<Membership>,
 }
 
 impl GroupCoordinator {
@@ -562,7 +566,21 @@ impl GroupCoordinator {
             groups: Mutex::new(HashMap::new()),
             offset_work: Arc::new(OffsetWork::new()),
             shutdown,
+            membership: Arc::default(),
         }
+    }
+
+    /// Coordinates only the groups `membership` gives this gateway. Every request for another
+    /// group answers `NOT_COORDINATOR` (16), and a member parked on a group this gateway stops
+    /// coordinating is released with it.
+    pub fn set_membership(&mut self, membership: Arc<Membership>) {
+        self.membership = membership;
+    }
+
+    /// Whether this gateway coordinates `group_id` now.
+    #[must_use]
+    pub fn coordinates(&self, group_id: &str) -> bool {
+        self.membership.snapshot().coordinates(group_id)
     }
 
     /// Joins `request`'s member, parking until the group's join barrier completes.
@@ -573,6 +591,10 @@ impl GroupCoordinator {
     pub async fn join(&self, request: &JoinRequest) -> JoinResult {
         let mut parked: Option<StrBytes> = None;
         loop {
+            if !self.coordinates(&request.group_id) {
+                let member_id = parked.unwrap_or_else(|| request.member_id.clone());
+                return JoinResult::error(ERROR_NOT_COORDINATOR, member_id);
+            }
             let outcome = {
                 let mut groups = self.groups.lock().await;
                 let now = Instant::now();
@@ -613,6 +635,9 @@ impl GroupCoordinator {
     pub async fn sync(&self, mut request: SyncRequest) -> SyncResult {
         let mut parked = false;
         loop {
+            if !self.coordinates(&request.group_id) {
+                return SyncResult::error(ERROR_NOT_COORDINATOR);
+            }
             let outcome = {
                 let mut groups = self.groups.lock().await;
                 let now = Instant::now();
@@ -655,6 +680,9 @@ impl GroupCoordinator {
         member_id: &StrBytes,
         group_instance_id: Option<&StrBytes>,
     ) -> i16 {
+        if !self.coordinates(group_id) {
+            return ERROR_NOT_COORDINATOR;
+        }
         let mut groups = self.groups.lock().await;
         state::heartbeat_step(
             &mut groups,
@@ -668,6 +696,9 @@ impl GroupCoordinator {
 
     /// Removes `request`'s members and releases whoever is parked on the group. Never parks.
     pub async fn leave(&self, request: &LeaveRequest) -> LeaveResult {
+        if !self.coordinates(&request.group_id) {
+            return LeaveResult::error(ERROR_NOT_COORDINATOR);
+        }
         let mut groups = self.groups.lock().await;
         state::leave_step(&mut groups, request, Instant::now())
     }
@@ -703,6 +734,9 @@ impl GroupCoordinator {
     /// The Kafka code that refuses the commit. `COORDINATOR_LOAD_IN_PROGRESS` while a deletion of
     /// the group's offsets runs, which clients retry.
     pub async fn validate_commit(&self, request: &CommitRequest) -> Result<RunningCommit, i16> {
+        if !self.coordinates(&request.group_id) {
+            return Err(ERROR_NOT_COORDINATOR);
+        }
         let mut groups = self.groups.lock().await;
         match state::commit_step(&mut groups, request, Instant::now()) {
             ERROR_NONE => self
@@ -790,9 +824,14 @@ impl GroupCoordinator {
     }
 
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.
+    ///
+    /// A change of membership wakes it too, so the caller checks again whether this gateway still
+    /// coordinates the group.
     async fn wait_until(&self, mut receiver: watch::Receiver<u64>, wake_at: Instant) -> bool {
+        let mut membership = self.membership.subscribe();
         tokio::select! {
             _ = tokio::time::timeout_at(wake_at, receiver.changed()) => true,
+            _ = membership.changed() => true,
             () = self.shutdown.cancelled() => false,
         }
     }

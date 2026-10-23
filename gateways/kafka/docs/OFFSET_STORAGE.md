@@ -105,18 +105,21 @@ consumer still uses a group, and Iggy keeps no commit time.
 
 ## More than one gateway
 
-Offsets are shared, since the key depends only on the Kafka group id. Membership is not
-([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)).
+Offsets are shared, since the key depends only on the Kafka group id. Membership is not: each group
+has one coordinator among the gateways that set `IGGY_KAFKA_NODE_ID`
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#several-gateways-behind-one-bootstrap-list)). The
+others answer `OffsetCommit`, `OffsetDelete` and `DeleteGroups` for the group with
+`NOT_COORDINATOR` (16), so admin tools and `assign()` consumers commit through the coordinator, as
+in Kafka, and its member checks apply to them. `OffsetFetch` is answered by every gateway.
 
-- A gateway with no members in a group accepts a commit with no generation, as admin tools and
-  `assign()` consumers send, even when another gateway has live members in it. That commit
-  overwrites their offsets. Point admin tools at the gateway that the group's consumers use.
-- A commit that a gateway gave up on can still land after a newer commit made through another
-  gateway. It then puts back the older offset, or deletes the key. Iggy cannot refuse the older
-  write yet.
-- `DeleteGroups` and `OffsetDelete` see only the members on their own gateway. Through a gateway
-  with no members in a group, they delete offsets of a group that is live on another gateway. That
-  includes offsets of the topics that its members subscribe to.
+- During a change of coordinator, the old and the new one can both accept a commit for up to one
+  heartbeat interval. A commit that a gateway gave up on can also land after a newer commit made
+  through another gateway. Either way the older offset can come back. Iggy cannot refuse the
+  older write yet.
+- Gateways without `IGGY_KAFKA_NODE_ID` behind one bootstrap list each coordinate every group, and
+  the problems of two independent groups under one name apply: a commit with no generation
+  overwrites the live group's offsets, and `DeleteGroups` and `OffsetDelete` see only their own
+  members.
 
 ## Server side
 

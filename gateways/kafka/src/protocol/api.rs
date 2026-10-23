@@ -32,6 +32,8 @@ use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
+use crate::listener::SecurityProtocol;
+use crate::membership::Membership;
 use crate::producer_state::ProducerStates;
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
@@ -385,6 +387,9 @@ pub struct GatewayState {
     pub cluster_id: ClusterId,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
+    /// The other gateways in front of the same Iggy cluster, and which groups and partitions
+    /// this one owns. A gateway that runs alone owns all of them, as node 1.
+    pub membership: Arc<Membership>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -423,7 +428,16 @@ impl GatewayState {
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
             auto_topic_creation: None,
+            membership: Arc::default(),
         }
+    }
+
+    /// Takes part in `membership` instead of running alone.
+    #[must_use]
+    pub fn with_membership(mut self, membership: Arc<Membership>) -> Self {
+        self.groups.set_membership(Arc::clone(&membership));
+        self.membership = membership;
+        self
     }
 
     /// Turns on Kafka's `auto.create.topics.enable` behaviour for `Metadata` when `config` says
@@ -498,6 +512,9 @@ impl GatewayState {
 pub struct ConnectionState {
     /// The broker address this connection's listener advertises.
     pub broker: BrokerAdvertise,
+    /// The security protocol of that listener, which picks the address of every other gateway
+    /// this connection is pointed at. `None` reads as `PLAINTEXT`.
+    pub protocol: Option<SecurityProtocol>,
     /// Whether `SaslHandshake` and `SaslAuthenticate` are advertised and routed on this
     /// connection's listener.
     pub sasl_enabled: bool,
@@ -552,6 +569,19 @@ impl ConnectionState {
 
     pub(crate) const fn id(&self) -> u64 {
         self.id.0
+    }
+
+    /// The same state, for a listener of `protocol`.
+    #[must_use]
+    pub const fn with_protocol(mut self, protocol: SecurityProtocol) -> Self {
+        self.protocol = Some(protocol);
+        self
+    }
+
+    /// The security protocol of this connection's listener.
+    #[must_use]
+    pub fn security_protocol(&self) -> SecurityProtocol {
+        self.protocol.unwrap_or(SecurityProtocol::Plaintext)
     }
 
     pub(crate) fn note_heartbeat(&self, member: GroupMember) {

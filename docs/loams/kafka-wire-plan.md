@@ -194,7 +194,7 @@ breadth. Status is `Planned` unless noted.
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | Planned | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Part 1 built** (producer state); parts 2–3 planned | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
-| KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
+| KW-5 | Several gateways behind one bootstrap | #4515 | **Built, PR #8 open, not merged** (fork Actions disabled on 2026-10-24, so `Kafka gateway required` never ran; producer-state handover waits for KW-3 part 3) | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | Planned | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
@@ -252,7 +252,7 @@ nightly.
 **Exit.** The diff suite runs green in fork CI against Apache Kafka with every
 remaining difference listed in `allowed_differences.toml` with its issue.
 
-**As built (2026-10-23).** `oracle_wire_diff_tests.rs` passes against
+**As built (2026-10-24, PR #8, not merged).** `oracle_wire_diff_tests.rs` passes against
 `apache/kafka:4.3.1` and `redpandadata/redpanda:v26.1.18` locally, with 18
 declared differences. Apache Kafka is the reference: a fact where the gateway
 agrees with Kafka and only Redpanda differs is reported as "oracles disagree"
@@ -446,6 +446,37 @@ at-least-once redelivery from the last commit, as Kafka does).
 
 **Exit.** #4515's acceptance criteria pass; the "one gateway per bootstrap"
 rule is removed from the docs.
+
+**As built (2026-10-24, PR #8, not merged).** `src/membership.rs` and `src/bridge/iggy_bridge/gateways.rs`. Each
+gateway with `IGGY_KAFKA_NODE_ID` appends a TOML announcement (node id, incarnation, instance id,
+endpoint per listener protocol) to the one-partition topic `<default stream>.meta/gateways` every
+heartbeat (default 2 s) and reads the others; liveness (lease, default 10 s, or a goodbye on
+shutdown) and eligibility (two heartbeats after the first announcement, so a new gateway takes
+nothing until the others heard of it) are judged on Iggy's append times, never a gateway's clock,
+so two gateways that read the same prefix agree. Rendezvous hashing over the eligible set picks
+each group's coordinator and each partition's leader. Metadata and `DescribeCluster` list every
+live gateway; FindCoordinator answers the owner per key; the others answer `NOT_COORDINATOR` (16)
+to the group APIs (parked joins and syncs are released at once on a change) and
+`NOT_LEADER_OR_FOLLOWER` (6) to a Produce for a partition led elsewhere; `ListGroups` lists only
+owned groups; `OffsetFetch`, Fetch and ListOffsets are served anywhere. Choices made here (owner
+may overrule): announcements in an Iggy topic rather than a server-side registry (no server
+change); partition leadership by hash, not by the Iggy primary (the SDK does not expose it);
+non-leader Produce refused so one gateway holds a partition's producer state. Tests: 10 unit
+tests in `membership.rs`; `membership_real_bridge_tests.rs` (three gateways on one
+`iggy-server`: brokers, coordinators, leaders and refusals agree; a goodbye moves only the
+leaver's groups and partitions; a crash moves them after the lease; a gateway that comes back
+takes its share again); `multi_gateway_oracle_tests.rs` runs the failover scenario (Java
+verifiable consumer through a three-broker bootstrap list, the coordinator stopped between two
+rounds written by kcat) against three gateways and a three-broker Apache Kafka 4.3.1 at once and
+compares what the member read. Still open: producer-state handover on a leadership move (KW-3
+part 3: today the new leader accepts the producer at any sequence, at-least-once); CreateTopics
+and CreatePartitions still validate a replication factor of 1 and assignments naming node 1
+(#4508 owns replication factor semantics); librdkafka in the failover scenario (nightly matrix,
+KW-2).
+Verified locally: clippy clean on the library, 866 library tests pass (10 of them for
+membership). Not yet run anywhere: `membership_real_bridge_tests.rs` and
+`multi_gateway_oracle_tests.rs` (the shared build target was cleared mid-run and fork Actions
+are disabled); they must pass in `Kafka gateway required` before PR #8 merges.
 
 ### KW-6. Log compaction
 

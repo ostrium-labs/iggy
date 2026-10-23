@@ -43,6 +43,7 @@ use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{ListenerConfig, SecurityProtocol};
+use crate::membership::{Announcement, Endpoint, Membership, MembershipConfig, Registry};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
     ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
@@ -165,6 +166,9 @@ pub struct GatewayConfig {
     /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
     /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
     pub auto_topic_creation: AutoTopicCreationConfig,
+    /// This gateway's node id and membership timings (`IGGY_KAFKA_NODE_ID`), when it shares one
+    /// bootstrap list with other gateways. `None` runs it alone, as node 1. Needs the bridge.
+    pub membership: Option<MembershipConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -186,6 +190,7 @@ impl Default for GatewayConfig {
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
             auto_topic_creation: AutoTopicCreationConfig::default(),
+            membership: None,
         }
     }
 }
@@ -366,6 +371,7 @@ impl Listener {
             self.protocol.uses_sasl(),
             self.acls_enabled,
         )
+        .with_protocol(self.protocol)
     }
 
     const fn advertisement(&self) -> Advertisement {
@@ -498,8 +504,7 @@ impl KafkaGateway {
         // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
-        let cluster_id = self.cluster_id().await?;
-        let state = Arc::new(self.shared_state(cluster_id, &cancel)?);
+        let (state, heartbeats) = self.start_state(&bound, &cancel).await?;
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -552,6 +557,11 @@ impl KafkaGateway {
         cancel.cancel();
         accept_loops.shutdown().await;
         drain(&tracker, &cancel, drain_timeout).await;
+        // Said goodbye on the cancel, while the connections drained. Awaited so no heartbeat
+        // runs when the bridge signs out.
+        if let Some(heartbeats) = heartbeats {
+            let _ = heartbeats.await;
+        }
         // After the drain, so no connection starts one after it, and before `run` returns, so
         // none still runs when the bridge signs out.
         state
@@ -575,6 +585,75 @@ impl KafkaGateway {
         )
         .with_cluster_id(cluster_id)
         .with_auto_topic_creation(self.config.auto_topic_creation)
+    }
+
+    /// The state every connection shares, with this gateway's membership started: announced and
+    /// heard once, then heartbeating until `cancel` fires. The handle ends after the goodbye.
+    async fn start_state(
+        &self,
+        bound: &[(Arc<Listener>, TcpListener)],
+        cancel: &CancellationToken,
+    ) -> Result<(Arc<GatewayState>, Option<tokio::task::JoinHandle<()>>)> {
+        let cluster_id = self.cluster_id().await?;
+        let endpoints = bound
+            .iter()
+            .map(|(listener, _)| Endpoint::new(listener.protocol, &listener.broker))
+            .collect();
+        let membership = self.membership(endpoints)?;
+        let state = Arc::new(
+            self.shared_state(cluster_id, cancel)?
+                .with_membership(Arc::clone(&membership)),
+        );
+        let heartbeats = self.start_membership(&membership, cancel).await;
+        Ok((state, heartbeats))
+    }
+
+    /// This gateway's membership: alone as node 1, or shared with the gateways that announce
+    /// themselves in Iggy.
+    fn membership(&self, endpoints: Vec<Endpoint>) -> Result<Arc<Membership>> {
+        let Some(config) = self.config.membership else {
+            return Ok(Arc::new(Membership::single()));
+        };
+        config
+            .validate()
+            .map_err(KafkaProtocolError::InvalidConfig)?;
+        if self.bridge.is_none() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "IGGY_KAFKA_NODE_ID needs the bridge: gateways find each other through Iggy. Set \
+                 IGGY_KAFKA_BRIDGE_ENABLED=true, or unset IGGY_KAFKA_NODE_ID to run one gateway"
+                    .into(),
+            ));
+        }
+        let me = Announcement::new(config.node_id, self.config.instance_id, endpoints);
+        Ok(Arc::new(Membership::shared(config, me)))
+    }
+
+    /// Announces this gateway and reads the others once, before any client is served, then keeps
+    /// doing so in the background until `cancel` fires.
+    async fn start_membership(
+        &self,
+        membership: &Arc<Membership>,
+        cancel: &CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let bridge = self.bridge.clone().filter(|_| membership.is_shared())?;
+        let registry: Arc<dyn Registry> = bridge;
+        match membership.beat(registry.as_ref()).await {
+            Ok(snapshot) => info!(
+                node_id = membership.node_id(),
+                live = ?snapshot.live_ids().collect::<Vec<_>>(),
+                eligible = ?snapshot.eligible_ids(),
+                "Kafka gateway membership started"
+            ),
+            Err(error) => warn!(
+                %error,
+                node_id = membership.node_id(),
+                "the first Kafka gateway membership heartbeat failed; serving as the only \
+                 gateway until one succeeds"
+            ),
+        }
+        Some(tokio::spawn(
+            Arc::clone(membership).run(registry, cancel.child_token()),
+        ))
     }
 
     /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.

@@ -65,8 +65,8 @@ use crate::protocol::api::{
     API_KEY_OFFSET_DELETE, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
     ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_GROUP_ID_NOT_FOUND, ERROR_GROUP_SUBSCRIBED_TO_TOPIC,
     ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST, ERROR_NON_EMPTY_GROUP, ERROR_NONE,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, is_supported_version,
+    ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_offset_delete_shape;
 use crate::protocol::handlers::{
@@ -131,6 +131,9 @@ async fn delete_offsets(
     let group = &request.group_id.0;
     if !is_valid_group_id(group) {
         return Err(ERROR_INVALID_GROUP_ID);
+    }
+    if !state.groups.coordinates(group) {
+        return Err(ERROR_NOT_COORDINATOR);
     }
     // Until this drops, the group takes no join and no commit.
     let (deletable, deletion) = state.groups.offset_deletion(group).await;

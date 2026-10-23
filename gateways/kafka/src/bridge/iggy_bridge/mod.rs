@@ -35,6 +35,7 @@ use crate::bridge::topic_map::validate_kafka_topic_name;
 
 mod cluster_id;
 mod fetch;
+mod gateways;
 mod group_index;
 mod group_offsets;
 mod offsets;
@@ -170,6 +171,8 @@ pub struct IggyBridge {
     group_index: GroupIndex,
     /// The client of the scan that finds those groups, so no offset call waits behind it.
     scan_client: LazyClient,
+    /// The client of the membership heartbeats, so a heartbeat never waits behind a request.
+    membership_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -215,6 +218,7 @@ impl IggyBridge {
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
             scan_client: LazyClient::default(),
+            membership_client: LazyClient::default(),
         })
     }
 
@@ -297,6 +301,7 @@ impl IggyBridge {
             auto_create_client,
             offset_clients,
             scan_client,
+            membership_client,
             shared_client,
         ) = tokio::join!(
             self.produce_pool.close(),
@@ -306,6 +311,7 @@ impl IggyBridge {
             self.auto_create_client.close(),
             self.offset_pool.close(),
             self.scan_client.close(),
+            self.membership_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
@@ -315,6 +321,7 @@ impl IggyBridge {
             .and(auto_create_client)
             .and(offset_clients)
             .and(scan_client)
+            .and(membership_client)
             .and(shared_client)
     }
 
@@ -404,6 +411,7 @@ impl IggyBridge {
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
+            membership_client: LazyClient::default(),
         }
     }
 }
