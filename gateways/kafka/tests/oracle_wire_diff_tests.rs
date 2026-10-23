@@ -402,13 +402,21 @@ async fn produce(
                 ]),
         ]);
     let version = version(client, ApiKey::Produce, 9)?;
-    let response = client.send(&request, version).await?;
-    let answer = response
-        .responses
-        .first()
-        .and_then(|topic| topic.partition_responses.first())
-        .ok_or_else(|| "Produce answered no partition".to_string())?;
-    Ok((answer.error_code, answer.base_offset))
+    // A leader elected moments ago can still answer 5 or 6, which write nothing; clients retry
+    // both, so the scenario does too.
+    for attempt in 0.. {
+        let response = client.send(&request, version).await?;
+        let answer = response
+            .responses
+            .first()
+            .and_then(|topic| topic.partition_responses.first())
+            .ok_or_else(|| "Produce answered no partition".to_string())?;
+        if !matches!(answer.error_code, 5 | 6) || attempt == 40 {
+            return Ok((answer.error_code, answer.base_offset));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    unreachable!("the loop returns")
 }
 
 /// The partition's fetch answer, and its decoded records.
