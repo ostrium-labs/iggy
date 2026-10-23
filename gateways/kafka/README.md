@@ -262,15 +262,14 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 
 ### Delivery guarantees
 
-Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
-restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
-a producer id so that it starts, but its retries are not deduplicated: Produce uses the producer
-id only to pick the producer's Iggy session, and ignores the epoch and sequence, so a retry after a
-network timeout writes the record twice, and both copies reach the stream with their own offsets.
-
-Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
-guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
-[docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the detail and what closing it needs.
+Delivery through this gateway is **at-least-once**. In the Ostrium fork, an idempotent Kafka
+producer's retries are deduplicated and kept in order, as on Kafka: a retry of a batch that
+landed is answered with its offset and not written again, and a batch out of sequence is refused
+with `OUT_OF_ORDER_SEQUENCE_NUMBER` (45), which the Java producer relies on to keep one key's
+order. Two cases stay at-least-once: a retry of a send whose outcome the gateway never learned
+(its connection to Iggy broke during the send), and a retry that spans a gateway restart, since
+producer state is in memory. [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) has the rules and what
+closes the rest.
 
 Transactions are **not supported**, and will not be. AddPartitionsToTxn (24), AddOffsetsToTxn
 (25), EndTxn (26) and TxnOffsetCommit (28) are never advertised, so a conforming client never
@@ -761,8 +760,10 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
   `Admin.createPartitions` report a `TimeoutException`, and the caller must retry.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
-- Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
-  can land after later ones.
+- Order: an idempotent producer (the Java default) keeps its order: a batch that would land out
+  of sequence is refused with 45 and retried in order. A producer that is not idempotent should
+  set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch can land
+  after later ones.
 - Order after a 7: the send can still run. A producer with a producer id waits behind it on any
   connection. A producer that is its connection does not once it reconnects, so its retry or its
   next batch can land first. To keep that order use an idempotent producer, the Java default, or

@@ -29,12 +29,14 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, ProduceTurn, Producer, TopicTarget};
+use crate::bridge::{BridgeError, IggyBridge, ProduceTurn, Producer, SendEnd, TopicTarget};
 use crate::error::Result;
+use crate::producer_state::{BatchKey, Landing, ProducerStates, Verdict, idempotence};
 use crate::protocol::api::{
-    API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_RECORD,
-    ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_PRODUCER_EPOCH,
+    ERROR_INVALID_RECORD, ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_REQUEST_TIMED_OUT,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
     ERROR_UNSUPPORTED_COMPRESSION_TYPE, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
     REQUEST_DEADLINE, UNKNOWN_OFFSET, supported_max_version,
 };
@@ -188,7 +190,11 @@ pub async fn handle(
         Zstd::Refused
     };
     let (board, held) = (&state.probe_board, (turn, admission));
-    let responses = write_request(bridge, held, board, &request, budget, zstd, deadline).await;
+    let states = &state.producer_states;
+    let responses = write_request(
+        bridge, held, board, states, &request, budget, zstd, deadline,
+    )
+    .await;
 
     // Kafka closes an `acks=0` connection on any error, so the client refreshes metadata.
     if request.acks == ACKS_NONE {
@@ -364,10 +370,12 @@ impl From<RecordCodecError> for Refusal {
 ///
 /// Sequential, and `held` carries the producer's turn, so its sends reach Iggy in order. A send
 /// that outlives the deadline keeps `held`, and the partitions after it answer 7.
+#[allow(clippy::too_many_arguments)]
 async fn write_request(
     bridge: &IggyBridge,
     held: Held,
     board: &ProbeBoard,
+    states: &Arc<ProducerStates>,
     request: &ProduceRequest,
     budget: DecompressionBudget,
     zstd: Zstd,
@@ -386,8 +394,29 @@ async fn write_request(
                 (Ok(target), Some(kept)) if !deadline.passed() => {
                     match plan(&budget, zstd, name, partition, max_send) {
                         Ok((id, messages)) => {
+                            let planned = Write {
+                                target,
+                                kafka_topic: name,
+                                partition_id: id,
+                                messages,
+                                deadline,
+                            };
+                            let idempotent = partition
+                                .records
+                                .as_deref()
+                                .and_then(idempotence)
+                                .map(|batch| {
+                                    (
+                                        BatchKey {
+                                            producer_id: batch.0,
+                                            topic: name.to_string(),
+                                            partition: partition.index,
+                                        },
+                                        batch,
+                                    )
+                                });
                             let (sent, kept) =
-                                send_by(bridge, kept, target, name, id, messages, deadline).await;
+                                write_checked(bridge, kept, states, idempotent, planned).await;
                             (sent.map_err(Refusal::from), kept)
                         }
                         Err(refusal) => (Err(refusal), Some(kept)),
@@ -517,6 +546,57 @@ fn request_timeout(timeout_ms: i32) -> Duration {
         .min(REQUEST_DEADLINE)
 }
 
+/// One partition's planned write.
+struct Write<'a> {
+    target: &'a TopicTarget,
+    kafka_topic: &'a str,
+    partition_id: u32,
+    messages: Vec<IggyMessage>,
+    deadline: Deadline,
+}
+
+/// Writes one partition, first checking an idempotent batch against its producer's state: a retry
+/// of a batch that landed is answered with its offset and not written, a batch out of sequence is
+/// refused with 45, and one from an older epoch with 47. See `producer_state.rs`.
+async fn write_checked(
+    bridge: &IggyBridge,
+    held: Held,
+    states: &Arc<ProducerStates>,
+    idempotent: Option<(BatchKey, (i64, i16, i32, i32))>,
+    write: Write<'_>,
+) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
+    let Some((key, (_, epoch, first, last))) = idempotent else {
+        return send_by(bridge, held, write, |_| {}).await;
+    };
+    match states.check(&key, epoch, first, last) {
+        Verdict::Duplicate(base_offset) => {
+            tracing::debug!(
+                producer_id = key.producer_id,
+                kafka_topic = write.kafka_topic,
+                first,
+                "answered a retried idempotent batch from producer state"
+            );
+            (Ok(base_offset), Some(held))
+        }
+        Verdict::OutOfOrder => (Err(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER), Some(held)),
+        Verdict::InvalidEpoch => (Err(ERROR_INVALID_PRODUCER_EPOCH), Some(held)),
+        Verdict::InFlight => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
+        Verdict::Append => {
+            states.begin(&key, epoch, first, last);
+            let states = Arc::clone(states);
+            send_by(bridge, held, write, move |end| {
+                let landing = match end {
+                    SendEnd::Landed(offset) => Some(Landing::Landed(offset)),
+                    SendEnd::Unknown => Some(Landing::Unknown),
+                    SendEnd::NotSent | SendEnd::Refused => None,
+                };
+                states.finish(&key, epoch, first, landing);
+            })
+            .await
+        }
+    }
+}
+
 /// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
 /// unless the send still runs and keeps it.
 ///
@@ -524,14 +604,26 @@ fn request_timeout(timeout_ms: i32) -> Duration {
 async fn send_by(
     bridge: &IggyBridge,
     (turn, admission): Held,
-    target: &TopicTarget,
-    kafka_topic: &str,
-    partition_id: u32,
-    messages: Vec<IggyMessage>,
-    deadline: Deadline,
+    write: Write<'_>,
+    observe: impl FnOnce(SendEnd) + Send + 'static,
 ) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
+    let Write {
+        target,
+        kafka_topic,
+        partition_id,
+        messages,
+        deadline,
+    } = write;
     let (sent, held) = bridge
-        .send_records(turn, admission, target, partition_id, messages, deadline.at)
+        .send_records_observed(
+            turn,
+            admission,
+            target,
+            partition_id,
+            messages,
+            deadline.at,
+            observe,
+        )
         .await;
     let sent = match sent {
         Ok(base_offset) => Ok(base_offset),

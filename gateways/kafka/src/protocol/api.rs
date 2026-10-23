@@ -32,6 +32,7 @@ use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
+use crate::producer_state::ProducerStates;
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
@@ -97,6 +98,8 @@ pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = ResponseError::NotLeaderOrFollower
 /// Outcome unknown: the write may have landed. Retriable, so a retry can duplicate it.
 /// Idempotent produce (#3545) closes that.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = ResponseError::RequestTimedOut.code();
+pub const ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = ResponseError::OutOfOrderSequenceNumber.code();
+pub const ERROR_INVALID_PRODUCER_EPOCH: i16 = ResponseError::InvalidProducerEpoch.code();
 /// Produce: a record, send or partition too large, even alone. Not retried as-is. Java splits a
 /// multi-record batch and sends the halves.
 pub const ERROR_MESSAGE_TOO_LARGE: i16 = ResponseError::MessageTooLarge.code();
@@ -350,6 +353,10 @@ pub struct GatewayState {
     /// Shared across every connection this gateway serves: a producer id has to be unique for
     /// the process, not for the connection that asked for it.
     pub producer_ids: ProducerIdAllocator,
+    /// Idempotent producer state, per producer id and partition: what lets Produce answer a
+    /// retried batch instead of writing it twice. Shared across connections, since a producer
+    /// retries on whichever connection it has.
+    pub producer_states: Arc<ProducerStates>,
     /// `PRODUCE_CAPS` partition caps, in frame bytes, that Produce may hold decoded at once. Caps
     /// its memory. A request takes what its largest partition may decode, and a send that
     /// outlives the request keeps it while it owns the decoded partition.
@@ -402,6 +409,7 @@ impl GatewayState {
             bridge,
             max_frame_size,
             producer_ids: ProducerIdAllocator::new(instance_id),
+            producer_states: Arc::default(),
             produce_memory: Arc::new(Semaphore::new(
                 PRODUCE_CAPS
                     .saturating_mul(max_frame_size)
