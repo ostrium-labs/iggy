@@ -209,7 +209,7 @@ breadth. Status is `Planned` unless noted.
 | KW-17 | Streams groups and share groups | #4529 | Planned | KW-13 | Later |
 | KW-18 | Kafka-to-Iggy migration guide | #3550 | Planned | KW-5 | Assigned upstream; fork copy only |
 | KW-L1 | Fork images: `iggy-server` and `iggy-gateway-kafka` on GHCR | — | **Done** (one image, `ghcr.io/ostrium-labs/iggy`) | KW-0 | No |
-| KW-L2 | Loams compose profile `kafka` | — (Loams repo) | Planned | KW-L1 | No |
+| KW-L2 | Loams compose profile `kafka` | — (Loams repo) | **Done** (ostrium-labs/loams#1148) | KW-L1 | No |
 | KW-T | Transactions and exactly-once | #4522 | **Planned, not built** | KW-3, KW-5, KW-6, KW-7 | Design discussion first |
 
 ### KW-1. Differential oracle harness
@@ -705,11 +705,14 @@ manual dispatch only, each architecture natively, layers cached. See
 
 ### KW-L2. Loams compose profile `kafka`
 
-In the Loams repo: `deploy/release/compose.yaml` gains a `kafka` profile with
-`iggy` and `kafka-gateway` services pinned by digest to a KW-L1 pair,
-loopback-bound by default, with the gateway's SASL wired to Loams credentials
-once KW-9 lands. Never in the default profile. A Loams PR, with a smoke test
-that kcat produces and consumes through it.
+**Status: done** (ostrium-labs/loams#1148, preview). `deploy/release/compose.yaml`
+has a `kafka` profile with `iggy` and `kafka-gateway` services, both from the
+one KW-L1 image pinned by digest, the gateway published on loopback only, never
+in the default stack. `release-compose` checks that it is off by default,
+pinned and on loopback, and a smoke job starts it and has kcat produce and
+consume through the gateway. Not wired to the Loams engine: the Iggy to Loams
+hop is FL1's `loams_sink`. SASL is the gateway's own (`KAFKA_SASL_ENABLED`),
+against Iggy users, not yet mapped to Loams credentials.
 
 ## 6. KW-T: transactions and exactly-once (planned, not built)
 
