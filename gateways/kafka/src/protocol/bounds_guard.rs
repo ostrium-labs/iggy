@@ -436,7 +436,9 @@ pub fn validate_produce_shape(version: i16, body: &Bytes, max_frame_size: usize)
         c.legacy_array_count()?
     };
     for _ in 0..topics_count {
-        if flexible {
+        if version >= 13 {
+            c.skip(16)?; // topic_id replaces the name (KIP-516)
+        } else if flexible {
             c.compact_string(false)?;
         } else {
             c.legacy_string(false)?;

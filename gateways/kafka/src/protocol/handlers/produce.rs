@@ -24,7 +24,7 @@ use bytes::Bytes;
 use iggy::prelude::{IggyError, IggyMessage, Sizeable};
 use kafka_protocol::messages::produce_request::PartitionProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
-use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
+use kafka_protocol::messages::{ProduceRequest, ProduceResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
@@ -44,8 +44,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
-    CODEC_OFF_WORKER_BYTES, decode_guarded, encode_message, is_transactional, off_worker,
-    respond_or_close, unsupported_version_response,
+    CODEC_OFF_WORKER_BYTES, decode_guarded, encode_message, is_transactional, learn_topic_ids,
+    off_worker, respond_or_close, unsupported_version_response,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
@@ -57,8 +57,15 @@ use crate::records::{ProducerMark, mark_producer};
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_PRODUCE,
     min_version: 3,
-    max_version: 9,
+    max_version: 13,
 };
+
+/// First version that names topics by id instead of by name (KIP-516).
+///
+/// v10 (KIP-951) and v11-12 (KIP-890) change nothing this gateway sends: the leader hints of v10
+/// are tagged and optional, and the transaction errors of v11-12 belong to transactional requests,
+/// which are refused before any of this.
+const TOPIC_ID_MIN_VERSION: i16 = 13;
 
 /// The three `acks` values the protocol defines. Anything else is a malformed request.
 const ACKS_NONE: i16 = 0;
@@ -125,7 +132,7 @@ pub async fn handle(
             }),
         };
     }
-    let request = match decode_guarded::<ProduceRequest>(api_version, body, |v, b| {
+    let mut request = match decode_guarded::<ProduceRequest>(api_version, body, |v, b| {
         validate_produce_shape(v, b, state.max_frame_size)
     }) {
         Ok(request) => request,
@@ -170,6 +177,11 @@ pub async fn handle(
 
     // Before planning, not after: the client waits through decompression too.
     let deadline = Deadline::new(request.timeout_ms);
+    let unnamed = if api_version >= TOPIC_ID_MIN_VERSION {
+        name_topics(state, bridge, &mut request).await
+    } else {
+        Vec::new()
+    };
     // The turn before the memory: a request that waits behind its producer's stuck send then
     // holds none, and no large slot.
     let producer = producer_of(state, connection, principal, &request);
@@ -194,10 +206,11 @@ pub async fn handle(
     };
     let (board, held) = (&state.probe_board, (turn, admission));
     let states = &state.producer_states;
-    let responses = write_request(
+    let mut responses = write_request(
         bridge, held, board, states, &request, budget, zstd, deadline,
     )
     .await;
+    responses.extend(unnamed);
 
     // Kafka closes an `acks=0` connection on any error, so the client refreshes metadata.
     if request.acks == ACKS_NONE {
@@ -212,6 +225,38 @@ pub async fn handle(
         };
     }
     respond_or_close(encode_written_response(api_version, responses), "Produce")
+}
+
+/// From v13 a request names its topics by id. Gives each topic the name its id belongs to, and
+/// takes out the topics whose id no topic has, answered here with `UNKNOWN_TOPIC_ID` on each
+/// partition, as Kafka does.
+async fn name_topics(
+    state: &GatewayState,
+    bridge: &IggyBridge,
+    request: &mut ProduceRequest,
+) -> Vec<TopicProduceResponse> {
+    let ids = request.topic_data.iter().map(|topic| topic.topic_id);
+    let refusal = learn_topic_ids(state, bridge, ids, REQUEST_DEADLINE).await;
+    let mut unnamed = Vec::new();
+    request.topic_data.retain_mut(|topic| {
+        if let Some(name) = state.topic_ids.name(&topic.topic_id) {
+            topic.name = TopicName(StrBytes::from_string(name));
+            return true;
+        }
+        unnamed.push(
+            TopicProduceResponse::default()
+                .with_topic_id(topic.topic_id)
+                .with_partition_responses(
+                    topic
+                        .partition_data
+                        .iter()
+                        .map(|partition| partition_response(partition.index, refusal))
+                        .collect(),
+                ),
+        );
+        false
+    });
+    unnamed
 }
 
 /// No bridge: answer retriable so clients keep their data instead of trusting a discarded write.
@@ -442,6 +487,7 @@ async fn write_request(
         topics.push(
             TopicProduceResponse::default()
                 .with_name(topic.name.clone())
+                .with_topic_id(topic.topic_id)
                 .with_partition_responses(responses),
         );
     }
@@ -926,6 +972,7 @@ fn encode_uniform_response(version: i16, req: &ProduceRequest, error_code: i16) 
         .map(|topic| {
             TopicProduceResponse::default()
                 .with_name(topic.name.clone())
+                .with_topic_id(topic.topic_id)
                 .with_partition_responses(
                     topic
                         .partition_data
