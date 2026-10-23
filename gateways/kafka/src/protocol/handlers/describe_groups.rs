@@ -23,12 +23,14 @@
 //! versions do not, matching Kafka 4.0's `describeGroups`. A v6 client treats error 0 as a real
 //! group. While the first scan of the groups that hold offsets runs (`IggyBridge::offset_groups`),
 //! a group that is not here gets `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. When no
-//! scan could find them, such a group is `Dead`.
+//! scan could find them, such a group is `Dead`. Among several gateways, a group that another
+//! gateway coordinates is `NOT_COORDINATOR` (16).
 //!
 //! `include_authorized_operations` is not answered. The field stays at the omitted sentinel
 //! (`i32::MIN`): there is no group ACL bitfield to report, and any other value fails the
 //! encoder below v3.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -41,8 +43,8 @@ use crate::error::Result;
 use crate::group::{DESCRIBE_RESPONSE_TOO_LARGE, GroupDescription, MemberDescription};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-    ERROR_GROUP_ID_NOT_FOUND, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome,
-    is_supported_version,
+    ERROR_GROUP_ID_NOT_FOUND, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_SERVER_ERROR,
+    GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_describe_groups_shape;
 use crate::protocol::dedup::dedup_first_seen;
@@ -99,23 +101,43 @@ pub async fn handle(
     // One result per distinct id. Repeating one group would otherwise copy its members into the
     // response once per copy, and the shape guard only charges the id strings.
     let group_ids = dedup_first_seen(&requested);
+    // Among several gateways, a group another one coordinates is `NOT_COORDINATOR` (16), and the
+    // admin client asks that one.
+    let snapshot = state.membership.snapshot();
+    let (owned, foreign): (Vec<&StrBytes>, Vec<&StrBytes>) = group_ids
+        .iter()
+        .partition(|group_id| snapshot.coordinates(group_id.as_str()));
+    let owned: Vec<StrBytes> = owned.into_iter().cloned().collect();
     let described = state
         .groups
-        .describe_groups(&group_ids, api_version, state.max_frame_size)
+        .describe_groups(&owned, api_version, state.max_frame_size)
         .await;
     let absent = if described.iter().any(Option::is_none) {
         Absent::look_up(state, connection).await
     } else {
         Absent::Dead
     };
-    let groups = group_ids
+    let mut described: HashMap<&str, DescribedGroup> = owned
         .iter()
         .zip(described)
         .map(|(group_id, group)| {
-            group.map_or_else(
+            let answer = group.map_or_else(
                 || absent.answer(api_version, group_id),
                 |group| described_group(api_version, group),
-            )
+            );
+            (group_id.as_str(), answer)
+        })
+        .collect();
+    let foreign: HashSet<&str> = foreign.iter().map(|group_id| group_id.as_str()).collect();
+    let groups = group_ids
+        .iter()
+        .map(|group_id| {
+            if foreign.contains(group_id.as_str()) {
+                return error_group(api_version, group_id, ERROR_NOT_COORDINATOR, None);
+            }
+            described
+                .remove(group_id.as_str())
+                .unwrap_or_else(|| missing_group(api_version, group_id))
         })
         .collect();
     respond_or_close(encode_response(api_version, groups), "DescribeGroups")

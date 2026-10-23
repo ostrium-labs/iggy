@@ -24,6 +24,7 @@ pub mod env;
 pub mod error;
 pub mod group;
 pub mod listener;
+pub mod membership;
 pub mod oauth;
 pub mod producer_state;
 pub mod protocol;

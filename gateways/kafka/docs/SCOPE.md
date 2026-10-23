@@ -61,7 +61,7 @@ it knows the server supports flexible encoding.
 | 37 | CreatePartitions | 0 | 3 | 0, 1, 2, 3 | With a bridge: adds partitions to the Iggy topic through `create_partitions`; a count at or below the current one answers `INVALID_PARTITIONS` (37). Without one: stub returns `NOT_CONTROLLER` (41). Flexible encoding at v2+ |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
 | 9 | OffsetFetch | 1 | 9 | 1 … 9 | With a bridge: reads each offset, -1 when none is stored, and a null topic list reads every topic that holds the group. Without one: 14. Flexible encoding at v6+ |
-| 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
+| 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers the gateway that coordinates each group key: this one when it runs alone, else the owner among the gateways sharing its bootstrap list ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#several-gateways-behind-one-bootstrap-list)); `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
 | 11 | JoinGroup | 0 | 9 | 0 … 9 | Real membership; parks on the group's join barrier; flexible encoding at v6+ |
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
 | 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
@@ -463,9 +463,18 @@ below it are still open for the issues that build on top of it.
     and the Java client use - fail identically and permanently once the cluster's total partition
     count crosses the trip point, since that size is the catalog's own, not anything the
     requesting client chose or can shrink.
-- [ ] Multi-broker topology (this gateway is, and will stay, a single logical broker - node id 1
-      always leads every partition it reports; nothing here models an Iggy cluster as multiple
-      Kafka-visible brokers)
+- [x] Several gateways as several Kafka brokers behind one bootstrap list
+      ([#4515](https://github.com/apache/iggy/issues/4515)): with `IGGY_KAFKA_NODE_ID` set, the
+      gateways of one Iggy cluster find each other through `<default stream>.meta/gateways`;
+      Metadata and `DescribeCluster` list every live one, each group has one coordinator and each
+      partition one leader among them, and the others answer `NOT_COORDINATOR` (16) and
+      `NOT_LEADER_OR_FOLLOWER` (6). Without it a gateway is node 1 and leads everything, as
+      before. `src/membership.rs`, `tests/membership_real_bridge_tests.rs`,
+      `tests/multi_gateway_oracle_tests.rs`, [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
+      Still open: `CreateTopics` and `CreatePartitions` accept a replication factor of 1 and a
+      manual assignment naming node 1 only, whatever the live gateways are (replication factor
+      semantics belong to #4508). Iggy's replicas stay below the gateways and are not shown as
+      Kafka replicas.
 - [ ] A raw/non-conformant client's extra trailing byte on some Metadata request shapes seen
       against real `kcat`/`librdkafka` traffic in earlier testing on a since-restructured branch -
       not reproduced or root-caused against the current `kafka_protocol`-based decode path in this
