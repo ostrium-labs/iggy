@@ -308,7 +308,7 @@ async fn fetch_unsupported_version_above_max_closes_connection() {
 #[tokio::test]
 async fn produce_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_PRODUCE, 13, Bytes::new(), &default_broker())
+        handle_request(API_KEY_PRODUCE, 14, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "Produce above encoder max must close rather than return a clamped body"
@@ -631,15 +631,15 @@ async fn apiversions_v0_and_v2_e2e_return_success() {
 }
 
 #[tokio::test]
-async fn apiversions_v4_out_of_range_e2e_returns_unsupported() {
+async fn apiversions_v5_out_of_range_e2e_returns_unsupported() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 4, 350, &[]).await;
+    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 5, 350, &[]).await;
     assert_eq!(corr, 350);
     let mut d = Decoder::new(body);
     assert_eq!(
         d.read_i16().unwrap(),
         ERROR_UNSUPPORTED_VERSION,
-        "ApiVersions v4 must return UNSUPPORTED_VERSION per KIP-511"
+        "ApiVersions v5 must return UNSUPPORTED_VERSION per KIP-511"
     );
 }
 

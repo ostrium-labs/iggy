@@ -26,7 +26,7 @@ use iggy_gateway_kafka::protocol::api::BrokerAdvertise;
 /// `src/protocol/api.rs` is declared: the `ApiVersions` tests compare the advertised list row by
 /// row against this one.
 pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
-    (0, "Produce", 3, 9),
+    (0, "Produce", 3, 13),
     (1, "Fetch", 4, 18),
     (2, "ListOffsets", 1, 7),
     (3, "Metadata", 0, 13),
@@ -39,7 +39,7 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (14, "SyncGroup", 0, 5),
     (15, "DescribeGroups", 0, 6),
     (16, "ListGroups", 0, 5),
-    (18, "ApiVersions", 0, 3),
+    (18, "ApiVersions", 0, 4),
     (19, "CreateTopics", 2, 7),
     (20, "DeleteTopics", 1, 6),
     (22, "InitProducerId", 0, 5),
