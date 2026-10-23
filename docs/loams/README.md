@@ -40,6 +40,34 @@ builds `iggy-server`, lints the gateway crate and runs its test suite,
 including the real-client end-to-end tests. Its summary check,
 `Kafka gateway required`, is what fork PRs merge on.
 
+## Images
+
+`.github/workflows/loams-images.yml` publishes one multi-arch (`linux/amd64`,
+`linux/arm64`) image, `ghcr.io/ostrium-labs/iggy`, holding `iggy-server`, the
+`iggy` CLI and `iggy-gateway-kafka` (built by `scripts/loams/Dockerfile`), so
+the server and the gateway always move as one tested pair.
+
+| Tag | Meaning |
+| --- | --- |
+| `loams-<shortsha>` | One per merge to `loams`. Immutable. Loams pins it by digest |
+| `loams` | Moving: the latest `loams` build |
+
+It builds on pushes to `loams` (not docs-only ones) and on manual dispatch. A
+pull request that changes the Dockerfile or the workflow gets one amd64 build
+with no push. Each architecture builds natively and is pushed by digest, then
+joined into one manifest list, with a provenance attestation and an SPDX SBOM
+attestation pushed to the registry. It uses `GITHUB_TOKEN` with `packages:
+write` and no other secret.
+
+```bash
+docker run --rm ghcr.io/ostrium-labs/iggy:loams                    # iggy-server
+docker run --rm ghcr.io/ostrium-labs/iggy:loams iggy-gateway-kafka # the gateway
+gh attestation verify oci://ghcr.io/ostrium-labs/iggy:loams -R ostrium-labs/iggy
+```
+
+Loams runs the pair in its optional `kafka` compose profile (never the default
+stack).
+
 ## Upstream
 
 Nothing is posted to apache/iggy (issues, comments or PRs) without the Loams

@@ -208,7 +208,7 @@ breadth. Status is `Planned` unless noted.
 | KW-16 | Old and pinned clients | #4528 | Planned | KW-2 | Yes |
 | KW-17 | Streams groups and share groups | #4529 | Planned | KW-13 | Later |
 | KW-18 | Kafka-to-Iggy migration guide | #3550 | Planned | KW-5 | Assigned upstream; fork copy only |
-| KW-L1 | Fork images: `iggy-server` and `iggy-gateway-kafka` on GHCR | — | Planned | KW-0 | No |
+| KW-L1 | Fork images: `iggy-server` and `iggy-gateway-kafka` on GHCR | — | **Done** (one image, `ghcr.io/ostrium-labs/iggy`) | KW-0 | No |
 | KW-L2 | Loams compose profile `kafka` | — (Loams repo) | Planned | KW-L1 | No |
 | KW-T | Transactions and exactly-once | #4522 | **Planned, not built** | KW-3, KW-5, KW-6, KW-7 | Design discussion first |
 
@@ -693,12 +693,15 @@ with offset translation, rollback, and Loams' compose profile. After KW-5.
 
 ### KW-L1. Fork images
 
-A fork workflow on tags `loams-kafka-v*` that builds `iggy-server` and
-`iggy-gateway-kafka` images from the tagged `loams` commit with upstream's
-Dockerfiles and pushes them to `ghcr.io/ostrium-labs/iggy-server` and
-`ghcr.io/ostrium-labs/iggy-kafka-gateway`, multi-arch, with SBOM and
-provenance. One tag per tested pair: server and gateway always move together
-(Iggy's protocol is pre-1.0). Exit: an image pair pulled and run by KW-L2.
+**Status: done.** One workflow, `.github/workflows/loams-images.yml`, builds one
+image holding `iggy-server`, the `iggy` CLI and `iggy-gateway-kafka`
+(`scripts/loams/Dockerfile`) and pushes it, `linux/amd64` and `linux/arm64`, to
+`ghcr.io/ostrium-labs/iggy` as `loams-<shortsha>` (one per merge to `loams`)
+and a moving `loams`, with build provenance and an SPDX SBOM attested to the
+registry. One image rather than two, so server and gateway always move
+together (Iggy's protocol is pre-1.0). It builds on pushes to `loams` and on
+manual dispatch only, each architecture natively, layers cached. See
+[README.md](README.md#images).
 
 ### KW-L2. Loams compose profile `kafka`
 
