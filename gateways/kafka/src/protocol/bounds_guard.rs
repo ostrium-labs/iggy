@@ -733,6 +733,19 @@ pub fn validate_delete_topics_shape(
     let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 4;
 
+    if version >= 6 {
+        // v6 names each topic by name or by id (KIP-516), in place of the name list.
+        let topics_count = c.compact_array_count()?;
+        for _ in 0..topics_count {
+            c.compact_string(true)?;
+            c.skip(16)?; // topic_id
+            c.tagged_fields()?;
+        }
+        let _timeout_ms = c.read_i32()?;
+        c.tagged_fields()?;
+        return Ok(());
+    }
+
     let topic_names_count = if flexible {
         c.compact_array_count()?
     } else {
