@@ -29,7 +29,9 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, ProduceTurn, Producer, SendEnd, TopicTarget};
+use crate::bridge::{
+    BridgeError, IggyBridge, InDoubt, ProduceTurn, Producer, Resolution, SendEnd, TopicTarget,
+};
 use crate::error::Result;
 use crate::producer_state::{BatchKey, Landing, ProducerStates, Verdict, idempotence};
 use crate::protocol::api::{
@@ -557,7 +559,8 @@ struct Write<'a> {
 
 /// Writes one partition, first checking an idempotent batch against its producer's state: a retry
 /// of a batch that landed is answered with its offset and not written, a batch out of sequence is
-/// refused with 45, and one from an older epoch with 47. See `producer_state.rs`.
+/// refused with 45, and one from an older epoch with 47. A retry of a batch whose send Iggy never
+/// answered replays that send rather than writing the batch again. See `producer_state.rs`.
 async fn write_checked(
     bridge: &IggyBridge,
     held: Held,
@@ -568,10 +571,16 @@ async fn write_checked(
     let Some((key, (_, epoch, first, last))) = idempotent else {
         return send_by(bridge, held, write, |_| {}).await;
     };
-    match states.check(&key, epoch, first, last) {
+    let batch = Batch {
+        key,
+        epoch,
+        first,
+        last,
+    };
+    match states.check(&batch.key, epoch, first, last) {
         Verdict::Duplicate(base_offset) => {
             tracing::debug!(
-                producer_id = key.producer_id,
+                producer_id = batch.key.producer_id,
                 kafka_topic = write.kafka_topic,
                 first,
                 "answered a retried idempotent batch from producer state"
@@ -581,20 +590,99 @@ async fn write_checked(
         Verdict::OutOfOrder => (Err(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER), Some(held)),
         Verdict::InvalidEpoch => (Err(ERROR_INVALID_PRODUCER_EPOCH), Some(held)),
         Verdict::InFlight => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
-        Verdict::Append => {
-            states.begin(&key, epoch, first, last);
-            let states = Arc::clone(states);
-            send_by(bridge, held, write, move |end| {
-                let landing = match end {
-                    SendEnd::Landed(offset) => Some(Landing::Landed(offset)),
-                    SendEnd::Unknown => Some(Landing::Unknown),
-                    SendEnd::NotSent | SendEnd::Refused => None,
-                };
-                states.finish(&key, epoch, first, landing);
-            })
-            .await
+        Verdict::Append => append(bridge, held, states, batch, write).await,
+        Verdict::Resolve(in_doubt) => {
+            match resolve(bridge, &held, states, &batch.key, &in_doubt, write.deadline).await {
+                Resolution::Landed => {
+                    tracing::debug!(
+                        producer_id = batch.key.producer_id,
+                        kafka_topic = write.kafka_topic,
+                        first,
+                        "a replay proved that a retried idempotent batch had landed"
+                    );
+                    (Ok(None), Some(held))
+                }
+                Resolution::StillInDoubt => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
+                Resolution::Refused | Resolution::Lost => {
+                    append(bridge, held, states, batch, write).await
+                }
+            }
+        }
+        Verdict::ResolveFirst(in_doubt) => {
+            match resolve(bridge, &held, states, &batch.key, &in_doubt, write.deadline).await {
+                Resolution::Landed | Resolution::Lost => {
+                    append(bridge, held, states, batch, write).await
+                }
+                // The batch before it is not in Iggy, so this one would leave a gap.
+                Resolution::Refused => (Err(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER), Some(held)),
+                Resolution::StillInDoubt => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
+            }
         }
     }
+}
+
+/// One idempotent batch: its producer and partition, epoch, and sequences.
+struct Batch {
+    key: BatchKey,
+    epoch: i16,
+    first: i32,
+    last: i32,
+}
+
+/// Replays the send in doubt `in_doubt` and records what it proved. A request nothing keeps any
+/// more leaves the batch's outcome unknown, and its retry is written again: at-least-once.
+async fn resolve(
+    bridge: &IggyBridge,
+    (turn, _): &Held,
+    states: &ProducerStates,
+    key: &BatchKey,
+    in_doubt: &InDoubt,
+    deadline: Deadline,
+) -> Resolution {
+    let resolution = bridge.resolve_send(turn, in_doubt, deadline.at).await;
+    let landing = match resolution {
+        // Iggy's answer to a replay names no offset.
+        Resolution::Landed => Some(Landing::Landed(None)),
+        Resolution::Refused => None,
+        Resolution::Lost => {
+            tracing::debug!(
+                producer_id = key.producer_id,
+                "the request of a send in doubt is gone, so its batch is written again"
+            );
+            Some(Landing::Unknown)
+        }
+        Resolution::StillInDoubt => return resolution,
+    };
+    states.resolved(key, in_doubt, landing);
+    resolution
+}
+
+/// Sends an idempotent batch, recording in its producer's state how the send ended.
+async fn append(
+    bridge: &IggyBridge,
+    held: Held,
+    states: &Arc<ProducerStates>,
+    batch: Batch,
+    write: Write<'_>,
+) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
+    let Batch {
+        key,
+        epoch,
+        first,
+        last,
+    } = batch;
+    states.begin(&key, epoch, first, last);
+    let states = Arc::clone(states);
+    send_by(bridge, held, write, move |end| {
+        let landing = match end {
+            SendEnd::Landed(offset) => Some(Landing::Landed(offset)),
+            SendEnd::InDoubt(in_doubt) => Some(Landing::InDoubt(in_doubt)),
+            SendEnd::Unknown => Some(Landing::Unknown),
+            SendEnd::NotSent | SendEnd::Refused => None,
+        };
+        states.finish(&key, epoch, first, landing);
+    })
+    .await
 }
 
 /// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
