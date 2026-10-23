@@ -33,7 +33,7 @@ use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_API_VERSIONS,
     min_version: 0,
-    max_version: 3,
+    max_version: 4,
 };
 
 /// Which of the listener-dependent keys one connection is told about.

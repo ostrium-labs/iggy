@@ -1097,3 +1097,71 @@ async fn given_no_bridge_when_handled_should_still_answer_the_retriable_stub() {
         "without a bridge nothing is stored, so the answer must stay retriable"
     );
 }
+
+/// Produce v13 at `topic_id`, decoded with `kafka_protocol`'s client half.
+async fn produce_by_id(
+    state: &GatewayState,
+    topic_id: uuid::Uuid,
+    entries: &[Entry],
+) -> kafka_protocol::messages::ProduceResponse {
+    use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+    use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
+    use kafka_protocol::protocol::{Decodable, Encodable};
+    let request = ProduceRequest::default()
+        .with_acks(-1)
+        .with_timeout_ms(5_000)
+        .with_topic_data(vec![
+            TopicProduceData::default()
+                .with_topic_id(topic_id)
+                .with_partition_data(
+                    entries
+                        .iter()
+                        .map(|(index, records)| {
+                            PartitionProduceData::default()
+                                .with_index(*index)
+                                .with_records(Some(records.clone()))
+                        })
+                        .collect(),
+                ),
+        ]);
+    let mut body = BytesMut::new();
+    request.encode(&mut body, 13).expect("encode v13");
+    let mut response = handle_request_bounded(state, API_KEY_PRODUCE, 13, body.freeze())
+        .await
+        .expect_response("acks=-1 answers");
+    ProduceResponse::decode(&mut response, 13).expect("a client decodes it")
+}
+
+/// KIP-516: from v13 a producer names the topic by id; the records land in that topic and the
+/// answer carries the id. An unknown id answers `UNKNOWN_TOPIC_ID` (100).
+#[tokio::test]
+#[serial]
+async fn given_v13_a_topic_named_by_id_should_store_its_records() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    let id = state
+        .bridge
+        .as_ref()
+        .expect("bridge")
+        .list_kafka_topics()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|topic| topic.kafka_topic == TOPIC)
+        .expect("listed")
+        .topic_id;
+    let records = batch(&[record(0, Some(b"k"), b"v", &[])], Compression::None);
+
+    let response = produce_by_id(&state, id, &[(0, records.clone())]).await;
+    assert_eq!(response.responses[0].topic_id, id);
+    let partition = &response.responses[0].partition_responses[0];
+    assert_eq!(partition.error_code, ERROR_NONE);
+    assert_eq!(partition.base_offset, 0);
+    assert_eq!(stored(&server, 0, 10).await.len(), 1);
+
+    let unknown = uuid::Uuid::from_u128(0x0bad_0000_0000_4000_8000_0000_0000_0002);
+    let response = produce_by_id(&state, unknown, &[(0, records)]).await;
+    assert_eq!(response.responses[0].topic_id, unknown);
+    assert_eq!(response.responses[0].partition_responses[0].error_code, 100);
+}
