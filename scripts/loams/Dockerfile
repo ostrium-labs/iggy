@@ -35,11 +35,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libhwloc-dev \
     libudev-dev \
     libssl-dev \
-    nodejs \
-    npm \
     pkg-config \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# The web UI iggy-server embeds (core/server/build.rs). Debian's own Node cannot load the
+# TypeScript Vite config; the official image's Node can.
+FROM node:24-trixie-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build:static
 
 FROM chef AS planner
 COPY . .
@@ -53,8 +60,10 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json \
     -p server -p iggy-cli -p iggy-gateway-kafka
 
 COPY . .
-# iggy-server embeds the web UI (core/server/build.rs).
-RUN npm --prefix web ci && npm --prefix web run build:static
+COPY --from=web /web/build/static /app/web/build/static
+COPY --from=web /web/node_modules /app/web/node_modules
+# third-party-licenses.sh renders the web's npm licenses with Node.
+COPY --from=web /usr/local/bin/node /usr/local/bin/node
 RUN cargo build --release --locked \
     --bin iggy-server --bin iggy --bin iggy-gateway-kafka && \
     cp target/release/iggy-server target/release/iggy target/release/iggy-gateway-kafka /app/
