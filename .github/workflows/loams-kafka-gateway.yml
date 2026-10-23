@@ -118,12 +118,32 @@ jobs:
           for image in $images; do
             timeout 600 docker pull -q "$image"
           done
+          # Redpanda is a nightly oracle only.
+          if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            tag=$(grep -rhoP '^pub const REDPANDA_ORACLE_TAG: &str = "\K[^"]+' gateways/kafka/tests)
+            timeout 600 docker pull -q "$tag"
+            echo "KAFKA_ORACLE_REDPANDA=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Test (gateway)
         env:
           KAFKA_FIXTURES_REQUIRED: "1"
           KAFKA_E2E_REQUIRED: "1"
+          KAFKA_ORACLE_REPORT: ${{ runner.temp }}/oracle-report.txt
         run: cargo nextest run --locked -p iggy-gateway-kafka --profile ci --no-fail-fast
+
+      - name: Oracle report
+        if: always()
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/oracle-report.txt"
+          {
+            echo "### Gateway vs oracles"
+            echo
+            echo '```text'
+            if [[ -s "$report" ]]; then cat "$report"; else echo "(no report: the oracle suite did not finish)"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   required:
     name: Kafka gateway required

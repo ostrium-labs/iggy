@@ -82,7 +82,7 @@ test-group = "kafka_bridge"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests)'
+filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests)'
 test-group = "kafka_client_e2e"
 
 # The chaos monkey runs a five-node cluster for minutes (IGGY_TEST_CHAOS_DURATION_SECS, 120 by
