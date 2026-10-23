@@ -190,7 +190,7 @@ breadth. Status is `Planned` unless noted.
 | # | Task | Issue | Status | Depends on | Upstream candidate |
 | --- | --- | --- | --- | --- | --- |
 | KW-0 | Fork setup: `loams` branch, workflows, lean CI | — | **Done** (7aa0efbf4) | — | No |
-| KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | Planned | KW-0 | Yes |
+| KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | **Built** (this PR) | KW-0 | Yes |
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | Planned | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | Planned | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
@@ -251,6 +251,28 @@ nightly.
 
 **Exit.** The diff suite runs green in fork CI against Apache Kafka with every
 remaining difference listed in `allowed_differences.toml` with its issue.
+
+**As built (2026-10-23).** `oracle_wire_diff_tests.rs` passes against
+`apache/kafka:4.3.1` and `redpandadata/redpanda:v26.1.18` locally, with 18
+declared differences. Apache Kafka is the reference: a fact where the gateway
+agrees with Kafka and only Redpanda differs is reported as "oracles disagree"
+and does not fail the run (Redpanda advertises lower maxima for 11 keys,
+answers `MAX_TIMESTAMP` with offset 0, and answers 6 rather than 3 for a
+missing partition). Besides the gaps already owned by #4508, #4517, #4522
+and #4525, the harness surfaced two documented behaviours that differ from
+Kafka and that Loams' clients can notice:
+
+- **Commit metadata is dropped** (#3542, `OFFSET_STORAGE.md`): OffsetFetch
+  answers `""`. Kafka Streams stores task metadata there. Added to KW-12.
+- **Lookups by time search Iggy's append time**, not the producer timestamp
+  (#4516, `BRIDGE_MAPPING.md`): backfilled or replayed records with old
+  `CreateTime` resolve to the wrong offset. Flink's "start from timestamp" and
+  `--reset-offsets --to-datetime` see it. Added to KW-7 (a time index on the
+  producer timestamp, or on `kafka.ts`).
+
+Fetch past the high watermark answers retriable 6 for 30 s before
+`OFFSET_OUT_OF_RANGE` (1), on purpose (README, Fetch error mapping); declared
+against #3536.
 
 ### KW-2. Client compatibility matrix
 
@@ -457,6 +479,10 @@ design note goes upstream as a discussion first.
 Flink, Spark (`failOnDataLoss`), KEDA and UIs read EARLIEST; Streams purges
 repartition topics with DeleteRecords.
 
+**Also (found by KW-1).** ListOffsets by time searches Iggy's append time
+(#4516), so records with an old producer timestamp resolve to the wrong
+offset; this task adds a lookup on the producer timestamp too.
+
 **Design.** A per-partition log start offset in Iggy that retention and
 segment deletion advance, readable by clients (a field on the partition in
 `get_topic`, or a new read; decided by the smaller change). DeleteRecords sets
@@ -582,8 +608,9 @@ with Apache Kafka.
 
 ### KW-12. Configurable limits; member client id and host
 
-**Why.** #4530 (group caps, CreateTopics caps, frame size have no knobs) and
-the last box of #4511 (`client_id`, `client_host` empty in DescribeGroups,
+**Why.** #4530 (group caps, CreateTopics caps, frame size have no knobs), the
+commit metadata string that OffsetCommit drops today (found by KW-1; Kafka
+Streams stores task metadata in it), and the last box of #4511 (`client_id`, `client_host` empty in DescribeGroups,
 so `kafka-consumer-groups --describe` shows no hosts).
 
 **Files.** `src/env.rs`, `src/main.rs`, `src/group/{mod.rs,state.rs}`, handler
