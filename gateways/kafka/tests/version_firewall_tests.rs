@@ -318,7 +318,7 @@ async fn produce_unsupported_version_above_max_closes_connection() {
 #[tokio::test]
 async fn create_topics_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_CREATE_TOPICS, 7, Bytes::new(), &default_broker())
+        handle_request(API_KEY_CREATE_TOPICS, 8, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "CreateTopics above encoder max must close rather than return a clamped body"
