@@ -40,7 +40,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::{IggyBridge, Producer};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
+    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_INVALID_PRODUCER_EPOCH, ERROR_NONE,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{KEY_HEADER, MAPPING_VERSION, VERSION_HEADER, from_iggy};
@@ -887,16 +888,11 @@ async fn given_a_transactional_batch_when_handled_should_answer_unsupported_vers
 
 #[tokio::test]
 #[serial]
-async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_both_copies() {
+async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_it_once() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
-
-    let mut records = [record(0, None, b"v", &[])];
-    records[0].producer_id = 7;
-    records[0].producer_epoch = 0;
-    records[0].sequence = 0;
-    let entries = [(0, batch(&records, Compression::None))];
+    let entries = [(0, sequenced_batch(7, 0, 0, &[b"a", b"b"]))];
 
     assert_eq!(
         produce(&state, 3, -1, TOPIC, &entries).await,
@@ -905,14 +901,86 @@ async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_both_cop
     );
     assert_eq!(
         produce(&state, 3, -1, TOPIC, &entries).await,
+        vec![(0, ERROR_NONE, 0)],
+        "a retry after a lost response is answered with the offset it landed at (#4513)"
+    );
+    assert_eq!(stored(&server, 0, 10).await.len(), 2, "written once");
+
+    let next = [(0, sequenced_batch(7, 0, 2, &[b"c"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &next).await,
+        vec![(0, ERROR_NONE, 2)],
+        "the next sequence lands after it"
+    );
+    assert_eq!(stored(&server, 0, 10).await.len(), 3);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_a_sequence_gap_when_handled_should_refuse_it_out_of_order() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+
+    let first = [(0, sequenced_batch(9, 0, 0, &[b"a"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &first).await,
+        vec![(0, ERROR_NONE, 0)]
+    );
+    // Sequence 1 is missing: a batch retried while a later one was in flight.
+    let gap = [(0, sequenced_batch(9, 0, 2, &[b"c"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &gap).await,
+        vec![(0, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, -1)],
+        "the Java producer relies on 45 to keep one key's order"
+    );
+    let missing = [(0, sequenced_batch(9, 0, 1, &[b"b"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &missing).await,
         vec![(0, ERROR_NONE, 1)],
-        "the sequence is ignored, so a resend never answers DUPLICATE_SEQUENCE_NUMBER (46)"
+        "the missing batch lands in order"
     );
     assert_eq!(
         stored(&server, 0, 10).await.len(),
         2,
-        "a retry writes twice until the producer pool in IDEMPOTENCE.md lands"
+        "the refused batch was not written"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn given_an_older_epoch_when_handled_should_refuse_it() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+
+    let current = [(0, sequenced_batch(11, 2, 0, &[b"a"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &current).await,
+        vec![(0, ERROR_NONE, 0)]
+    );
+    let zombie = [(0, sequenced_batch(11, 1, 1, &[b"b"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &zombie).await,
+        vec![(0, ERROR_INVALID_PRODUCER_EPOCH, -1)]
+    );
+    assert_eq!(stored(&server, 0, 10).await.len(), 1);
+}
+
+/// A batch of `values` from `producer_id` at `epoch`, its first record at `sequence`.
+fn sequenced_batch(producer_id: i64, epoch: i16, sequence: i32, values: &[&[u8]]) -> Bytes {
+    let records: Vec<Record> = values
+        .iter()
+        .zip(0..)
+        .map(|(value, index)| {
+            let mut record = record(index, None, value, &[]);
+            record.producer_id = producer_id;
+            record.producer_epoch = epoch;
+            record.sequence = sequence + i32::try_from(index).expect("small batch");
+            record
+        })
+        .collect();
+    batch(&records, Compression::None)
 }
 
 #[tokio::test]

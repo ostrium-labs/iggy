@@ -114,11 +114,12 @@ enum Scenario {
     ClassicGroup,
     StandaloneCommit,
     InitProducerId,
+    IdempotentProducer,
     DescribeConfigs,
 }
 
 impl Scenario {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -126,6 +127,7 @@ impl Scenario {
         Self::ClassicGroup,
         Self::StandaloneCommit,
         Self::InitProducerId,
+        Self::IdempotentProducer,
         Self::DescribeConfigs,
     ];
 
@@ -138,6 +140,7 @@ impl Scenario {
             Self::ClassicGroup => "classic_group",
             Self::StandaloneCommit => "standalone_commit",
             Self::InitProducerId => "init_producer_id",
+            Self::IdempotentProducer => "idempotent_producer",
             Self::DescribeConfigs => "describe_configs",
         }
     }
@@ -153,6 +156,7 @@ impl Scenario {
             Self::ClassicGroup => classic_group(cx, &mut client, &mut facts).await?,
             Self::StandaloneCommit => standalone_commit(cx, &mut client, &mut facts).await?,
             Self::InitProducerId => init_producer_id(cx, &mut client, &mut facts).await?,
+            Self::IdempotentProducer => idempotent_producer(cx, &mut client, &mut facts).await?,
             Self::DescribeConfigs => describe_configs(cx, &mut client, &mut facts).await?,
         }
         Ok(facts)
@@ -326,6 +330,15 @@ fn now_ms() -> i64 {
 }
 
 fn batch(records: &[Sent], first_timestamp: i64) -> Result<Bytes, String> {
+    sequenced(records, first_timestamp, None)
+}
+
+/// As [`batch`], from producer `(id, epoch)` with its first record at `sequence`.
+fn sequenced(
+    records: &[Sent],
+    first_timestamp: i64,
+    producer: Option<(i64, i16, i32)>,
+) -> Result<Bytes, String> {
     let records: Vec<Record> = records
         .iter()
         .zip(0_i64..)
@@ -334,13 +347,14 @@ fn batch(records: &[Sent], first_timestamp: i64) -> Result<Bytes, String> {
             control: false,
             delete_horizon: false,
             partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
-            producer_id: NO_PRODUCER_ID,
-            producer_epoch: NO_PRODUCER_EPOCH,
+            producer_id: producer.map_or(NO_PRODUCER_ID, |(id, _, _)| id),
+            producer_epoch: producer.map_or(NO_PRODUCER_EPOCH, |(_, epoch, _)| epoch),
             timestamp_type: TimestampType::Creation,
             offset: index,
             // A fixed `offset - sequence`, or the encoder splits the records into one batch
             // each, and a Produce partition carries exactly one batch.
-            sequence: NO_SEQUENCE + i32::try_from(index).unwrap_or(0),
+            sequence: producer.map_or(NO_SEQUENCE, |(_, _, sequence)| sequence)
+                + i32::try_from(index).unwrap_or(0),
             timestamp: first_timestamp + index * 1000,
             key: key.map(|key| Bytes::from(key.as_bytes().to_vec())),
             value: value.map(|value| Bytes::from(value.as_bytes().to_vec())),
@@ -998,6 +1012,52 @@ async fn init_producer_id(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     facts.set("transactional.error", error);
+    Ok(())
+}
+
+/// Kafka's idempotence rules on one partition: a retry answers its first offset and is not
+/// written again, a gap is 45, the missing batch then lands in order.
+async fn idempotent_producer(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let name = cx.name("idempotent_producer", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let init_version = version(client, ApiKey::InitProducerId, 4)?;
+    let request = InitProducerIdRequest::default()
+        .with_transactional_id(None)
+        .with_transaction_timeout_ms(-1)
+        .with_producer_id(ProducerId(-1))
+        .with_producer_epoch(-1);
+    let mut init = client.send(&request, init_version).await?;
+    for _ in 0..60 {
+        if !coordinator_loading(init.error_code) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        init = client.send(&request, init_version).await?;
+    }
+    let (id, epoch) = (init.producer_id.0, init.producer_epoch);
+    let start = now_ms() - 60_000;
+    let first = sequenced(&RECORDS[..2], start, Some((id, epoch, 0)))?;
+    let (error, base) = produce(client, &name, 0, first.clone()).await?;
+    facts.set("first.error", error);
+    facts.set("first.base_offset", base);
+    let (error, base) = produce(client, &name, 0, first).await?;
+    facts.set("retry.error", error);
+    facts.set("retry.base_offset", base);
+    let gap = sequenced(&RECORDS[3..4], start, Some((id, epoch, 3)))?;
+    let (error, _) = produce(client, &name, 0, gap).await?;
+    facts.set("gap.error", error);
+    let next = sequenced(&RECORDS[2..3], start, Some((id, epoch, 2)))?;
+    let (error, base) = produce(client, &name, 0, next).await?;
+    facts.set("next.error", error);
+    facts.set("next.base_offset", base);
+    let (partition, records) = fetch(client, &name, 0).await?;
+    facts.set("fetch.high_watermark", partition.high_watermark);
+    facts.set("fetch.records", records.len());
     Ok(())
 }
 

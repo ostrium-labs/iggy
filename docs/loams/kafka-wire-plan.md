@@ -192,7 +192,7 @@ breadth. Status is `Planned` unless noted.
 | KW-0 | Fork setup: `loams` branch, workflows, lean CI | — | **Done** (7aa0efbf4) | — | No |
 | KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | **Built** (this PR) | KW-0 | Yes |
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | Planned | KW-1 | Yes |
-| KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | Planned | KW-1 | Yes |
+| KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Part 1 built** (producer state); parts 2–3 planned | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
@@ -367,6 +367,15 @@ Apache Kafka give the same records and the same per-batch error codes
 
 **Exit.** The three acceptance criteria of #4513 pass in fork CI; the README no
 longer says retries are duplicated.
+
+**As built, part 1 (2026-10-23).** `src/producer_state.rs` and the check in
+`src/protocol/handlers/produce.rs`; the bridge gains `send_records_observed`, so a send that ends
+after its request answered 7 still records its outcome. Tests: 12 unit tests, three bridge tests
+in `produce_real_bridge_tests.rs` (retry stored once, gap refused with 45 then filled, older
+epoch refused with 47), and the `idempotent_producer` oracle scenario, which matches Apache Kafka
+fact for fact. Still open: part 2 (an unknown outcome is written again), part 3 (state is lost on
+restart), the Java producer e2e under injected timeouts, and KIP-360's epoch bump on
+InitProducerId with an existing id.
 
 ### KW-4. Topic configurations frameworks send
 

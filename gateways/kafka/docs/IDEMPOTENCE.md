@@ -179,18 +179,21 @@ for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly
 Produce:
 
 - accept `producer_id`, `producer_epoch` and `base_sequence` on the request. The id picks the
-  producer's session when this run handed it out. The epoch and the sequence are ignored
-- never answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) or `DUPLICATE_SEQUENCE_NUMBER` (46)
+  producer's session when this run handed it out. Since the Ostrium fork's KW-3 (see
+  [Producer state](#producer-state-ostrium-fork-kw-3) below), the epoch and the sequence are
+  checked against the producer's state, and the gateway answers
+  `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) and `INVALID_PRODUCER_EPOCH` (47)
 - reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
   level, keeping the connection open. Under `acks=0` there is no response to carry 35, so the
   gateway closes the connection instead, as a Kafka broker does on any `acks=0` produce error.
   The check runs before the `acks=0` branch, so no write path can see a transactional batch
 
-Those first two codes stay unsent even once dedup lands. The watermark accepts any request
-above it without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending
-either code claims a detection the gateway does not have.
+The paragraph this replaced said 45 and 46 stay unsent, because Iggy's watermark cannot tell a
+gap from ordinary traffic. That holds for Iggy's dedup. The producer state below keeps Kafka's
+own sequence numbers in the gateway, so it can detect a gap, and answers 45 for one. 46 stays
+unsent: as on Kafka, a retry of a stored batch is answered `NONE` with its first offset.
 
-The third is where `maybeTransitionToErrorState` is exact. `Sender.completeBatch` ->
+The transactional refusal is where `maybeTransitionToErrorState` is exact. `Sender.completeBatch` ->
 `canRetry` false -> `failBatch` -> `handleFailedBatch` -> `maybeTransitionToErrorState`, whose
 explicit fatal set holds ClusterAuthorization, TransactionalIdAuthorization, ProducerFenced,
 UnsupportedVersion and InvalidPidMapping. `INVALID_TXN_STATE` (48) is explicitly rewritten to
@@ -209,6 +212,42 @@ that sets the bit without the request field gets the retriable stub error (6). J
 librdkafka set both, so no stock client reaches it, and the stub does not parse batches to close
 it. [#3535](https://github.com/apache/iggy/issues/3535) decodes each batch before persisting it,
 and must refuse one with the transactional bit set there, the same way.
+
+## Producer state (Ostrium fork, KW-3)
+
+Status: part 1 built in the Ostrium Labs fork (`docs/loams/kafka-wire-plan.md`, KW-3), not
+upstream. `src/producer_state.rs` keeps what Kafka's `ProducerStateManager` keeps, per producer id
+and partition: the epoch and the last five batches with their first and last sequence and where
+each landed. Produce checks every batch that carries a producer id and a sequence before it sends:
+
+| Batch | Answer | Written |
+| --- | --- | --- |
+| Equal to a stored batch that landed | `NONE` (0), with the base offset it landed at | No |
+| First sequence follows the producer's last | as the send answers | Yes |
+| A gap, or older than the five stored batches | `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) | No |
+| An epoch below the producer's | `INVALID_PRODUCER_EPOCH` (47) | No |
+| A new epoch that does not start at 0 | 45 | No |
+| A producer with no state here (new, forgotten, or from before a restart) | as the send answers | Yes |
+| A retry of a batch whose send still runs | `REQUEST_TIMED_OUT` (7) | No |
+
+The rules are Kafka's (`ProducerAppendInfo.checkSequence`, `findDuplicateBatch`), and the oracle
+suite (`tests/oracle_wire_diff_tests.rs`, scenario `idempotent_producer`) checks them against
+Apache Kafka. A producer's batches already reach Iggy one at a time on its own session, so a
+check and its send never race another batch of the same producer. The bridge reports how each
+send ended (`IggyBridge::send_records_observed`), also when it ends after its request answered 7,
+so the retry that follows is checked against the truth.
+
+What this does not close yet:
+
+- A send that ended without saying whether it landed (the connection to Iggy broke, or the send
+  was cut off at the slot limit) leaves its batch unknown. Its retry is written again, so that
+  one case stays at-least-once. Part 2 (the SDK seams above) closes it by replaying the send as
+  the same Iggy request.
+- State lives in the gateway's memory. After a restart, or on another gateway, a producer has no
+  state and its next batch is accepted at any sequence, as Kafka accepts a producer whose state
+  expired. Part 3 rebuilds state from the log.
+- At most 100,000 producer-partition entries, forgotten after a day idle (Kafka's
+  `producer.id.expiration.ms`) or least recently used first when full.
 
 ## Invariants this design rests on
 

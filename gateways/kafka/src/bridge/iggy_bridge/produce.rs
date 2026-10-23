@@ -393,18 +393,43 @@ impl IggyBridge {
         kept: K,
         target: &TopicTarget,
         partition: u32,
-        mut messages: Vec<IggyMessage>,
+        messages: Vec<IggyMessage>,
         deadline: Instant,
     ) -> (Result<Option<u64>, BridgeError>, Option<(ProduceTurn, K)>) {
+        self.send_records_observed(turn, kept, target, partition, messages, deadline, |_| {})
+            .await
+    }
+
+    /// [`Self::send_records`], calling `observe` once with how the send ended, also when it ends
+    /// after this call returned. Idempotent producer state records outcomes through it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_records_observed<K: Send + 'static>(
+        &self,
+        turn: ProduceTurn,
+        kept: K,
+        target: &TopicTarget,
+        partition: u32,
+        mut messages: Vec<IggyMessage>,
+        deadline: Instant,
+        observe: impl FnOnce(SendEnd) + Send + 'static,
+    ) -> (Result<Option<u64>, BridgeError>, Option<(ProduceTurn, K)>) {
+        let observe = Observer(Some(Box::new(observe)));
         let session = Arc::clone(&turn.seat.session);
         let connect = self.produce_pool.client_of(&session, &self.config);
         let client = match timeout_at(deadline, connect).await {
             Ok(Ok(client)) => client,
-            Ok(Err(error)) => return (Err(error), Some((turn, kept))),
-            Err(_elapsed) => return (Err(BridgeError::Timeout), Some((turn, kept))),
+            Ok(Err(error)) => {
+                observe.end(SendEnd::NotSent);
+                return (Err(error), Some((turn, kept)));
+            }
+            Err(_elapsed) => {
+                observe.end(SendEnd::NotSent);
+                return (Err(BridgeError::Timeout), Some((turn, kept)));
+            }
         };
         // Decoding can run past the deadline. A send must not start late.
         if Instant::now() >= deadline {
+            observe.end(SendEnd::NotSent);
             return (Err(BridgeError::Timeout), Some((turn, kept)));
         }
         let (stream_id, topic_id) = (target.stream_id.clone(), target.topic_id.clone());
@@ -428,7 +453,19 @@ impl IggyBridge {
                     }
                 }
             };
-            within_slot_limit(&session, &client, kept, send).await
+            let (result, kept) = within_slot_limit(&session, &client, kept, send).await;
+            observe.end(match &result {
+                Ok(response) => SendEnd::Landed(
+                    response
+                        .confirmations
+                        .iter()
+                        .find(|confirmation| confirmation.partition_id == partition)
+                        .map(|confirmation| confirmation.base_offset),
+                ),
+                Err(BridgeError::Iggy(_)) => SendEnd::Refused,
+                Err(_) => SendEnd::Unknown,
+            });
+            (result, kept)
         };
         // The SDK cannot cancel a send. One that outlives this call keeps the turn in its task,
         // so the next one waits for it here instead of queueing its batch inside the SDK.
@@ -443,6 +480,39 @@ impl IggyBridge {
                 .map(|confirmation| confirmation.base_offset)
         });
         (base_offset, kept.map(|kept| (turn, kept)))
+    }
+}
+
+/// How a Produce send ended, as far as Iggy said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendEnd {
+    /// It never started: nothing was written.
+    NotSent,
+    /// Iggy appended it, at this base offset when it named one.
+    Landed(Option<u64>),
+    /// Iggy refused it: nothing was written.
+    Refused,
+    /// The connection broke or the send was cut off: it may have landed.
+    Unknown,
+}
+
+/// Calls its callback once. Dropped uncalled, as when the runtime drops a running send, it
+/// reports [`SendEnd::Unknown`].
+struct Observer(Option<Box<dyn FnOnce(SendEnd) + Send>>);
+
+impl Observer {
+    fn end(mut self, end: SendEnd) {
+        if let Some(observe) = self.0.take() {
+            observe(end);
+        }
+    }
+}
+
+impl Drop for Observer {
+    fn drop(&mut self) {
+        if let Some(observe) = self.0.take() {
+            observe(SendEnd::Unknown);
+        }
     }
 }
 
