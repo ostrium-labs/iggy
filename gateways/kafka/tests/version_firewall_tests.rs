@@ -231,11 +231,11 @@ async fn metadata_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn metadata_above_max_version_closes_connection() {
-    // v10 request uses flexible encoding; a clamped v9 reply would not survive client parsing.
+    // A clamped v13 reply would not survive client parsing at v14.
     assert!(
         handle_request(
             API_KEY_METADATA,
-            10,
+            14,
             build_metadata_flexible_request_v10(&["test-topic"]),
             &default_broker(),
         )
@@ -251,8 +251,8 @@ async fn e2e_metadata_above_max_version_closes_tcp_connection() {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let body = build_metadata_flexible_request_v10(&["orders"]);
-    let frame = build_request_frame(API_KEY_METADATA, 10, 44, Some("n9-test"), &body);
-    stream.write_all(&frame).await.expect("write metadata v10");
+    let frame = build_request_frame(API_KEY_METADATA, 14, 44, Some("n9-test"), &body);
+    stream.write_all(&frame).await.expect("write metadata v14");
 
     assert_eq!(
         read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
