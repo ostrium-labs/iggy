@@ -632,6 +632,9 @@ pub fn validate_list_offsets_shape(
             c.tagged_fields()?;
         }
     }
+    if version >= 10 {
+        let _timeout_ms = c.read_i32()?;
+    }
     if flexible {
         c.tagged_fields()?;
     }

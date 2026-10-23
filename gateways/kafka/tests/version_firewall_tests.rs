@@ -328,7 +328,7 @@ async fn create_topics_unsupported_version_above_max_closes_connection() {
 #[tokio::test]
 async fn list_offsets_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_LIST_OFFSETS, 8, Bytes::new(), &default_broker())
+        handle_request(API_KEY_LIST_OFFSETS, 11, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "ListOffsets above encoder max must close rather than return a clamped body"
@@ -802,12 +802,12 @@ async fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
 // ── Unsupported-version e2e paths for remaining scoped APIs ─────────────────
 
 #[tokio::test]
-async fn list_offsets_v8_unsupported_e2e_closes_connection() {
+async fn list_offsets_v11_unsupported_e2e_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     let frame = build_request_frame(
         API_KEY_LIST_OFFSETS,
-        8,
+        11,
         370,
         Some("scope-test"),
         &[0x00, 0x00, 0x00, 0x00],
@@ -816,7 +816,7 @@ async fn list_offsets_v8_unsupported_e2e_closes_connection() {
     assert_eq!(
         read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
         ByteRead::Closed,
-        "ListOffsets v8 is above the advertised max and must close"
+        "ListOffsets v11 is above the advertised max and must close"
     );
 }
 
