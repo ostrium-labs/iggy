@@ -77,6 +77,9 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
 | `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
+| `IGGY_KAFKA_NODE_ID` | unset | This gateway's Kafka node id, 0 or more, unique among the gateways that share one bootstrap list. Setting it puts the gateway among the others it finds in Iggy: each group gets one coordinator and each partition one leader among them ([Several gateways](docs/CONSUMER_GROUPS.md#several-gateways-behind-one-bootstrap-list)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Unset, the gateway runs alone as node 1 |
+| `IGGY_KAFKA_MEMBERSHIP_HEARTBEAT_MS` | `2000` | How often a gateway with a node id announces itself in Iggy and reads the others. Refused without `IGGY_KAFKA_NODE_ID` |
+| `IGGY_KAFKA_MEMBERSHIP_LEASE_MS` | `10000` | How long a gateway that stopped announcing itself, without saying goodbye, still counts as live. Longer than two heartbeat intervals. Refused without `IGGY_KAFKA_NODE_ID` |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 | `IGGY_KAFKA_SASL_MECHANISMS` | `PLAIN` | SASL mechanisms the SASL listeners offer, comma-separated: `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`. Refused without a SASL listener. See [Authentication](#authentication-3549-4512) |
 | `IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS` | `0` (no limit) | Kafka's `connections.max.reauth.ms`: the longest a SASL session lasts before the client must re-authenticate on the same connection (KIP-368) |
@@ -258,7 +261,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) — how a Kafka record becomes an Iggy message, and back
 - [docs/IDEMPOTENCE.md](docs/IDEMPOTENCE.md) — InitProducerId, and why delivery is at-least-once
 - [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) — where Kafka consumer group offsets live
-- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
+- [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and several gateways behind one bootstrap list
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
 - [docs/CONFIGS.md](docs/CONFIGS.md) — topic configurations on CreateTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs: which Iggy honours and which it stores and echoes
@@ -293,8 +296,10 @@ member that leaves hands its partition to the other at its commit.
 
 Limits:
 
-- One gateway per bootstrap endpoint. Group membership is gateway memory
-  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
+- Several gateways can share one bootstrap list once each has its own `IGGY_KAFKA_NODE_ID`. Each
+  group then has one coordinator among them, and its state is that gateway's memory, so a group
+  whose coordinator stops rejoins on another one
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#several-gateways-behind-one-bootstrap-list)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
 - Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).

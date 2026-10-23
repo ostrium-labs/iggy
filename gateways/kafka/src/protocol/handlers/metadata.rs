@@ -32,6 +32,7 @@ use crate::bridge::IggyBridge;
 use crate::bridge::topic_map::is_valid_kafka_topic_name;
 use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
+use crate::membership::Snapshot;
 use crate::protocol::api::{
     API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ConnectionState,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
@@ -174,10 +175,10 @@ pub async fn handle(
         // this shard for the duration. `spawn_blocking` moves that cost off the shard's own task
         // so ordinary requests keep their latency regardless of how large one all-topics response
         // gets.
-        let broker = connection.broker.clone();
+        let advertised = Advertised::of(state, connection);
         let cluster_id = state.cluster_id.clone();
         tokio::task::spawn_blocking(move || {
-            encode_real_response(api_version, &results, &broker, &cluster_id)
+            encode_real_response(api_version, &results, &advertised, &cluster_id)
         })
         .await
         .unwrap_or_else(|join_error| {
@@ -185,7 +186,12 @@ pub async fn handle(
             Err(KafkaProtocolError::Malformed(join_error.to_string()))
         })
     } else {
-        encode_real_response(api_version, &results, &connection.broker, &state.cluster_id)
+        encode_real_response(
+            api_version,
+            &results,
+            &Advertised::of(state, connection),
+            &state.cluster_id,
+        )
     };
     respond_or_close(encoded, "Metadata")
 }
@@ -573,14 +579,70 @@ pub fn encode_response(
     encode_message(&resp, response_version, 256)
 }
 
+/// The brokers a bridged Metadata answer lists, and who leads each partition.
+///
+/// A gateway that runs alone is broker 1 and leads every partition. Among several gateways
+/// (`crate::membership`), every live gateway with a listener of the connection's protocol is a
+/// broker, and each partition is led by the gateway the membership names, so producers spread
+/// over the gateways and the batches of one partition reach one gateway's producer state.
+pub struct Advertised {
+    brokers: Vec<(i32, BrokerAdvertise)>,
+    snapshot: Arc<Snapshot>,
+}
+
+impl Advertised {
+    #[must_use]
+    pub fn of(state: &GatewayState, connection: &ConnectionState) -> Self {
+        let snapshot = state.membership.snapshot();
+        Self {
+            brokers: snapshot.brokers(connection.security_protocol(), &connection.broker),
+            snapshot,
+        }
+    }
+
+    /// What a gateway that runs alone advertises: `broker`, as node 1.
+    #[must_use]
+    pub fn single(broker: &BrokerAdvertise) -> Self {
+        let snapshot = Arc::new(Snapshot::single(crate::membership::SINGLE_NODE_ID));
+        Self {
+            brokers: vec![(snapshot.node_id(), broker.clone())],
+            snapshot,
+        }
+    }
+
+    /// The partition's leader, or this gateway when the leader cannot be reached on the
+    /// connection's protocol.
+    fn leader(&self, topic: &str, partition: i32) -> i32 {
+        let leader = self.snapshot.leader(topic, partition);
+        if self.brokers.iter().any(|(node_id, _)| *node_id == leader) {
+            leader
+        } else {
+            self.snapshot.node_id()
+        }
+    }
+
+    fn controller(&self) -> i32 {
+        let controller = self.snapshot.controller();
+        if self
+            .brokers
+            .iter()
+            .any(|(node_id, _)| *node_id == controller)
+        {
+            controller
+        } else {
+            self.snapshot.node_id()
+        }
+    }
+}
+
 /// Real (bridge-backed) response: unlike [`encode_response`], each topic carries its own
-/// resolved error code and, on success, one [`MetadataResponsePartition`] per partition with
-/// this gateway's single broker (node id 1) as leader/replica/ISR - there is only ever one
-/// broker behind this gateway, so that triple is never actually in question.
+/// resolved error code and, on success, one [`MetadataResponsePartition`] per partition with its
+/// leader as the only replica and ISR. Iggy replicates below the gateways, so Kafka's replica
+/// set has nothing to name.
 fn encode_real_response(
     response_version: i16,
     results: &[TopicResult],
-    broker: &BrokerAdvertise,
+    advertised: &Advertised,
     cluster_id: &ClusterId,
 ) -> Result<Bytes> {
     let response_topics = results
@@ -589,11 +651,13 @@ fn encode_real_response(
             let partitions = if result.error_code == ERROR_NONE {
                 (0..result.partitions_count)
                     .map(|index| {
+                        let index = i32::try_from(index).unwrap_or(i32::MAX);
+                        let leader = BrokerId(advertised.leader(result.name.as_str(), index));
                         MetadataResponsePartition::default()
-                            .with_partition_index(i32::try_from(index).unwrap_or(i32::MAX))
-                            .with_leader_id(BrokerId(1))
-                            .with_replica_nodes(vec![BrokerId(1)])
-                            .with_isr_nodes(vec![BrokerId(1)])
+                            .with_partition_index(index)
+                            .with_leader_id(leader)
+                            .with_replica_nodes(vec![leader])
+                            .with_isr_nodes(vec![leader])
                     })
                     .collect()
             } else {
@@ -607,15 +671,21 @@ fn encode_real_response(
         })
         .collect();
 
-    let broker_entry = MetadataResponseBroker::default()
-        .with_node_id(BrokerId(1))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
+    let brokers = advertised
+        .brokers
+        .iter()
+        .map(|(node_id, broker)| {
+            MetadataResponseBroker::default()
+                .with_node_id(BrokerId(*node_id))
+                .with_host(StrBytes::from_string(broker.host.clone()))
+                .with_port(broker.port)
+        })
+        .collect();
 
     let resp = MetadataResponse::default()
-        .with_brokers(vec![broker_entry])
+        .with_brokers(brokers)
         .with_cluster_id(Some(StrBytes::from_string(cluster_id.to_string())))
-        .with_controller_id(BrokerId(1))
+        .with_controller_id(BrokerId(advertised.controller()))
         .with_topics(response_topics);
 
     encode_message(&resp, response_version, 256)
@@ -943,7 +1013,8 @@ mod tests {
         let results = [topic_result("orders", ERROR_NONE, 1)];
         for version in RANGE.min_version..=RANGE.max_version {
             let mut body =
-                encode_real_response(version, &results, &broker, &cluster_id).expect("encode");
+                encode_real_response(version, &results, &Advertised::single(&broker), &cluster_id)
+                    .expect("encode");
             let response =
                 MetadataResponse::decode(&mut body, version).expect("a Metadata response");
             let expected = (version >= 2).then_some(cluster_id.as_str());

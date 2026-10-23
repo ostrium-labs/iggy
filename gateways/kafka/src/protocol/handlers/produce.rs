@@ -182,6 +182,20 @@ pub async fn handle(
     } else {
         Vec::new()
     };
+    // Among several gateways, a partition's batches go to its leader only, so one gateway holds
+    // its producer state. A client with stale metadata is told to refresh it, and nothing of the
+    // request is written: Kafka clients send one request per leader, so this is a request that
+    // went to the wrong gateway, and its retry goes to the right one. After the naming: from v13
+    // a topic has no name until its id is looked up, and leadership is decided by name.
+    if !leads_every_partition(state, &request) {
+        tracing::debug!("Produce names a partition another gateway leads");
+        if request.acks == ACKS_NONE {
+            return HandleOutcome::Close;
+        }
+        let mut responses = uniform_responses(&request, ERROR_NOT_LEADER_OR_FOLLOWER);
+        responses.extend(unnamed);
+        return respond_or_close(encode_written_response(api_version, responses), "Produce");
+    }
     // The turn before the memory: a request that waits behind its producer's stuck send then
     // holds none, and no large slot.
     let producer = producer_of(state, connection, principal, &request);
@@ -257,6 +271,21 @@ async fn name_topics(
         false
     });
     unnamed
+}
+
+/// Whether this gateway leads every partition `request` writes to (`crate::membership`). A
+/// gateway that runs alone leads them all.
+fn leads_every_partition(state: &GatewayState, request: &ProduceRequest) -> bool {
+    if !state.membership.is_shared() {
+        return true;
+    }
+    let snapshot = state.membership.snapshot();
+    request.topic_data.iter().all(|topic| {
+        topic
+            .partition_data
+            .iter()
+            .all(|partition| snapshot.leads(topic.name.as_str(), partition.index))
+    })
 }
 
 /// No bridge: answer retriable so clients keep their data instead of trusting a discarded write.
@@ -966,8 +995,12 @@ pub fn encode_response(version: i16, req: &ProduceRequest) -> Result<Bytes> {
 /// One code for every partition named, for failures that belong to the request and not to a
 /// single partition.
 fn encode_uniform_response(version: i16, req: &ProduceRequest, error_code: i16) -> Result<Bytes> {
-    let responses = req
-        .topic_data
+    encode_written_response(version, uniform_responses(req, error_code))
+}
+
+/// `error_code` on every partition `req` names.
+fn uniform_responses(req: &ProduceRequest, error_code: i16) -> Vec<TopicProduceResponse> {
+    req.topic_data
         .iter()
         .map(|topic| {
             TopicProduceResponse::default()
@@ -981,8 +1014,7 @@ fn encode_uniform_response(version: i16, req: &ProduceRequest, error_code: i16) 
                         .collect(),
                 )
         })
-        .collect();
-    encode_written_response(version, responses)
+        .collect()
 }
 
 /// # Errors

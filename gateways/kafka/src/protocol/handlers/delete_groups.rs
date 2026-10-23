@@ -57,7 +57,7 @@ use crate::group::{GroupRemoval, is_valid_group_id};
 use crate::protocol::api::{
     API_KEY_DELETE_GROUPS, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
     ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_GROUP_ID,
-    ERROR_NON_EMPTY_GROUP, ERROR_NONE, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_NON_EMPTY_GROUP, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_TOPIC_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_delete_groups_shape;
@@ -107,7 +107,7 @@ pub async fn handle(
         .collect();
     let group_ids = dedup_first_seen(&requested);
     let codes = if may_delete_groups(principal, "DeleteGroups") {
-        delete(state, connection, &group_ids).await
+        delete_owned(state, connection, &group_ids).await
     } else {
         vec![ERROR_GROUP_AUTHORIZATION_FAILED; group_ids.len()]
     };
@@ -131,6 +131,38 @@ enum Plan {
     /// Its offsets go. `held`: this coordinator holds the group, so it exists even when no topic
     /// holds its offsets.
     Delete { held: bool },
+}
+
+/// [`delete`] for the groups this gateway coordinates. Among several gateways, a group that
+/// another one coordinates is `NOT_COORDINATOR` (16), and the admin client asks that one.
+async fn delete_owned(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    group_ids: &[StrBytes],
+) -> Vec<i16> {
+    let snapshot = state.membership.snapshot();
+    let foreign = |group_id: &StrBytes| {
+        is_valid_group_id(group_id) && !snapshot.coordinates(group_id.as_str())
+    };
+    if !group_ids.iter().any(foreign) {
+        return delete(state, connection, group_ids).await;
+    }
+    let owned: Vec<StrBytes> = group_ids
+        .iter()
+        .filter(|group_id| !foreign(group_id))
+        .cloned()
+        .collect();
+    let mut codes = delete(state, connection, &owned).await.into_iter();
+    group_ids
+        .iter()
+        .map(|group_id| {
+            if foreign(group_id) {
+                ERROR_NOT_COORDINATOR
+            } else {
+                codes.next().unwrap_or(ERROR_NOT_COORDINATOR)
+            }
+        })
+        .collect()
 }
 
 /// One code per group of `group_ids`, in order.

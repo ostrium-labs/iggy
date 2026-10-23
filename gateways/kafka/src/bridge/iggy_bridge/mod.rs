@@ -38,6 +38,7 @@ use crate::scram::{ScramCredential, ScramMechanism};
 
 mod cluster_id;
 mod fetch;
+mod gateways;
 mod group_index;
 mod group_offsets;
 mod log_start;
@@ -186,6 +187,8 @@ pub struct IggyBridge {
     scram_client: LazyClient,
     /// The SCRAM credentials replayed from that log.
     scram: ScramStore,
+    /// The client of the membership heartbeats, so a heartbeat never waits behind a request.
+    membership_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -234,6 +237,7 @@ impl IggyBridge {
             log_starts: LogStarts::default(),
             scram_client: LazyClient::default(),
             scram: ScramStore::default(),
+            membership_client: LazyClient::default(),
         })
     }
 
@@ -323,6 +327,7 @@ impl IggyBridge {
             offset_clients,
             scan_client,
             scram_client,
+            membership_client,
             shared_client,
         ) = tokio::join!(
             self.produce_pool.close(),
@@ -333,6 +338,7 @@ impl IggyBridge {
             self.offset_pool.close(),
             self.scan_client.close(),
             self.scram_client.close(),
+            self.membership_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
@@ -343,6 +349,7 @@ impl IggyBridge {
             .and(offset_clients)
             .and(scan_client)
             .and(scram_client)
+            .and(membership_client)
             .and(shared_client)
     }
 
@@ -435,6 +442,7 @@ impl IggyBridge {
             log_starts: LogStarts::default(),
             scram_client: LazyClient::default(),
             scram: ScramStore::default(),
+            membership_client: LazyClient::default(),
         }
     }
 }
