@@ -44,7 +44,7 @@ use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_OFFSETS,
     min_version: 1,
-    max_version: 7,
+    max_version: 10,
 };
 
 /// Cap on distinct topics one `ListOffsets` request resolves through the bridge in one pass.
@@ -68,6 +68,12 @@ const EARLIEST_TIMESTAMP: i64 = -2;
 /// KIP-734 sentinel, from v7. Kafka answers the record with the largest timestamp, this gateway
 /// the last record appended.
 const MAX_TIMESTAMP: i64 = -3;
+/// KIP-405 sentinel, from v8: the first offset in local storage. Iggy has no tiered storage, so
+/// it is the earliest offset.
+const EARLIEST_LOCAL_TIMESTAMP: i64 = -4;
+/// KIP-1005 sentinel, from v9: the last offset in tiered storage. A broker without tiered storage
+/// (Kafka with `remote.log.storage.system.enable=false`) answers offset -1 with no error.
+const LATEST_TIERED_TIMESTAMP: i64 = -5;
 
 /// Most of the request deadline one record lookup may take, so a partition that stalls leaves
 /// time for the rest.
@@ -372,16 +378,21 @@ fn resolve_one_partition(
 
     let lookup = match requested.timestamp {
         LATEST_TIMESTAMP => return PartitionAnswer::Answered(offset_response(index, watermark)),
+        // Iggy has no tiered storage: -1, as a Kafka broker without it answers.
+        LATEST_TIERED_TIMESTAMP => {
+            return PartitionAnswer::Answered(offset_response(index, UNKNOWN_OFFSET));
+        }
         // Every record is deleted, or the partition was never written to: no read can say more.
         // A server without stats reads a high watermark of 0 too, and then 0 is still a start
         // offset a consumer can read from.
-        EARLIEST_TIMESTAMP
+        EARLIEST_TIMESTAMP | EARLIEST_LOCAL_TIMESTAMP
             if probe.deleted_below >= probe.high_watermark || probe.high_watermark == 0 =>
         {
             let start = i64::try_from(probe.deleted_below).unwrap_or(i64::MAX);
             return PartitionAnswer::Answered(offset_response(index, start));
         }
-        EARLIEST_TIMESTAMP => Lookup::Earliest,
+        // Without tiered storage the local log start is the log start.
+        EARLIEST_TIMESTAMP | EARLIEST_LOCAL_TIMESTAMP => Lookup::Earliest,
         MAX_TIMESTAMP => Lookup::Last,
         millis => Lookup::Time(millis),
     };
