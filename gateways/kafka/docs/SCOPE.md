@@ -55,8 +55,8 @@ it knows the server supports flexible encoding.
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 18 | 4 … 18 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s); `OFFSET_OUT_OF_RANGE` (1) below the log start offset. From v13 topics are named by [topic id](#topic-ids); an unknown id answers `UNKNOWN_TOPIC_ID` (100) on each partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST (the log start offset), a timestamp (searched on the record timestamp) and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
-| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | With a bridge: creates the Iggy topic with every Kafka topic configuration ([`CONFIGS.md`](CONFIGS.md)); any replication factor of 1 or more is accepted and reported as 1. Without one: stub returns `NOT_CONTROLLER` (41). `-1` partitions/RF = broker default at every version |
-| 20 | DeleteTopics | 1 | 5 | 1, 2, 3, 4, 5 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 (topic-id-based) not advertised - this bridge has no topic-id concept |
+| 19 | CreateTopics | 2 | 7 | 2 … 7 | With a bridge: creates the Iggy topic with every Kafka topic configuration ([`CONFIGS.md`](CONFIGS.md)); any replication factor of 1 or more is accepted and reported as 1. Without one: stub returns `NOT_CONTROLLER` (41). `-1` partitions/RF = broker default at every version; v7 answers each created topic's [topic id](#topic-ids) |
+| 20 | DeleteTopics | 1 | 6 | 1 … 6 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 names each topic by name or by [topic id](#topic-ids); both at once answer `INVALID_REQUEST` (42), an unknown id `UNKNOWN_TOPIC_ID` (100) |
 | 21 | DeleteRecords | 0 | 2 | 0, 1, 2 | With a bridge: raises each partition's watermark, and answers the new log start offset (see "DeleteRecords and the log start offset" below). Without one: `NOT_LEADER_OR_FOLLOWER` (6). Flexible encoding at v2 |
 | 37 | CreatePartitions | 0 | 3 | 0, 1, 2, 3 | With a bridge: adds partitions to the Iggy topic through `create_partitions`; a count at or below the current one answers `INVALID_PARTITIONS` (37). Without one: stub returns `NOT_CONTROLLER` (41). Flexible encoding at v2+ |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
@@ -100,8 +100,8 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 15 | DescribeGroups | 0–6 | v5 |
 | 16 | ListGroups | 0–5 | v3 |
 | 18 | ApiVersions | 0–3 | v3 |
-| 19 | CreateTopics | 2–5 | v5 |
-| 20 | DeleteTopics | 1–5 | v4 |
+| 19 | CreateTopics | 2–7 | v5 |
+| 20 | DeleteTopics | 1–6 | v4 |
 | 22 | InitProducerId | 0–5 | v2 |
 | 32 | DescribeConfigs | 1–4 | v4 |
 | 33 | AlterConfigs | 0–2 | v2 |
