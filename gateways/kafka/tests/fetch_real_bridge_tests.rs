@@ -844,3 +844,88 @@ async fn given_read_committed_when_fetching_should_set_last_stable_offset_to_hig
     assert_eq!(partition.aborted_transactions, None);
     assert_eq!(offsets(partition), vec![0, 1]);
 }
+
+/// The topic id (KIP-516) the gateway reports for [`TOPIC`].
+async fn topic_id(state: &GatewayState) -> uuid::Uuid {
+    let topics = state
+        .bridge
+        .as_ref()
+        .expect("a bridge")
+        .list_kafka_topics()
+        .await
+        .expect("list topics");
+    topics
+        .into_iter()
+        .find(|topic| topic.kafka_topic == TOPIC)
+        .expect("the topic is listed")
+        .topic_id
+}
+
+/// [`request`] naming the topic by id, as from v13.
+fn request_by_id(id: uuid::Uuid, partitions: &[(i32, i64)]) -> FetchRequest {
+    let mut by_id = request("", partitions);
+    by_id.topics[0].topic_id = id;
+    by_id
+}
+
+/// KIP-516: from v13 a consumer names the topic by id, and the answer carries the same id.
+#[tokio::test]
+#[serial]
+async fn given_v13_and_later_a_topic_named_by_id_should_return_its_records() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    store(&server, 0, &[keyed(b"first"), keyed(b"second")]).await;
+    let id = topic_id(&state).await;
+
+    for version in 13..=18 {
+        let response = tokio::time::timeout(
+            PROMPT,
+            fetch_at(&state, version, &request_by_id(id, &[(0, 0)])),
+        )
+        .await
+        .expect("records answer at once");
+        assert_eq!(response.responses.len(), 1, "v{version}");
+        assert_eq!(response.responses[0].topic_id, id, "v{version}");
+        let partition = only(&response);
+        assert_eq!(partition.error_code, ERROR_NONE, "v{version}");
+        assert_eq!(offsets(partition), vec![0, 1], "v{version}");
+    }
+}
+
+/// An id no topic has answers `UNKNOWN_TOPIC_ID` (100) on each of its partitions, and a known
+/// topic in the same request is still served.
+#[tokio::test]
+#[serial]
+async fn given_an_unknown_topic_id_should_answer_100_and_serve_the_rest() {
+    const ERROR_UNKNOWN_TOPIC_ID: i16 = 100;
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    store(&server, 0, &[keyed(b"first")]).await;
+    let id = topic_id(&state).await;
+    let unknown = uuid::Uuid::from_u128(0x0bad_0000_0000_4000_8000_0000_0000_0001);
+    let mut both = request_by_id(id, &[(0, 0)]);
+    let mut missing = request_by_id(unknown, &[(0, 0), (1, 0)]);
+    both.topics.push(missing.topics.remove(0));
+
+    let response = tokio::time::timeout(PROMPT, fetch_at(&state, 13, &both))
+        .await
+        .expect("answers at once");
+    assert_eq!(response.responses.len(), 2);
+    let known = response
+        .responses
+        .iter()
+        .find(|topic| topic.topic_id == id)
+        .expect("the known topic answers");
+    assert_eq!(offsets(&known.partitions[0]), vec![0]);
+    let unknown_answer = response
+        .responses
+        .iter()
+        .find(|topic| topic.topic_id == unknown)
+        .expect("the unknown id answers");
+    assert_eq!(unknown_answer.partitions.len(), 2);
+    for partition in &unknown_answer.partitions {
+        assert_refused(partition, ERROR_UNKNOWN_TOPIC_ID);
+    }
+}
