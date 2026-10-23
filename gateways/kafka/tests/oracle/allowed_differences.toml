@@ -1,0 +1,138 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Every intended difference between the gateway and an oracle, read by
+# oracle_wire_diff_tests.rs. An observed difference not listed here fails the
+# run, and so does an entry here that no longer occurs: when a gap closes, its
+# entry goes. `oracles` limits an entry to some oracles; without it, it applies
+# to every oracle. `issue` is the apache/iggy issue that owns the gap.
+
+# CreateTopics refuses every topic configuration today.
+[[difference]]
+scenario = "topic_admin"
+fact = "create_with_retention_ms.error"
+issue = "apache/iggy#4508"
+reason = "CreateTopics answers INVALID_CONFIG (40) to any configuration"
+
+# No log start offset: Fetch reports it unknown.
+[[difference]]
+scenario = "produce_fetch"
+fact = "fetch.log_start_offset"
+issue = "apache/iggy#4525"
+reason = "Iggy exposes no log start offset, so Fetch sends -1"
+
+# Headers come back sorted by name, not in send order.
+[[difference]]
+scenario = "produce_fetch"
+fact = "fetch.offset_1.headers"
+issue = "apache/iggy#4517"
+reason = "Iggy user headers are keyed in a BTreeMap"
+
+# Documented: past the high watermark the gateway answers retriable 6 for 30 s before 1.
+[[difference]]
+scenario = "produce_fetch"
+fact = "fetch_beyond_end.error"
+issue = "apache/iggy#3536"
+reason = "README Fetch error mapping: OFFSET_OUT_OF_RANGE only after 30 s of NOT_LEADER_OR_FOLLOWER, so a lagging node is not mistaken for data loss"
+
+# Documented: lookups by time search Iggy's append time, not the producer timestamp.
+[[difference]]
+scenario = "list_offsets"
+fact = "at_third_record.offset"
+issue = "apache/iggy#4516"
+reason = "BRIDGE_MAPPING.md: Iggy searches by the time it appended each batch; the records here carry producer timestamps a minute in the past"
+
+[[difference]]
+scenario = "list_offsets"
+fact = "at_third_record.timestamp_delta"
+issue = "apache/iggy#4516"
+reason = "follows from the append-time search"
+
+[[difference]]
+scenario = "list_offsets"
+fact = "between_records.offset"
+issue = "apache/iggy#4516"
+reason = "follows from the append-time search"
+
+[[difference]]
+scenario = "list_offsets"
+fact = "between_records.timestamp_delta"
+issue = "apache/iggy#4516"
+reason = "follows from the append-time search"
+
+# Documented: the commit metadata string is dropped.
+[[difference]]
+scenario = "classic_group"
+fact = "fetch_offsets.p0.metadata"
+issue = "apache/iggy#3542"
+reason = "OFFSET_STORAGE.md: the metadata string is dropped and OffsetFetch answers an empty string"
+
+[[difference]]
+scenario = "classic_group"
+fact = "fetch_offsets_after_leave.p0.metadata"
+issue = "apache/iggy#3542"
+reason = "OFFSET_STORAGE.md: the metadata string is dropped"
+
+[[difference]]
+scenario = "standalone_commit"
+fact = "after.p0.metadata"
+issue = "apache/iggy#3542"
+reason = "OFFSET_STORAGE.md: the metadata string is dropped"
+
+[[difference]]
+scenario = "standalone_commit"
+fact = "after_reset.p0.metadata"
+issue = "apache/iggy#3542"
+reason = "OFFSET_STORAGE.md: the metadata string is dropped"
+
+# Transactions are refused (planned, not built).
+[[difference]]
+scenario = "init_producer_id"
+fact = "find_transaction_coordinator.error"
+issue = "apache/iggy#4522"
+reason = "FindCoordinator for a transaction answers TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53)"
+
+[[difference]]
+scenario = "init_producer_id"
+fact = "transactional.error"
+issue = "apache/iggy#4522"
+reason = "InitProducerId with a transactional id answers UNSUPPORTED_VERSION (35)"
+
+# Topic configs: only retention.ms is reported, as never-expire by default.
+[[difference]]
+scenario = "describe_configs"
+fact = "retention.ms.value"
+issue = "apache/iggy#4508"
+reason = "an Iggy topic never expires by default; Kafka's default is 7 days"
+
+[[difference]]
+scenario = "describe_configs"
+fact = "cleanup.policy.value"
+issue = "apache/iggy#4508"
+reason = "cleanup.policy is left out until a policy is stored per topic"
+
+[[difference]]
+scenario = "describe_configs"
+fact = "cleanup.policy.source"
+issue = "apache/iggy#4508"
+reason = "cleanup.policy is left out until a policy is stored per topic"
+
+[[difference]]
+scenario = "describe_configs"
+fact = "cleanup.policy.read_only"
+issue = "apache/iggy#4508"
+reason = "cleanup.policy is left out until a policy is stored per topic"
