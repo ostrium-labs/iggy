@@ -120,13 +120,16 @@ authorization so Loams namespaces cannot read each other (KW-10).
 ## 3. Oracles and the test strategy
 
 Every task proves its behaviour against a real Kafka, not only against
-hand-built frames. Three oracles, used as black boxes:
+hand-built frames. Two oracles, both containers, used as black boxes:
 
 | Oracle | How it runs | Licence and rule | Used for |
 | --- | --- | --- | --- |
-| **Apache Kafka** | `apache/kafka` container, KRaft single node, pinned by digest (the suite uses 3.9.0 today; KW-1 adds the newest 4.x release at task start) | Apache-2.0. Reading its source is fine | The default oracle for every task, in fork CI |
-| **Redpanda** | `docker.redpanda.com/redpandadata/redpanda` container, single node, pinned by digest at task start | BSL. **Black box only**: never read or copy its source; only its container and public docs | The second transactions oracle (approved by the owner earlier); a second opinion where Kafka and the gateway disagree |
-| **Confluent Cloud** | One Basic cluster, owner's account, reached with credentials from `~/confluent.env` | Managed service; credits only | A managed-Kafka reference: client compatibility, behaviour diffs, KIP-848, idempotence, admin APIs, SASL behaviour and the transactions plan. **Local runs only, never fork CI** |
+| **Apache Kafka** | `apache/kafka` container, KRaft single node, pinned (the suite uses 3.9.0 for client tools today; KW-1 adds `apache/kafka:4.3.1` as the broker oracle) | Apache-2.0. Reading its source is fine | The default oracle for every task, in fork CI |
+| **Redpanda** | `redpandadata/redpanda:v26.1.18` container (Docker Hub), single node, pinned | BSL. **Black box only**: never read or copy its source; only its container and public docs | The second transactions oracle (approved by the owner earlier); a second opinion where Kafka and the gateway disagree |
+
+A managed Kafka (for example Confluent Cloud) is a possible later oracle, once
+startup credits come through; nothing in this plan or the harness uses one
+today.
 
 ### 3.1 The differential harness (KW-1)
 
@@ -150,70 +153,12 @@ normalisation:
   owns it. The nightly report links each failure to its blocking issue (#4531's
   acceptance criterion).
 
-### 3.2 Confluent Cloud as an optional oracle
-
-Credentials: `~/confluent.env`, mode 600, with `CONFLUENT_BOOTSTRAP`,
-`CONFLUENT_API_KEY` and `CONFLUENT_API_SECRET` (the cluster key), and
-optionally `CONFLUENT_CLOUD_API_KEY` and `CONFLUENT_CLOUD_API_SECRET` (the Cloud
-API, for the spend check). Rules:
-
-- The harness reads the file itself and never prints it, logs a value from it,
-  or writes it into a container's command line (values go in through an
-  `--env-file` the harness writes to a mode-600 temporary file and deletes).
-- The target is skipped, with a printed reason, when the file is absent or
-  `KAFKA_ORACLE_CONFLUENT=1` is not set. Fork CI never sets it and has no
-  secrets for it.
-- Every topic the harness creates is named `loams-oracle-<run id>-<name>` and is
-  deleted at the end of the run, also on failure (a drop guard plus a sweep of
-  `loams-oracle-*` topics older than 2 h at the start of each run).
-- Consumer groups and transactional ids carry the same prefix, so a sweep can
-  find them.
-
-**Budget: well under the $400 of credits for 30 days (target: under $150).**
-
-| Item | Choice | Estimated cost (verify on the billing page after the first run) |
-| --- | --- | --- |
-| Cluster | One **Basic** cluster, one region near the owner. **Standard only if a feature needs it** (see below). **Never Dedicated** | Basic: billed by eCKU-hour, usage-based; budget assumes at most about $0.15/h, so about $110 if left up all 30 days. Delete it between campaigns to stay lower |
-| Data | Runs move well under 1 GB | Under $0.10 per run |
-| Storage | Topics deleted after each run | About $0 |
-| Not used | Connectors, ksqlDB, Flink, Schema Registry beyond the free tier, private networking | $0 |
-
-Estimated spend per run, recorded in each task that uses it:
-
-| Run | What it does | Estimate |
-| --- | --- | --- |
-| Smoke (KW-2 subset) | 6 clients, a few thousand records | Under $0.05 |
-| Full client matrix (KW-2) | About 25 clients and frameworks | Under $0.50 |
-| Behaviour diff for one task | One scenario family | Under $0.10 |
-| Transactions campaign (KW-T, when built) | Fencing, timeouts, aborts, `read_committed` | Under $1 |
-
-Guard: the harness keeps a local ledger at
-`$XDG_STATE_HOME/loams-kafka-oracle/confluent-runs.tsv` (run id, date, bytes
-written and read, topics created, estimated dollars). It refuses to start a
-Confluent run when the ledger's 30-day total passes **$200**, and with the
-Cloud API key it also reads the real month-to-date cost and refuses above
-$250. Neither is a substitute for the owner watching the billing page.
-
-Features that may need Standard (each verified on Basic first, and Standard
-only with the owner's OK): OAUTHBEARER client authentication, and KIP-848
-consumer groups if Basic does not offer them (verify both; Confluent's cluster
-type tables change). Transactions and idempotence are expected on Basic
-(verify).
-
-What Confluent Cloud cannot be an oracle for: broker-side admin it does not
-expose to tenants (DescribeLogDirs, broker configs, AlterConfigs on some keys,
-ACLs, which are managed through its own API), and anything that depends on
-the replication factor or partition placement it chooses.
-
-### 3.3 Gates
+### 3.2 Gates
 
 - **Every PR into `loams`**: the existing suite plus the KW-2 smoke subset and
   the wire-level diffs against Apache Kafka, in `Kafka gateway required`.
 - **Nightly** (fork workflow, schedule): the full container matrix and the
   Redpanda diffs.
-- **Before a task's PR merges**, when the task touches client-visible
-  behaviour and `~/confluent.env` exists: one local Confluent diff run, its
-  result pasted into the PR (pass/fail per scenario, estimated spend).
 
 ## 4. Rules for every task
 
@@ -245,7 +190,7 @@ breadth. Status is `Planned` unless noted.
 | # | Task | Issue | Status | Depends on | Upstream candidate |
 | --- | --- | --- | --- | --- | --- |
 | KW-0 | Fork setup: `loams` branch, workflows, lean CI | — | **Done** (7aa0efbf4) | — | No |
-| KW-1 | Differential oracle harness (Kafka, Redpanda, optional Confluent) | #4531 | Planned | KW-0 | Yes (without Confluent) |
+| KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | Planned | KW-0 | Yes |
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | Planned | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | Planned | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
@@ -275,32 +220,37 @@ clients against the gateway only.
 
 **Files.**
 
-- `gateways/kafka/tests/common/oracle.rs` (new): `Target` (`Gateway`,
-  `Kafka`, `Redpanda`, `Confluent`), container lifecycle on free ports with
+- `gateways/kafka/tests/common/oracle.rs` (new): the oracle containers
+  (`KafkaOracle`, `RedpandaOracle`) on free loopback ports with
   `--network host` and `--pull never` (as the existing suite does), readiness
-  probes, the Confluent credential loader (§3.2), the topic-prefix sweep.
-- `gateways/kafka/tests/common/normalize.rs` (new): per-API normalisation of
-  decoded responses.
-- `gateways/kafka/tests/oracle/allowed_differences.toml` (new).
+  probes, and `WireClient`, which encodes requests with `kafka-protocol`'s
+  client half and negotiates each API down to what the target advertises.
+- `gateways/kafka/tests/common/facts.rs` (new): a scenario records named,
+  already-normalised facts (node ids, hosts, cluster ids, throttle times and
+  broker-chosen ids are never recorded); `compare` and `judge` turn them into
+  unexpected, declared and stale differences.
+- `gateways/kafka/tests/oracle/allowed_differences.toml` (new): every
+  intended difference, with the issue that owns it.
 - `gateways/kafka/tests/oracle_wire_diff_tests.rs` (new): wire-level diffs for
-  ApiVersions (key set only), Metadata, Produce, Fetch, ListOffsets
-  (earliest, latest, by time), CreateTopics, DescribeConfigs, the classic group
-  flow (FindCoordinator → JoinGroup → SyncGroup → Heartbeat → OffsetCommit →
-  OffsetFetch → LeaveGroup), InitProducerId.
+  ApiVersions (the gateway never advertises above the oracle), CreateTopics,
+  Metadata, Produce, Fetch, ListOffsets (earliest, latest, by time, max
+  timestamp), DescribeConfigs, the classic group flow (FindCoordinator →
+  JoinGroup → SyncGroup → Heartbeat → OffsetCommit → OffsetFetch →
+  LeaveGroup), a commit with no membership (Flink's pattern), and
+  InitProducerId.
 - `.config/nextest.toml`: the new binary into the `kafka_client_e2e` group
   (one container-heavy suite at a time).
 - `.github/workflows/loams-kafka-gateway.yml`: pull the oracle images.
 
 **Tests.** The diff tests themselves; plus a self-test that plants a
-difference and expects the harness to report it, and one that a Confluent run
-without the file is a skip, never a failure, and never prints a credential.
+difference and expects the harness to report it, and one that a declared
+difference which no longer occurs is reported as stale.
 
 **Oracle comparison.** Gateway vs Apache Kafka on every PR; vs Redpanda
-nightly; vs Confluent locally.
+nightly.
 
 **Exit.** The diff suite runs green in fork CI against Apache Kafka with every
-remaining difference listed in `allowed_differences.toml` with its issue; a
-local Confluent run passes or is cleanly skipped.
+remaining difference listed in `allowed_differences.toml` with its issue.
 
 ### KW-2. Client compatibility matrix
 
@@ -329,7 +279,6 @@ from reading their code.
 
 **Oracle comparison.** Each client's observations against the gateway equal
 those against Apache Kafka, except rows in `allowed_differences.toml`.
-Confluent: the full matrix once locally per milestone (estimate under $0.50).
 
 **Exit.** Smoke green on PRs; the nightly job reports every client in §2 with a
 result and a linked blocker for each failure.
@@ -392,7 +341,7 @@ TCP relay that drops responses): no duplicates, no reordering.
 
 **Oracle comparison.** The same lost-response and in-flight scenarios against
 Apache Kafka give the same records and the same per-batch error codes
-(wire diff); Confluent locally (estimate under $0.10).
+(wire diff).
 
 **Exit.** The three acceptance criteria of #4513 pass in fork CI; the README no
 longer says retries are duplicated.
@@ -429,7 +378,7 @@ Schema Registry and a stateful Streams app.
 
 **Oracle comparison.** DescribeConfigs after CreateTopics with the Connect,
 Streams and Debezium config sets, gateway vs Apache Kafka, with the
-not-enforced keys as declared differences. Confluent locally (under $0.10).
+not-enforced keys as declared differences.
 
 **Exit.** #4508's acceptance criteria for Connect, Schema Registry and Streams
 pass in the nightly matrix.
@@ -579,10 +528,9 @@ Java, librdkafka and franz-go authenticate with OAUTHBEARER and SCRAM
 (KW-2 smoke).
 
 **Oracle comparison.** Error codes and client outcomes for good and bad
-credentials vs Apache Kafka configured with the same mechanisms. Confluent
-locally for OAUTHBEARER behaviour (token refresh timing, re-auth), if the Basic
-cluster allows OAuth (verify; Standard only with the owner's OK; estimate under
-$0.10 per run).
+credentials vs Apache Kafka configured with the same mechanisms (OAUTHBEARER
+with Kafka's unsecured-JWT validator and a JWKS validator, SCRAM through
+`kafka-configs`).
 
 **Exit.** #4512's acceptance criteria pass for OAUTHBEARER and SCRAM.
 
@@ -667,8 +615,7 @@ the KW-5 ownership model. Assignments name topics by id (KW-8).
 **Tests and oracle.** Java and librdkafka consume with
 `group.protocol=consumer`; a group moves from classic to KIP-848 one member at
 a time keeping offsets; assignments and rebalance outcomes compared with Apache
-Kafka 4.x and with Confluent Cloud locally (verify KIP-848 is offered on Basic;
-estimate under $0.10 per run).
+Kafka 4.x.
 
 **Exit.** #4523's acceptance criteria pass.
 
@@ -835,15 +782,14 @@ DescribeTransactions (65), ListTransactions (66), DescribeProducers (61) for
 
 ### 6.7 Test plan
 
-Conformance oracles: **Apache Kafka 4.x** (container), **Redpanda** (container,
-black box, owner-approved as the transactions oracle) and **Confluent Cloud**
-(managed reference, local only, §3.2). A behaviour the three oracles agree on
-is the contract; where they differ, Apache Kafka wins and the difference is
-recorded.
+Conformance oracles: **Apache Kafka 4.x** (container) and **Redpanda**
+(container, black box, owner-approved as the transactions oracle). A behaviour
+both oracles agree on is the contract; where they differ, Apache Kafka wins and
+the difference is recorded.
 
 1. **Wire diffs** (KW-1 harness): the full handshake sequence (FindCoordinator
    TXN → InitProducerId → AddPartitionsToTxn → Produce → AddOffsetsToTxn →
-   TxnOffsetCommit → EndTxn) with error codes at each step, against all three.
+   TxnOffsetCommit → EndTxn) with error codes at each step, against both.
 2. **Fencing**: two producers with one transactional id; the first is fenced
    with the same exception class on the Java client and librdkafka as on each
    oracle.
@@ -853,7 +799,7 @@ recorded.
 4. **Read committed**: interleaved committed and aborted transactions on one
    partition from three producers; a `read_committed` consumer's record set
    equals the oracle's exactly; a `read_uncommitted` one equals the oracle's.
-5. **Crash matrix** (gateway and Iggy, not Confluent): kill the coordinator
+5. **Crash matrix** (gateway and Iggy): kill the coordinator
    gateway at each state transition, the partition leader mid-transaction, and
    `iggy-server` during marker writes; verify no committed record lost, no
    aborted record visible to `read_committed`, no transaction stuck past
@@ -864,12 +810,10 @@ recorded.
    oracle's under injected restarts); a Flink `EXACTLY_ONCE` sink job with a
    failing checkpoint; Connect with `exactly.once.source.support=enabled`;
    ksqlDB starts and runs one persistent query.
-7. **Budget**: the Confluent transactions campaign is about 30 scenarios and
-   well under 1 GB (estimate under $1 per campaign).
 
 Exit, when built: #4522's acceptance criteria (Streams `exactly_once_v2` runs
 and `read_committed` never sees an aborted record; ksqlDB starts), plus items
-1–6 green against Apache Kafka and Redpanda, and one recorded Confluent run.
+1–6 green against Apache Kafka and Redpanda.
 
 ### 6.8 Size and order, if approved
 
@@ -919,7 +863,4 @@ the owner's machine (disk), and let fork CI do the full runs.
 3. KW-4: accept-and-echo configs Iggy cannot honour (default), or refuse them?
 4. KW-6: write the compaction design note for upstream discussion first, or
    build it in the fork straight away? Default: fork first, note kept ready.
-5. Confluent Cloud: confirm one Basic cluster, created for each test campaign
-   and deleted afterwards (cheaper), or kept up for the 30 days (simpler,
-   about $110 estimate)? Default: delete between campaigns.
-6. KW-T: when to start building transactions, if at all.
+5. KW-T: when to start building transactions, if at all.
