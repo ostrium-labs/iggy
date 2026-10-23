@@ -25,6 +25,7 @@ use kafka_protocol::messages::metadata_response::{
 };
 use kafka_protocol::messages::{BrokerId, MetadataRequest, MetadataResponse, TopicName};
 use kafka_protocol::protocol::{Encodable, StrBytes};
+use uuid::Uuid;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
@@ -34,19 +35,25 @@ use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ConnectionState,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
-    HandleOutcome, REQUEST_DEADLINE, is_supported_version, supported_max_version,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_ID, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    GatewayState, HandleOutcome, REQUEST_DEADLINE, is_supported_version, supported_max_version,
 };
 use crate::protocol::auto_topic_creation::is_internal_topic_name;
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::dedup::dedup_first_seen;
-use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
+use crate::protocol::handlers::{
+    decode_guarded, encode_message, learn_topic_ids, respond_or_close,
+};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_METADATA,
     min_version: 0,
-    max_version: 9,
+    max_version: 13,
 };
+
+/// First version whose request may name topics by id (KIP-516). v10 and v11 carry the field but
+/// Kafka refuses a request that fills it.
+const FIRST_TOPIC_ID_REQUEST_VERSION: i16 = 12;
 
 /// Above this many total partitions in an all-topics response, `encode_real_response` runs on a
 /// blocking-pool thread instead of inline (see the call site). Conservative relative to the one
@@ -121,14 +128,16 @@ pub async fn handle(
                 return HandleOutcome::Close;
             }
         },
-        Some(names) => {
+        Some(Requested::Names(names)) => {
             let mut results = resolve_requested_named_topics(bridge, &names).await;
             if allow_auto_topic_creation {
                 auto_create_missing(state, bridge, principal, &mut results);
             }
             results
         }
+        Some(Requested::Ids(ids)) => resolve_requested_topic_ids(state, bridge, &ids).await,
     };
+    register_topic_ids(state, &results);
 
     // `bounds_guard` cannot see this: it charges the projected response by *requested* element
     // (one topic name), but one real topic can carry up to Iggy's own per-topic partition cap
@@ -238,7 +247,8 @@ async fn resolve_requested_named_topics(
             .into_iter()
             .map(|(name, metadata)| match metadata {
                 Some(metadata) => TopicResult {
-                    name,
+                    name: Some(name),
+                    topic_id: metadata.topic_id,
                     error_code: ERROR_NONE,
                     partitions_count: metadata.partitions_count,
                     missing: false,
@@ -268,6 +278,61 @@ async fn resolve_requested_named_topics(
                 .into_iter()
                 .map(|name| error_result(name, ERROR_REQUEST_TIMED_OUT))
                 .collect()
+        }
+    }
+}
+
+/// Resolves a Metadata v12+ request that names its topics by id (KIP-516), as Kafka does: the
+/// names in such a request are ignored, an id no topic has is answered `UNKNOWN_TOPIC_ID` with a
+/// null name, and nothing is ever auto-created.
+///
+/// An id this gateway has not reported yet (another gateway did, or this one restarted) is found
+/// by listing every topic once, since ids are derived from what the listing returns.
+async fn resolve_requested_topic_ids(
+    state: &GatewayState,
+    bridge: &IggyBridge,
+    ids: &[Uuid],
+) -> Vec<TopicResult> {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let distinct: Vec<Uuid> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+    let refusal = learn_topic_ids(state, bridge, distinct.iter().copied(), REQUEST_DEADLINE).await;
+    let named: Vec<(Uuid, Option<StrBytes>)> = distinct
+        .iter()
+        .map(|id| (*id, state.topic_ids.name(id).map(StrBytes::from_string)))
+        .collect();
+    let lookups: Vec<StrBytes> = named.iter().filter_map(|(_, name)| name.clone()).collect();
+    let mut found = resolve_requested_named_topics(bridge, &lookups)
+        .await
+        .into_iter();
+    named
+        .into_iter()
+        .map(|(id, name)| {
+            if name.is_none() {
+                return id_error_result(id, refusal);
+            }
+            match found.next() {
+                // The name now belongs to another incarnation of the topic: the one this id named
+                // is gone, which Kafka reports as an unknown id.
+                Some(result) if result.error_code == ERROR_NONE && result.topic_id != id => {
+                    id_error_result(id, ERROR_UNKNOWN_TOPIC_ID)
+                }
+                Some(result) if result.missing => id_error_result(id, ERROR_UNKNOWN_TOPIC_ID),
+                Some(result) if result.error_code == ERROR_NONE => result,
+                Some(result) => id_error_result(id, result.error_code),
+                None => id_error_result(id, ERROR_UNKNOWN_TOPIC_ID),
+            }
+        })
+        .collect()
+}
+
+/// Records the id of every topic a Metadata answer reports, so later requests may name it by id.
+fn register_topic_ids(state: &GatewayState, results: &[TopicResult]) {
+    for result in results
+        .iter()
+        .filter(|result| result.error_code == ERROR_NONE)
+    {
+        if let Some(name) = &result.name {
+            state.topic_ids.register(name.as_str(), result.topic_id);
         }
     }
 }
@@ -309,7 +374,9 @@ fn auto_create_missing(
         Some(_) => Some(ERROR_TOPIC_AUTHORIZATION_FAILED),
     };
     for result in results.iter_mut().filter(|result| result.missing) {
-        let name = result.name.as_str();
+        let Some(name) = result.name.as_ref().map(StrBytes::as_str) else {
+            continue;
+        };
         if let Some(error_code) = refusal {
             result.error_code = error_code;
         } else if !is_valid_kafka_topic_name(name) {
@@ -347,11 +414,12 @@ fn template_partition_bytes(version: i16) -> usize {
 }
 
 /// Fixed per-`MetadataResponseTopic` cost, independent of name length or partition count:
-/// `error_code`(2) + `is_internal`(1) + the `partitions` array's own compact-length varint
-/// (charged at its 5-byte worst case) + `topic_authorized_operations`(4) + empty tagged fields(1).
+/// `error_code`(2) + `topic_id`(16, v10+) + `is_internal`(1) + the `partitions` array's own
+/// compact-length varint (charged at its 5-byte worst case) + `topic_authorized_operations`(4) +
+/// empty tagged fields(1).
 /// Every result pays this once - `encode_real_response` emits a full wrapper even for an error
 /// result, just with an empty `partitions` array, so this cost isn't conditional on `ERROR_NONE`.
-const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 13;
+const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 29;
 
 /// Estimated encoded byte cost of one [`TopicResult`]: the fixed per-topic overhead, the name's
 /// own bytes (compact string: length plus a short varint prefix, charged at a flat +2), and -
@@ -366,7 +434,7 @@ const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 13;
 /// wrapper to encode. 500 topics with 255-byte names and one partition each encode to ~146 KB
 /// against the ~32 KB a partitions-only charge would have priced in.
 fn estimated_response_bytes(result: &TopicResult, per_partition_bytes: usize) -> usize {
-    let name_bytes = result.name.as_str().len() + 2;
+    let name_bytes = result.name.as_ref().map_or(0, |name| name.as_str().len()) + 2;
     let partition_bytes = if result.error_code == ERROR_NONE {
         (result.partitions_count as usize).saturating_mul(per_partition_bytes)
     } else {
@@ -422,7 +490,10 @@ fn truncate_all_topics_to_frame_budget(
 /// One resolved topic result for the real (bridge-backed) path - `partitions_count` is
 /// meaningless when `error_code != ERROR_NONE`.
 struct TopicResult {
-    name: StrBytes,
+    /// Null only for a topic asked for by an id no topic has.
+    name: Option<StrBytes>,
+    /// Zero for a topic asked for by a name no topic has, as in Kafka.
+    topic_id: Uuid,
     error_code: i16,
     partitions_count: u32,
     /// The lookup found no such topic, as opposed to failing.
@@ -431,7 +502,8 @@ struct TopicResult {
 
 fn found_result(metadata: crate::bridge::KafkaTopicMetadata) -> TopicResult {
     TopicResult {
-        name: StrBytes::from_string(metadata.kafka_topic),
+        name: Some(StrBytes::from_string(metadata.kafka_topic)),
+        topic_id: metadata.topic_id,
         error_code: ERROR_NONE,
         partitions_count: metadata.partitions_count,
         missing: false,
@@ -440,7 +512,18 @@ fn found_result(metadata: crate::bridge::KafkaTopicMetadata) -> TopicResult {
 
 const fn error_result(name: StrBytes, error_code: i16) -> TopicResult {
     TopicResult {
-        name,
+        name: Some(name),
+        topic_id: Uuid::nil(),
+        error_code,
+        partitions_count: 0,
+        missing: false,
+    }
+}
+
+const fn id_error_result(topic_id: Uuid, error_code: i16) -> TopicResult {
+    TopicResult {
+        name: None,
+        topic_id,
         error_code,
         partitions_count: 0,
         missing: false,
@@ -518,7 +601,8 @@ fn encode_real_response(
             };
             MetadataResponseTopic::default()
                 .with_error_code(result.error_code)
-                .with_name(Some(TopicName(result.name.clone())))
+                .with_name(result.name.clone().map(TopicName))
+                .with_topic_id(result.topic_id)
                 .with_partitions(partitions)
         })
         .collect();
@@ -558,6 +642,14 @@ fn decode_topics(api_version: i16, body: Bytes, max_frame_size: usize) -> Result
         .collect()
 }
 
+/// The topics a named or by-id Metadata request asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Requested {
+    Names(Vec<StrBytes>),
+    /// v12+: at least one topic carried a non-zero id. Kafka then ignores every name.
+    Ids(Vec<Uuid>),
+}
+
 /// Like [`decode_topics`], but for the real (bridge-backed) path, which must tell apart what
 /// `decode_topics`' `unwrap_or_default()` deliberately collapses: a null topics array (`None`,
 /// "all topics") from an explicit, merely empty one (`Some(vec![])`, "these zero topics") - the
@@ -569,34 +661,59 @@ fn decode_topics(api_version: i16, body: Bytes, max_frame_size: usize) -> Result
 /// `describeCluster()`, starts at v1), so an empty array at v0 can only mean "all topics."
 /// Also returns the request's `allow_auto_topic_creation`, which below v4 is always true, as in
 /// Kafka.
+///
+/// From v12 a topic may be named by id instead (KIP-516). As in Kafka's `KafkaApis`, one non-zero
+/// id makes the whole request a by-id lookup, and below v12 an id, or a null name, is refused.
 fn decode_requested_topics(
     api_version: i16,
     body: Bytes,
     max_frame_size: usize,
-) -> Result<(Option<Vec<StrBytes>>, bool)> {
+) -> Result<(Option<Requested>, bool)> {
     let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
         validate_metadata_shape(v, b, max_frame_size)
     })?;
     let allow_auto_topic_creation = req.allow_auto_topic_creation;
     let requested = req
         .topics
-        .map(|topics| {
-            topics
-                .into_iter()
-                .map(|topic| {
-                    topic
-                        .name
-                        .map(|name| name.0)
-                        .ok_or(KafkaProtocolError::NullTopicName)
-                })
-                .collect::<Result<Vec<_>>>()
-        })
+        .map(|topics| requested(api_version, topics))
         .transpose()?;
     let requested = match requested {
-        Some(topics) if topics.is_empty() && api_version == 0 => None,
+        Some(Requested::Names(topics)) if topics.is_empty() && api_version == 0 => None,
         other => other,
     };
     Ok((requested, allow_auto_topic_creation))
+}
+
+fn requested(
+    api_version: i16,
+    topics: Vec<kafka_protocol::messages::metadata_request::MetadataRequestTopic>,
+) -> Result<Requested> {
+    if api_version >= FIRST_TOPIC_ID_REQUEST_VERSION
+        && topics.iter().any(|topic| !topic.topic_id.is_nil())
+    {
+        return Ok(Requested::Ids(
+            topics
+                .into_iter()
+                .map(|topic| topic.topic_id)
+                .filter(|id| !id.is_nil())
+                .collect(),
+        ));
+    }
+    if topics.iter().any(|topic| !topic.topic_id.is_nil()) {
+        return Err(KafkaProtocolError::Malformed(format!(
+            "Metadata v{api_version} cannot name topics by id"
+        )));
+    }
+    topics
+        .into_iter()
+        .map(|topic| {
+            topic
+                .name
+                .map(|name| name.0)
+                .ok_or(KafkaProtocolError::NullTopicName)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Requested::Names)
 }
 
 #[cfg(test)]
@@ -656,7 +773,7 @@ mod tests {
         // zero topics" (KIP-4's describeCluster() shape).
         let body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x00]); // 0 topics, not -1
         let requested = decode_requested_topics(1, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested.0, Some(Vec::new()));
+        assert_eq!(requested.0, Some(Requested::Names(Vec::new())));
     }
 
     #[test]
@@ -675,7 +792,10 @@ mod tests {
             0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's', // "orders"
         ]);
         let requested = decode_requested_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested.0, Some(vec![StrBytes::from_static_str("orders")]));
+        assert_eq!(
+            requested.0,
+            Some(Requested::Names(vec![StrBytes::from_static_str("orders")]))
+        );
     }
 
     #[test]
@@ -697,7 +817,10 @@ mod tests {
             0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's',
         ]);
         let (requested, allow) = decode_requested_topics(3, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert_eq!(requested, Some(vec![StrBytes::from_static_str("orders")]));
+        assert_eq!(
+            requested,
+            Some(Requested::Names(vec![StrBytes::from_static_str("orders")]))
+        );
         assert!(allow);
     }
 
@@ -731,7 +854,8 @@ mod tests {
 
     fn topic_result(name: &'static str, error_code: i16, partitions_count: u32) -> TopicResult {
         TopicResult {
-            name: StrBytes::from_static_str(name),
+            name: Some(StrBytes::from_static_str(name)),
+            topic_id: Uuid::nil(),
             error_code,
             partitions_count,
             missing: false,

@@ -35,5 +35,6 @@ pub use iggy_bridge::{
     KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups,
     ProduceTurn, Producer, Resolution, SCRAM_TOPIC, ScannedGroups, ScramStore, SendEnd,
     StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget, cluster_id_stream,
+    kafka_topic_details_id, kafka_topic_id,
 };
 pub use topic_map::{TopicMapping, TopicOverride};

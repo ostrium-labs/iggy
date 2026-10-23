@@ -51,7 +51,7 @@ it knows the server supports flexible encoding.
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
-| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
+| 3 | Metadata | 0 | 13 | 0 … 13 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+; each topic's [topic id](#topic-ids) from v10, and topics named by id from v12 (an unknown id answers `UNKNOWN_TOPIC_ID` (100) with a null name). With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s); `OFFSET_OUT_OF_RANGE` (1) below the log start offset. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST (the log start offset), a timestamp (searched on the record timestamp) and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
@@ -89,7 +89,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 0 | Produce | 3–9 | v9 |
 | 1 | Fetch | 4–12 | v12 |
 | 2 | ListOffsets | 1–7 | v6 |
-| 3 | Metadata | 0–9 | v9 |
+| 3 | Metadata | 0–13 | v9 |
 | 8 | OffsetCommit | 2–9 | v8 |
 | 9 | OffsetFetch | 1–9 | v6 |
 | 10 | FindCoordinator | 0–4 | v3 |
@@ -110,6 +110,17 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
 | 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
+
+### Topic ids
+
+Kafka names topics by a 128-bit id (KIP-516) from Metadata v10, Fetch v13, Produce v13,
+`CreateTopics` v7 and `DeleteTopics` v6, and in KIP-848 assignments. Iggy has no such id, so the
+gateway derives one (`src/topic_id.rs`): a keyed BLAKE3 hash of the Iggy stream name, the topic's
+numeric id and its creation time, shaped as an RFC 9562 version 8 UUID. All three inputs are
+replicated Iggy state, so every gateway in front of one Iggy cluster reports the same id, a
+restart changes nothing, nothing is written, and a topic deleted and created again gets a new id,
+as in Kafka. A request that names a topic by an id the gateway has not reported yet makes it list
+the topics once; an id still unknown after that answers `UNKNOWN_TOPIC_ID` (100).
 
 ### Cluster id
 

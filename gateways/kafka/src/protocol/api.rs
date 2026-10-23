@@ -54,6 +54,7 @@ use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
     EnabledMechanisms, encode_sasl_authenticate_response, encode_sasl_handshake_response,
 };
+use crate::topic_id::TopicIds;
 
 pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
@@ -230,6 +231,8 @@ pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
 pub const ERROR_MISMATCHED_ENDPOINT_TYPE: i16 = ResponseError::MismatchedEndpointType.code();
 /// `DescribeCluster` v1+ named an endpoint type Kafka does not define.
 pub const ERROR_UNSUPPORTED_ENDPOINT_TYPE: i16 = ResponseError::UnsupportedEndpointType.code();
+/// A request named a topic by an id (KIP-516) that no topic has, or no longer has.
+pub const ERROR_UNKNOWN_TOPIC_ID: i16 = ResponseError::UnknownTopicId.code();
 
 /// Kafka's -1 for an offset or a timestamp that is not known.
 pub(crate) const UNKNOWN_OFFSET: i64 = -1;
@@ -390,6 +393,9 @@ pub struct GatewayState {
     pub cluster_id: ClusterId,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
+    /// The topic ids (KIP-516) this gateway has reported, so a request that names a topic by id
+    /// finds its name. See [`crate::topic_id`].
+    pub topic_ids: TopicIds,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -428,6 +434,7 @@ impl GatewayState {
             partition_growth: Arc::default(),
             cluster_id: ClusterId::random(),
             auto_topic_creation: None,
+            topic_ids: TopicIds::default(),
         }
     }
 

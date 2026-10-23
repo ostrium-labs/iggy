@@ -27,11 +27,13 @@ use iggy::prelude::{
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use super::{IggyBridge, REQUEST_TIMEOUT, metadata_write_on, with_request_timeout};
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::protocol::handlers::kafka_topic_configs::{TopicConfigSnapshot, TopicWrite};
+use crate::topic_id::derive_topic_id;
 
 /// Partitions of a topic whose creator leaves the count to the broker: Kafka's own
 /// `num.partitions` default.
@@ -73,6 +75,21 @@ pub enum TopicCreationOutcome {
 pub struct KafkaTopicMetadata {
     pub kafka_topic: String,
     pub partitions_count: u32,
+    /// The Kafka topic id (KIP-516), derived from the Iggy topic's identity. See
+    /// [`crate::topic_id`].
+    pub topic_id: Uuid,
+}
+
+/// The Kafka topic id of `topic`, an Iggy topic in stream `stream_name`.
+#[must_use]
+pub fn kafka_topic_id(stream_name: &str, topic: &Topic) -> Uuid {
+    derive_topic_id(stream_name, topic.id, topic.created_at.as_micros())
+}
+
+/// [`kafka_topic_id`] for a topic read with its partitions.
+#[must_use]
+pub fn kafka_topic_details_id(stream_name: &str, topic: &TopicDetails) -> Uuid {
+    derive_topic_id(stream_name, topic.id, topic.created_at.as_micros())
 }
 
 /// [`IggyBridge::list_kafka_topics`], with the override topics that it leaves out because the
@@ -430,14 +447,17 @@ impl IggyBridge {
             .map(|(_, stream_name, _)| stream_name.clone())
             .collect();
 
-        let mut topics_by_stream: HashMap<String, HashMap<String, u32>> =
+        let mut topics_by_stream: HashMap<String, HashMap<String, (u32, Uuid)>> =
             HashMap::with_capacity(distinct_streams.len());
         for stream_name in distinct_streams {
             let stream_id = Identifier::named(&stream_name).map_err(BridgeError::Iggy)?;
             let topics = with_request_timeout(self.client.get_topics(&stream_id)).await?;
             let by_name = topics
                 .into_iter()
-                .map(|topic| (topic.name, topic.partitions_count))
+                .map(|topic| {
+                    let topic_id = kafka_topic_id(&stream_name, &topic);
+                    (topic.name, (topic.partitions_count, topic_id))
+                })
                 .collect();
             topics_by_stream.insert(stream_name, by_name);
         }
@@ -448,9 +468,10 @@ impl IggyBridge {
                 let metadata = topics_by_stream
                     .get(&stream_name)
                     .and_then(|topics| topics.get(&topic_name))
-                    .map(|&partitions_count| KafkaTopicMetadata {
+                    .map(|&(partitions_count, topic_id)| KafkaTopicMetadata {
                         kafka_topic: kafka_topic.as_str().to_string(),
                         partitions_count,
+                        topic_id,
                     });
                 (kafka_topic, metadata)
             })
@@ -653,6 +674,7 @@ impl IggyBridge {
                 Ok(Some(details)) => results.push(KafkaTopicMetadata {
                     kafka_topic: kafka_topic.to_string(),
                     partitions_count: details.partitions_count,
+                    topic_id: kafka_topic_details_id(&over.stream, &details),
                 }),
                 Ok(None) => {}
                 // One override naming a topic this caller (the bridge user) can't read must not
@@ -697,9 +719,11 @@ impl IggyBridge {
                 );
                 continue;
             }
+            let topic_id = kafka_topic_id(default_stream, &topic);
             results.push(KafkaTopicMetadata {
                 kafka_topic: topic.name,
                 partitions_count: topic.partitions_count,
+                topic_id,
             });
         }
 

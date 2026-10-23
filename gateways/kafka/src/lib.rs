@@ -31,5 +31,6 @@ pub mod records;
 pub mod scram;
 pub mod server;
 pub mod tls;
+pub mod topic_id;
 
 pub use server::{GatewayConfig, KafkaGateway};
