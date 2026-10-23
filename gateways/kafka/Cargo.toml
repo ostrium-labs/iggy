@@ -38,6 +38,8 @@ anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# Derives Kafka topic ids from Iggy topic identity (`topic_id.rs`).
+blake3 = { workspace = true }
 bytes = { workspace = true }
 # Rewrites the CRC of a Fetch batch whose records repeat a header name (`records::headers`).
 crc32c = { workspace = true }

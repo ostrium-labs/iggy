@@ -63,7 +63,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::BridgeError;
+use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
@@ -73,8 +73,8 @@ use crate::protocol::api::{
     API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
     API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
-    supported_max_version,
+    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_ID, ERROR_UNSUPPORTED_VERSION, GatewayState,
+    HandleOutcome, is_supported_version, supported_max_version,
 };
 
 /// Record encodes and decodes of this many bytes or more run off the async worker.
@@ -161,6 +161,39 @@ pub async fn dispatch(
         }
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
+    }
+}
+
+/// Makes `state.topic_ids` know every id in `ids` that some topic has, listing the topics once
+/// when one is missing (another gateway reported it, or this one restarted). Ids are derived from
+/// what the listing returns, so nothing else needs reading.
+///
+/// Returns the code to answer for an id still unknown afterwards: `UNKNOWN_TOPIC_ID`, or, when the
+/// listing failed, what that failure maps to, so an outage is not reported as a deleted topic.
+pub(crate) async fn learn_topic_ids(
+    state: &GatewayState,
+    bridge: &IggyBridge,
+    ids: impl IntoIterator<Item = uuid::Uuid>,
+    wait: Duration,
+) -> i16 {
+    if ids
+        .into_iter()
+        .all(|id| id.is_nil() || state.topic_ids.name(&id).is_some())
+    {
+        return ERROR_UNKNOWN_TOPIC_ID;
+    }
+    match tokio::time::timeout(wait, bridge.list_kafka_topics()).await {
+        Ok(Ok(topics)) => {
+            for topic in &topics {
+                state.topic_ids.register(&topic.kafka_topic, topic.topic_id);
+            }
+            ERROR_UNKNOWN_TOPIC_ID
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "listing topics to resolve topic ids failed");
+            error.to_kafka_error_code()
+        }
+        Err(_elapsed) => ERROR_REQUEST_TIMED_OUT,
     }
 }
 

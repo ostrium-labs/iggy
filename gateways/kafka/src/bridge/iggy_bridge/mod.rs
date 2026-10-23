@@ -63,7 +63,7 @@ pub(crate) use scram_store::CredentialChange;
 pub use scram_store::{SCRAM_TOPIC, ScramStore};
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
-    TopicCreationOutcome, TopicLoad,
+    TopicCreationOutcome, TopicLoad, kafka_topic_details_id, kafka_topic_id,
 };
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.

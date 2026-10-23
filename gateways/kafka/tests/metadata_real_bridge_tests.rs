@@ -895,3 +895,189 @@ async fn given_a_bridge_user_iggy_refuses_when_the_topic_is_named_again_should_n
     assert_eq!(journal_len(data_dir.path()), after_first);
     assert!(!exists(&seed, "orders").await);
 }
+
+/// One topic of a Metadata response decoded with `kafka_protocol`'s client half.
+fn decoded_topics(
+    version: i16,
+    outcome: iggy_gateway_kafka::protocol::api::HandleOutcome,
+) -> Vec<kafka_protocol::messages::metadata_response::MetadataResponseTopic> {
+    use kafka_protocol::protocol::Decodable;
+    let mut body = outcome.expect_response("Metadata answers");
+    kafka_protocol::messages::MetadataResponse::decode(&mut body, version)
+        .expect("a Metadata response")
+        .topics
+}
+
+fn encoded_request(version: i16, topics: Vec<(Option<&str>, uuid::Uuid)>) -> Bytes {
+    use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+    use kafka_protocol::messages::{MetadataRequest, TopicName};
+    use kafka_protocol::protocol::{Encodable, StrBytes};
+    let request = MetadataRequest::default()
+        .with_topics(Some(
+            topics
+                .into_iter()
+                .map(|(name, id)| {
+                    MetadataRequestTopic::default()
+                        .with_name(name.map(|name| TopicName(StrBytes::from_string(name.into()))))
+                        .with_topic_id(id)
+                })
+                .collect(),
+        ))
+        .with_allow_auto_topic_creation(false);
+    let mut body = bytes::BytesMut::new();
+    request.encode(&mut body, version).expect("encode");
+    body.freeze()
+}
+
+async fn send_v(
+    state: &GatewayState,
+    version: i16,
+    topics: Vec<(Option<&str>, uuid::Uuid)>,
+) -> iggy_gateway_kafka::protocol::api::HandleOutcome {
+    metadata::handle(
+        state,
+        &ConnectionState::default(),
+        None,
+        version,
+        encoded_request(version, topics),
+    )
+    .await
+}
+
+/// KIP-516: from v10 every topic found carries a non-zero id, the same on every call, and a
+/// missing one carries the zero id.
+#[tokio::test]
+#[serial]
+async fn given_v10_and_later_a_found_topic_should_carry_a_stable_topic_id() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the topic");
+
+    let mut ids = Vec::new();
+    for version in 10..=13 {
+        let outcome = send_v(
+            &state,
+            version,
+            vec![
+                (Some("orders"), uuid::Uuid::nil()),
+                (Some("missing"), uuid::Uuid::nil()),
+            ],
+        )
+        .await;
+        let topics = decoded_topics(version, outcome);
+        assert_eq!(topics.len(), 2, "v{version}");
+        assert_eq!(topics[0].error_code, ERROR_NONE, "v{version}");
+        assert!(!topics[0].topic_id.is_nil(), "v{version}");
+        assert_eq!(topics[1].error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        assert!(topics[1].topic_id.is_nil(), "v{version}");
+        ids.push(topics[0].topic_id);
+    }
+    assert!(ids.windows(2).all(|pair| pair[0] == pair[1]), "{ids:?}");
+
+    // A second gateway derives the same id: nothing is stored, so nothing can disagree.
+    let (other, _seed) = connected_state(&server).await;
+    let topics = decoded_topics(
+        12,
+        send_v(&other, 12, vec![(Some("orders"), uuid::Uuid::nil())]).await,
+    );
+    assert_eq!(topics[0].topic_id, ids[0]);
+}
+
+/// v12+: a topic named by id is answered with its name; an unknown id with
+/// `UNKNOWN_TOPIC_ID` and a null name.
+#[tokio::test]
+#[serial]
+async fn given_v12_a_topic_named_by_id_should_resolve_to_its_name() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("seed the topic");
+    let by_name = decoded_topics(
+        12,
+        send_v(&state, 12, vec![(Some("orders"), uuid::Uuid::nil())]).await,
+    );
+    let id = by_name[0].topic_id;
+    let unknown = uuid::Uuid::from_u128(0x1234_5678_9abc_4def_8123_4567_89ab_cdef);
+
+    let topics = decoded_topics(
+        12,
+        send_v(&state, 12, vec![(None, id), (None, unknown)]).await,
+    );
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics[0].error_code, ERROR_NONE);
+    assert_eq!(
+        topics[0].name.as_ref().map(|name| name.as_str()),
+        Some("orders")
+    );
+    assert_eq!(topics[0].topic_id, id);
+    assert_eq!(topics[0].partitions.len(), 2);
+    assert_eq!(
+        topics[1].error_code,
+        iggy_gateway_kafka::protocol::api::ERROR_UNKNOWN_TOPIC_ID
+    );
+    assert_eq!(topics[1].name, None);
+    assert_eq!(topics[1].topic_id, unknown);
+
+    // A gateway that never reported the id finds it by listing the topics.
+    let (fresh, _seed) = connected_state(&server).await;
+    let topics = decoded_topics(13, send_v(&fresh, 13, vec![(None, id)]).await);
+    assert_eq!(
+        topics[0].name.as_ref().map(|name| name.as_str()),
+        Some("orders")
+    );
+}
+
+/// A topic deleted and created again has a new id; the old one is unknown.
+#[tokio::test]
+#[serial]
+async fn given_a_recreated_topic_the_old_id_should_be_unknown() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("seed the topic");
+    let old = decoded_topics(
+        12,
+        send_v(&state, 12, vec![(Some("orders"), uuid::Uuid::nil())]).await,
+    )[0]
+    .topic_id;
+    seed.delete_kafka_topic("orders").await.expect("delete");
+    seed.ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("recreate the topic");
+
+    let topics = decoded_topics(12, send_v(&state, 12, vec![(None, old)]).await);
+    assert_eq!(
+        topics[0].error_code,
+        iggy_gateway_kafka::protocol::api::ERROR_UNKNOWN_TOPIC_ID
+    );
+    let new = decoded_topics(
+        12,
+        send_v(&state, 12, vec![(Some("orders"), uuid::Uuid::nil())]).await,
+    )[0]
+    .topic_id;
+    assert_ne!(old, new);
+}
+
+/// Kafka refuses an id below v12 (`InvalidRequestException`); Metadata has no top-level error
+/// before v13, so the gateway closes.
+#[tokio::test]
+#[serial]
+async fn given_v11_a_topic_named_by_id_should_close_the_connection() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, _seed) = connected_state(&server).await;
+    let outcome = send_v(
+        &state,
+        11,
+        vec![(Some("orders"), uuid::Uuid::from_u128(7 << 64))],
+    )
+    .await;
+    assert!(outcome.is_close());
+}
