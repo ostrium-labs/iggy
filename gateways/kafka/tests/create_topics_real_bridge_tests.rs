@@ -100,7 +100,7 @@ fn build_request(topics: &[TopicSpec], validate_only: bool) -> Bytes {
 
         if let Some((name, value)) = topic
             .config
-            .or(topic.has_config.then_some(("cleanup.policy", "delete")))
+            .or_else(|| topic.has_config.then_some(("cleanup.policy", "delete")))
         {
             enc.write_varint(2); // one config
             enc.write_compact_nullable_string(Some(name));
