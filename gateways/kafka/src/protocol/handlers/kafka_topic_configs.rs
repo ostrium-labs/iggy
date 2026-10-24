@@ -413,6 +413,7 @@ impl ConfigFault {
 /// [`ConfigFault::InvalidValue`] when Kafka would refuse the value, and
 /// [`ConfigFault::Unsupported`] for `remote.storage.enable=true`, which Kafka refuses on a broker
 /// without tiered storage, as this one is.
+#[allow(clippy::too_many_lines)] // one arm per Kafka validator kind
 pub fn normalize(key: &TopicConfigKey, value: &str) -> Result<String, ConfigFault> {
     let invalid = |reason: String| ConfigFault::InvalidValue {
         name: key.name.to_string(),
@@ -569,6 +570,7 @@ fn java_double(number: f64) -> String {
 }
 
 /// The Kafka-visible configuration of one Iggy topic, read from its options.
+#[allow(clippy::struct_excessive_bools)] // one explicit flag per Iggy option
 #[derive(Debug, Clone, PartialEq)]
 pub struct TopicConfigSnapshot {
     pub partitions: u32,
@@ -733,6 +735,7 @@ impl TopicConfigSnapshot {
     /// # Errors
     ///
     /// `Err` when the stored expiry cannot be shown as `retention.ms`.
+    #[allow(clippy::result_unit_err)] // one failure, already described above
     pub fn explicit(&self) -> Result<BTreeMap<&'static str, String>, ()> {
         let mut set = BTreeMap::new();
         for key in &TOPIC_CONFIGS {
@@ -757,6 +760,7 @@ impl TopicConfigSnapshot {
     /// # Errors
     ///
     /// `Err` for `retention.ms` when the stored expiry is no whole number of milliseconds.
+    #[allow(clippy::result_unit_err)] // one failure, already described above
     pub fn describe(&self, key: &TopicConfigKey) -> Result<(String, bool), ()> {
         let explicit = match key.name {
             CLEANUP_POLICY => self
@@ -1326,7 +1330,7 @@ mod tests {
         let write = plan_create(&configs, 1).expect("storable");
         assert_eq!(write.message_expiry, Some(IggyExpiry::NeverExpire));
         assert_eq!(write.max_topic_size, Some(MaxTopicSize::Unlimited));
-        let kept = write.kafka_configs.clone().expect("echoed");
+        let kept = write.kafka_configs.expect("echoed");
         let snapshot = TopicConfigSnapshot {
             message_expiry: IggyExpiry::NeverExpire,
             message_expiry_explicit: true,
