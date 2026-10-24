@@ -41,7 +41,7 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::topic_config::{
-    MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
+    find_duplicate_names, topic_cap_message,
 };
 use crate::protocol::handlers::{
     clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
@@ -99,10 +99,11 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         .copied()
         .filter(|name| !duplicate_names.contains(name))
         .collect();
-    if distinct_bridge_backed.len() > MAX_CONFIG_TOPICS {
+    let max_topics = crate::limits::admin_topics_per_request();
+    if distinct_bridge_backed.len() > max_topics {
         tracing::warn!(
             distinct_topics = distinct_bridge_backed.len(),
-            max = MAX_CONFIG_TOPICS,
+            max = max_topics,
             "CreateTopics request addresses too many distinct topics; rejecting"
         );
         // A server-imposed limit, not a malformed request. INVALID_REQUEST would blame the

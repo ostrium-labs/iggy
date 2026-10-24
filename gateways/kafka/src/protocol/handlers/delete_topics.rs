@@ -67,8 +67,11 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// Same rationale as `create_topics`'s own `MAX_CONFIG_TOPICS`-based cap, but counted differently: every
 /// name here costs its own bridge round trip against the single lockstep `IggyClient` every
 /// Kafka connection on this gateway shares, duplicates included, so this charges the raw count
-/// rather than the distinct one `CreateTopics` charges.
-const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
+/// rather than the distinct one `CreateTopics` charges. The same variable moves both
+/// ([`crate::limits::admin_topics_per_request`]).
+fn max_bridge_backed_topics() -> usize {
+    crate::limits::admin_topics_per_request()
+}
 
 pub async fn handle(
     state: &GatewayState,
@@ -119,14 +122,15 @@ pub async fn handle(
 
     // RANGE caps at v5, so req.topics (the v6 topic-id shape) is always empty - topic_names is
     // the only populated field at any version this bridge advertises.
-    if req.topic_names.len() > MAX_BRIDGE_BACKED_TOPICS {
+    let max_topics = max_bridge_backed_topics();
+    if req.topic_names.len() > max_topics {
         tracing::warn!(
             requested_topics = req.topic_names.len(),
-            max = MAX_BRIDGE_BACKED_TOPICS,
+            max = max_topics,
             "DeleteTopics request addresses too many topics; rejecting"
         );
         let message = StrBytes::from(format!(
-            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} topic names per DeleteTopics request"
+            "this gateway addresses at most {max_topics} topic names per DeleteTopics request"
         ));
         let results = req
             .topic_names

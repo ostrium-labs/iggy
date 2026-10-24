@@ -64,8 +64,9 @@ pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseco
 /// lockstep Iggy calls per name on the shared client (`ensure_stream`, `create_topic`, and a
 /// possible race-retry read). 100 keeps that worst case small and is shared with the config
 /// APIs. Duplicate names count once toward the cap and are rejected on their own. A larger
-/// batch is `POLICY_VIOLATION` on every resource.
-pub const MAX_CONFIG_TOPICS: usize = 100;
+/// batch is `POLICY_VIOLATION` on every resource. `IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST` moves
+/// it ([`crate::limits`]); this is the default.
+pub const MAX_CONFIG_TOPICS: usize = crate::limits::DEFAULT_ADMIN_TOPICS_PER_REQUEST;
 
 const CLEANUP_POLICY_READ_ONLY: &str = "cleanup.policy is read-only";
 
@@ -278,17 +279,19 @@ pub fn parse_retention_ms(value: &str) -> Result<IggyExpiry, ConfigFault> {
     )))
 }
 
-/// Whether `names` contains more than [`MAX_CONFIG_TOPICS`] distinct strings.
+/// Whether `names` contains more distinct strings than one request may name
+/// ([`crate::limits::admin_topics_per_request`]).
 #[must_use]
 pub fn exceeds_topic_cap<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
-    names.into_iter().collect::<HashSet<_>>().len() > MAX_CONFIG_TOPICS
+    names.into_iter().collect::<HashSet<_>>().len() > crate::limits::admin_topics_per_request()
 }
 
-/// Client-facing text for a request over [`MAX_CONFIG_TOPICS`].
+/// Client-facing text for a request over [`crate::limits::admin_topics_per_request`].
 #[must_use]
 pub fn topic_cap_message(api_name: &str) -> String {
     format!(
-        "this gateway addresses at most {MAX_CONFIG_TOPICS} distinct topics per {api_name} request"
+        "this gateway addresses at most {} distinct topics per {api_name} request",
+        crate::limits::admin_topics_per_request()
     )
 }
 

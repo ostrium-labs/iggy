@@ -23,6 +23,7 @@ pub mod cluster_id;
 pub mod env;
 pub mod error;
 pub mod group;
+pub mod limits;
 pub mod listener;
 pub mod producer_state;
 pub mod protocol;
