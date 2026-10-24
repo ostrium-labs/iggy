@@ -35,13 +35,6 @@ fact = "fetch.log_start_offset"
 issue = "apache/iggy#4525"
 reason = "Iggy exposes no log start offset, so Fetch sends -1"
 
-# Headers come back sorted by name, not in send order.
-[[difference]]
-scenario = "produce_fetch"
-fact = "fetch.offset_1.headers"
-issue = "apache/iggy#4517"
-reason = "Iggy user headers are keyed in a BTreeMap"
-
 # Documented: past the high watermark the gateway answers retriable 6 for 30 s before 1.
 [[difference]]
 scenario = "produce_fetch"

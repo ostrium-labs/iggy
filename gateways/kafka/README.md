@@ -482,7 +482,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | Bytes after the batch | 87. |
 | More records than the batch declares | 87, as Kafka. |
 | Same partition twice in one request | Written twice. Kafka keeps the last. |
-| Repeated header name in a record | 87. |
+| Repeated header name in a record | Kept, in send order, as Kafka. Stored in the envelope. |
+| Header order | Kept, as Kafka. `kafka.ho` holds it when not sorted by name. |
 | Produce v0-2, `acks=0` | Closes the connection. |
 | Undecodable request | Closes the connection. |
 

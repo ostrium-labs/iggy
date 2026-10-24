@@ -61,6 +61,7 @@ use tokio::sync::broadcast;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::records::{HeaderList, encode_batch_with};
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -110,6 +111,7 @@ enum Scenario {
     ApiVersions,
     TopicAdmin,
     ProduceFetch,
+    RecordHeaders,
     ListOffsets,
     ClassicGroup,
     StandaloneCommit,
@@ -119,10 +121,11 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
+        Self::RecordHeaders,
         Self::ListOffsets,
         Self::ClassicGroup,
         Self::StandaloneCommit,
@@ -136,6 +139,7 @@ impl Scenario {
             Self::ApiVersions => "api_versions",
             Self::TopicAdmin => "topic_admin",
             Self::ProduceFetch => "produce_fetch",
+            Self::RecordHeaders => "record_headers",
             Self::ListOffsets => "list_offsets",
             Self::ClassicGroup => "classic_group",
             Self::StandaloneCommit => "standalone_commit",
@@ -152,6 +156,7 @@ impl Scenario {
             Self::ApiVersions => api_versions(cx, &client, &mut facts),
             Self::TopicAdmin => topic_admin(cx, &mut client, &mut facts).await?,
             Self::ProduceFetch => produce_fetch(cx, &mut client, &mut facts).await?,
+            Self::RecordHeaders => record_headers(cx, &mut client, &mut facts).await?,
             Self::ListOffsets => list_offsets(cx, &mut client, &mut facts).await?,
             Self::ClassicGroup => classic_group(cx, &mut client, &mut facts).await?,
             Self::StandaloneCommit => standalone_commit(cx, &mut client, &mut facts).await?,
@@ -524,6 +529,189 @@ async fn produce_fetch(
 }
 
 /// `(error, offset, timestamp)` for one `ListOffsets` lookup on partition 0.
+/// What `record_headers` writes, as `(key, headers)`: a repeated name out of name order with a
+/// null among them (`KafkaJS` array headers, Spring's trace headers), headers out of name order
+/// with no repeat, and headers already in name order.
+/// One record of [`HEADER_RECORDS`]: its key and its headers in send order.
+type HeaderRecord = (
+    &'static str,
+    &'static [(&'static str, Option<&'static str>)],
+);
+
+const HEADER_RECORDS: [HeaderRecord; 3] = [
+    (
+        "repeats",
+        &[
+            ("trace", Some("t1")),
+            ("app", Some("demo")),
+            ("trace", Some("t2")),
+            ("trace", None),
+        ],
+    ),
+    (
+        "unsorted",
+        &[
+            ("zulu", Some("1")),
+            ("alpha", Some("2")),
+            ("mike", Some("3")),
+        ],
+    ),
+    ("sorted", &[("alpha", Some("1")), ("beta", Some("2"))]),
+];
+
+/// One batch of [`HEADER_RECORDS`], written with every header, repeats included.
+///
+/// `kafka_protocol`'s `Record` folds a repeated name, so the gateway's own list-aware encoder
+/// writes the batch. Both targets check its CRC, and Kafka serves it back as sent.
+fn header_batch(first_timestamp: i64) -> Result<Bytes, String> {
+    let mut records = Vec::new();
+    let mut repeated = Vec::new();
+    for ((key, headers), index) in HEADER_RECORDS.iter().zip(0_i64..) {
+        let list: HeaderList = headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    s(name),
+                    value.map(|value| Bytes::from(value.as_bytes().to_vec())),
+                )
+            })
+            .collect();
+        let mut map = kafka_protocol::indexmap::IndexMap::new();
+        for (name, value) in &list {
+            map.insert(name.clone(), value.clone());
+        }
+        if map.len() < list.len() {
+            repeated.push((usize::try_from(index).unwrap_or_default(), list));
+        }
+        records.push(Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: NO_PARTITION_LEADER_EPOCH,
+            producer_id: NO_PRODUCER_ID,
+            producer_epoch: NO_PRODUCER_EPOCH,
+            timestamp_type: TimestampType::Creation,
+            offset: index,
+            sequence: NO_SEQUENCE,
+            timestamp: first_timestamp + index * 1000,
+            key: Some(Bytes::from(key.as_bytes().to_vec())),
+            value: Some(Bytes::from_static(b"value")),
+            headers: map,
+        });
+    }
+    encode_batch_with(&mut records, &repeated).map_err(|error| format!("encode batch: {error}"))
+}
+
+/// Reads a zigzag varint off `buf`.
+fn read_varint(buf: &mut &[u8]) -> Result<i64, String> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = buf.split_first().ok_or("varint runs off the end")?;
+        *buf = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok((value >> 1).cast_signed() ^ -(value & 1).cast_signed());
+        }
+    }
+    Err("varint is too long".into())
+}
+
+fn read_slice<'a>(buf: &mut &'a [u8], len: i64) -> Result<Option<&'a [u8]>, String> {
+    if len < 0 {
+        return Ok(None);
+    }
+    let len = usize::try_from(len).map_err(|error| error.to_string())?;
+    let (head, rest) = buf.split_at_checked(len).ok_or("field runs off the end")?;
+    *buf = rest;
+    Ok(Some(head))
+}
+
+/// Each record of the uncompressed v2 batches in `blob`, as `(offset, record bytes, headers)`.
+///
+/// Walks the bytes rather than decoding through `kafka_protocol`, whose `Record` would fold a
+/// repeated header name and so hide the very thing this scenario checks.
+#[allow(clippy::type_complexity)]
+fn raw_records(blob: &[u8]) -> Result<Vec<(i64, Vec<u8>, Vec<String>)>, String> {
+    let mut out = Vec::new();
+    let mut rest = blob;
+    while rest.len() >= 12 {
+        let base = i64::from_be_bytes(rest[..8].try_into().map_err(|_| "base offset")?);
+        let length = i32::from_be_bytes(rest[8..12].try_into().map_err(|_| "batch length")?);
+        let length = usize::try_from(length).map_err(|error| error.to_string())?;
+        let Some(batch) = rest.get(12..12 + length) else {
+            break; // A partial batch at the end of a Fetch, as Kafka allows.
+        };
+        rest = &rest[12 + length..];
+        // Leader epoch, magic, CRC, attributes, last offset delta, two timestamps, producer id,
+        // epoch, base sequence: 45 bytes, then the record count.
+        let attributes = i16::from_be_bytes([batch[9], batch[10]]);
+        if attributes & 0b111 != 0 || attributes & (1 << 5) != 0 {
+            return Err(format!(
+                "batch attributes {attributes:#x}: compressed or control"
+            ));
+        }
+        let mut records = &batch[49..];
+        while !records.is_empty() {
+            let size = read_varint(&mut records)?;
+            let body = read_slice(&mut records, size)?.ok_or("negative record length")?;
+            let mut fields = body;
+            fields = &fields[1..]; // attributes
+            read_varint(&mut fields)?; // timestamp delta
+            let offset_delta = read_varint(&mut fields)?;
+            for _ in 0..2 {
+                let len = read_varint(&mut fields)?;
+                read_slice(&mut fields, len)?;
+            }
+            let count = read_varint(&mut fields)?;
+            let mut headers = Vec::new();
+            for _ in 0..count {
+                let len = read_varint(&mut fields)?;
+                let name = read_slice(&mut fields, len)?.ok_or("null header name")?;
+                let len = read_varint(&mut fields)?;
+                let value = read_slice(&mut fields, len)?;
+                headers.push(format!(
+                    "{}={}",
+                    String::from_utf8_lossy(name),
+                    value.map_or_else(|| "<null>".into(), String::from_utf8_lossy)
+                ));
+            }
+            out.push((base + offset_delta, body.to_vec(), headers));
+        }
+    }
+    Ok(out)
+}
+
+/// Repeated header names and header order (#4517): what Produce stored comes back byte for byte.
+async fn record_headers(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let name = cx.name("record_headers", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let start = now_ms() - 60_000;
+    let (error, base) = produce(client, &name, 0, header_batch(start)?).await?;
+    facts.set("produce.error", error);
+    facts.set("produce.base_offset", base);
+
+    let (partition, _) = fetch(client, &name, 0).await?;
+    facts.set("fetch.error", partition.error_code);
+    let records = raw_records(partition.records.as_deref().unwrap_or_default())?;
+    facts.set("fetch.records", records.len());
+    for (offset, body, headers) in records {
+        let prefix = format!("fetch.offset_{offset}");
+        facts.set(format!("{prefix}.headers"), headers.join(","));
+        let mut hex = String::with_capacity(body.len() * 2);
+        for byte in body {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        // The record from its attributes on: timestamp and offset deltas, key, value, headers.
+        facts.set(format!("{prefix}.bytes"), hex);
+    }
+    Ok(())
+}
+
 async fn list_offset(
     client: &mut WireClient,
     name: &str,

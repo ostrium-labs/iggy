@@ -39,6 +39,8 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+# Rewrites the CRC of a Fetch batch whose records repeat a header name (`records::headers`).
+crc32c = { workspace = true }
 # The four codecs are driven from `records::decompress` rather than through kafka-protocol,
 # whose decompressors materialize the whole stream before a budget can see it.
 flate2 = { workspace = true }
@@ -76,8 +78,6 @@ x509-parser = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
-# Repairs the CRC of a batch header a test rewrote, which the decoder checks first.
-crc32c = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
 # Certificates for the TLS listener tests, minted per test so nothing in the tree expires.

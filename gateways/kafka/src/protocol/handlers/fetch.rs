@@ -54,7 +54,8 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::{PROBE_INTERVAL, Snapshot, recent};
 use crate::records::{
-    BATCH_HEADER_BYTES, RecordCodecError, encode_batch, from_iggy, record_size_bound,
+    BATCH_HEADER_BYTES, RecordCodecError, RepeatedHeaders, encode_batch_with, from_iggy_with,
+    record_size_bound_with,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -1630,6 +1631,7 @@ fn encode_records(
     keep_one: bool,
 ) -> core::result::Result<Bytes, RecordCodecError> {
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
+    let mut repeated = RepeatedHeaders::new();
     let mut size = BATCH_HEADER_BYTES;
     for message in messages
         .iter()
@@ -1638,19 +1640,22 @@ fn encode_records(
         let Ok(kafka_offset) = i64::try_from(message.header.offset) else {
             break;
         };
-        let record = match from_iggy(message, kafka_offset) {
-            Ok(record) => record,
+        let (record, headers) = match from_iggy_with(message, kafka_offset) {
+            Ok(decoded) => decoded,
             Err(error) if records.is_empty() => return Err(error),
             // The next Fetch starts at this message and reports it.
             Err(_) => break,
         };
-        size = size.saturating_add(record_size_bound(&record));
+        size = size.saturating_add(record_size_bound_with(&record, headers.as_deref()));
         if size > budget && !(keep_one && records.is_empty()) {
             break;
         }
+        if let Some(headers) = headers {
+            repeated.push((records.len(), headers));
+        }
         records.push(record);
     }
-    encode_batch(&mut records)
+    encode_batch_with(&mut records, &repeated)
 }
 
 /// The Fetch code for a bridge error.
