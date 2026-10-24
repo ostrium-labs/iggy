@@ -54,8 +54,10 @@
 //! a description to interpret.
 
 mod catalog;
+mod cleanup_policy;
 mod codec;
 mod durability;
+mod kafka_configs;
 mod key;
 mod partition_resize_policy;
 
@@ -67,8 +69,10 @@ pub use catalog::{
     critical_keys_marker, derived_defaults, descriptors_for, public_options, stream_key_from_entry,
     stream_wrap_set,
 };
+pub use cleanup_policy::CleanupPolicy;
 pub use codec::OptionValueCodec;
 pub use durability::Durability;
+pub use kafka_configs::{KAFKA_CONFIGS_EMPTY, KAFKA_CONFIGS_MAX_LENGTH, KafkaTopicConfigs};
 pub use key::OptionKey;
 pub use partition_resize_policy::PartitionResizePolicy;
 
@@ -340,6 +344,12 @@ pub mod topic_option_keys {
     /// [`SEGMENT_SIZE`] -- preallocation reserves exactly that much, so
     /// the two only make sense decided together.
     pub const PREALLOCATE_SEGMENTS: &str = "preallocate_segments";
+    /// Kafka-style cleanup policy: `String`, `delete`, `compact` or
+    /// `compact,delete`. Stored and reported; the server does not compact yet.
+    pub const CLEANUP_POLICY: &str = "cleanup_policy";
+    /// Kafka topic configurations kept verbatim for the Kafka gateway:
+    /// `String`, sorted `name=value` lines, or `-` for none.
+    pub const KAFKA_CONFIGS: &str = "kafka_configs";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -1196,9 +1206,10 @@ pub struct TopicCreateOptions {
     pub preallocate_segments: Option<bool>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
-    /// server catalog after this build shipped. Outbound only: a typed field
-    /// wins on collision in [`Self::to_wire`], and [`Self::parse`] never
-    /// populates it.
+    /// server catalog after this build shipped. A typed field wins on
+    /// collision in [`Self::to_wire`]. [`Self::parse`] fills it only for the
+    /// catalog keys that have no typed field (`cleanup_policy`,
+    /// `kafka_configs`), in canonical form.
     pub raw: BTreeMap<String, String>,
 }
 
@@ -1310,6 +1321,15 @@ impl TopicCreateOptions {
             }
             OptionKey::PreallocateSegments => {
                 self.preallocate_segments = Some(bool::decode(option, entry)?);
+            }
+            // No typed field: kept in `raw` in canonical form, so a re-encode sends them.
+            OptionKey::CleanupPolicy => {
+                let policy = CleanupPolicy::decode(option, entry)?;
+                self.raw.insert(key.to_owned(), policy.to_option_string());
+            }
+            OptionKey::KafkaConfigs => {
+                let configs = KafkaTopicConfigs::decode(option, entry)?;
+                self.raw.insert(key.to_owned(), configs.to_option_string());
             }
             OptionKey::Name
             | OptionKey::Username

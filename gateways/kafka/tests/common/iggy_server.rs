@@ -222,6 +222,11 @@ impl PortGuard {
 ///
 /// Panics if `iggy-server` cannot be found alongside this test binary's own target directory.
 fn iggy_server_binary() -> PathBuf {
+    // A target shared by several worktrees holds whichever `iggy-server` was built last;
+    // `IGGY_SERVER_BIN` pins the one built from this tree.
+    if let Some(path) = std::env::var_os("IGGY_SERVER_BIN") {
+        return PathBuf::from(path);
+    }
     let current_exe = std::env::current_exe().expect("resolve this test binary's own path");
     let binary_name = format!("iggy-server{}", std::env::consts::EXE_SUFFIX);
     current_exe

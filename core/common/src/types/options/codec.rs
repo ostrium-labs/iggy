@@ -17,8 +17,8 @@
 
 use super::key::OptionKey;
 use super::{
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    PartitionResizePolicy,
+    CleanupPolicy, Durability, KafkaTopicConfigs, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, PartitionResizePolicy,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
@@ -154,6 +154,38 @@ impl OptionValueCodec for PartitionResizePolicy {
 
     fn encode(&self) -> Result<HeaderValue, IggyError> {
         HeaderValue::from_str(self.as_ref())
+    }
+
+    fn to_option_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl OptionValueCodec for CleanupPolicy {
+    const KIND: HeaderKind = HeaderKind::String;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        parse_text(key, entry, |text| text.parse().ok())
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        HeaderValue::from_str(self.as_str())
+    }
+
+    fn to_option_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl OptionValueCodec for KafkaTopicConfigs {
+    const KIND: HeaderKind = HeaderKind::String;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        parse_text(key, entry, |text| text.parse().ok())
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        HeaderValue::from_str(&self.to_text())
     }
 
     fn to_option_string(&self) -> String {
