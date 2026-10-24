@@ -38,6 +38,8 @@ anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+# Derives Kafka topic ids from Iggy topic identity (`topic_id.rs`).
+blake3 = { workspace = true }
 bytes = { workspace = true }
 # The four codecs are driven from `records::decompress` rather than through kafka-protocol,
 # whose decompressors materialize the whole stream before a budget can see it.

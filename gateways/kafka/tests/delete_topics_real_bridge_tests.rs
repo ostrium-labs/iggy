@@ -500,3 +500,101 @@ async fn given_a_plaintext_listener_beside_sasl_ssl_should_deny_delete_topics_th
         "the plaintext listener must not bypass what the SASL listener enforces"
     );
 }
+
+/// Awaits `handle` and decodes the answer as a client does.
+async fn round_trip<Resp: kafka_protocol::protocol::Decodable>(
+    version: i16,
+    handle: impl std::future::Future<Output = iggy_gateway_kafka::protocol::api::HandleOutcome>,
+) -> Resp {
+    let mut body = handle.await.expect_response("answered");
+    Resp::decode(&mut body, version).expect("a client decodes it")
+}
+
+fn encoded<Req: kafka_protocol::protocol::Encodable>(request: &Req, version: i16) -> Bytes {
+    let mut body = bytes::BytesMut::new();
+    request.encode(&mut body, version).expect("encode");
+    body.freeze()
+}
+
+/// KIP-516: `CreateTopics` v7 answers the new topic's id, and `DeleteTopics` v6 deletes by it.
+#[tokio::test]
+#[serial]
+async fn given_v6_a_topic_deleted_by_id_should_be_gone_and_its_id_unknown() {
+    use iggy_gateway_kafka::protocol::handlers::create_topics;
+    use kafka_protocol::messages::create_topics_request::CreatableTopic;
+    use kafka_protocol::messages::delete_topics_request::DeleteTopicState;
+    use kafka_protocol::messages::{
+        CreateTopicsRequest, CreateTopicsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
+        TopicName,
+    };
+    use kafka_protocol::protocol::StrBytes;
+    const ERROR_UNKNOWN_TOPIC_ID: i16 = 100;
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    let name = || TopicName(StrBytes::from_static_str("by-id"));
+
+    let create = CreateTopicsRequest::default()
+        .with_timeout_ms(10_000)
+        .with_topics(vec![
+            CreatableTopic::default()
+                .with_name(name())
+                .with_num_partitions(1)
+                .with_replication_factor(-1),
+        ]);
+    let created: CreateTopicsResponse =
+        round_trip(7, create_topics::handle(&state, 7, encoded(&create, 7))).await;
+    assert_eq!(created.topics[0].error_code, ERROR_NONE);
+    let id = created.topics[0].topic_id;
+    assert!(!id.is_nil());
+    let listed = state
+        .bridge
+        .as_ref()
+        .expect("bridge")
+        .list_kafka_topics()
+        .await
+        .expect("list");
+    assert_eq!(
+        listed
+            .iter()
+            .find(|topic| topic.kafka_topic == "by-id")
+            .map(|topic| topic.topic_id),
+        Some(id)
+    );
+
+    let both = DeleteTopicsRequest::default()
+        .with_timeout_ms(10_000)
+        .with_topics(vec![
+            DeleteTopicState::default()
+                .with_name(Some(name()))
+                .with_topic_id(id),
+        ]);
+    let refused: DeleteTopicsResponse =
+        round_trip(6, delete_topics::handle(&state, None, 6, encoded(&both, 6))).await;
+    assert_eq!(refused.responses[0].error_code, ERROR_INVALID_REQUEST);
+
+    let by_id = DeleteTopicsRequest::default()
+        .with_timeout_ms(10_000)
+        .with_topics(vec![DeleteTopicState::default().with_topic_id(id)]);
+    let deleted: DeleteTopicsResponse = round_trip(
+        6,
+        delete_topics::handle(&state, None, 6, encoded(&by_id, 6)),
+    )
+    .await;
+    assert_eq!(deleted.responses.len(), 1);
+    assert_eq!(deleted.responses[0].error_code, ERROR_NONE);
+    assert_eq!(
+        deleted.responses[0].name.as_ref().map(|name| name.as_str()),
+        Some("by-id")
+    );
+    assert_eq!(deleted.responses[0].topic_id, id);
+
+    let again: DeleteTopicsResponse = round_trip(
+        6,
+        delete_topics::handle(&state, None, 6, encoded(&by_id, 6)),
+    )
+    .await;
+    assert_eq!(again.responses[0].error_code, ERROR_UNKNOWN_TOPIC_ID);
+    assert_eq!(again.responses[0].name, None);
+}

@@ -27,13 +27,15 @@
 //! silently dropped. Unlike `CreateTopics`, whose equivalent field is encoded at every version it
 //! supports.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use iggy::prelude::IggyError;
+use kafka_protocol::messages::delete_topics_request::DeleteTopicState;
 use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
 use kafka_protocol::messages::{DeleteTopicsRequest, DeleteTopicsResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
+use uuid::Uuid;
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -44,23 +46,26 @@ use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_DELETE_TOPICS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_delete_topics_shape;
 use crate::protocol::handlers::{
     clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, respond_or_close, unsupported_version_response,
+    is_supported_version, learn_topic_ids, respond_or_close, unsupported_version_response,
 };
 
-/// This bridge never advertises v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape).
+/// v1 to v6. v1 is the crate's own floor (`kafka_protocol` does not implement v0 for this message).
 ///
-/// It has no concept of a Kafka topic id, only the Kafka-side name `TopicMapping` resolves. v1
-/// is the crate's own floor (`kafka_protocol` does not implement v0 for this message).
+/// v6 names each topic by name or by id (KIP-516, `topics: Vec<DeleteTopicState>`); ids resolve
+/// through `GatewayState::topic_ids`.
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_DELETE_TOPICS,
     min_version: 1,
-    max_version: 5,
+    max_version: 6,
 };
+
+/// First version that may name a topic by id.
+const TOPIC_ID_MIN_VERSION: i16 = 6;
 
 /// Cap on topic names one `DeleteTopics` request may address through the bridge.
 ///
@@ -112,24 +117,30 @@ pub async fn handle(
         }
     };
 
-    if let Some(results) = authorize(principal, &req.topic_names) {
+    // From v6 each topic is a name or an id. Those that resolve to a name go through the same
+    // path as a v1-v5 name list; the rest are answered here.
+    let (topic_names, mut answered) = if api_version >= TOPIC_ID_MIN_VERSION {
+        name_topics(state, bridge, &req.topics).await
+    } else {
+        (req.topic_names.clone(), Vec::new())
+    };
+
+    if let Some(mut results) = authorize(principal, &topic_names) {
+        results.append(&mut answered);
         let resp = DeleteTopicsResponse::default().with_responses(results);
         return respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics");
     }
 
-    // RANGE caps at v5, so req.topics (the v6 topic-id shape) is always empty - topic_names is
-    // the only populated field at any version this bridge advertises.
-    if req.topic_names.len() > MAX_BRIDGE_BACKED_TOPICS {
+    if topic_names.len() > MAX_BRIDGE_BACKED_TOPICS {
         tracing::warn!(
-            requested_topics = req.topic_names.len(),
+            requested_topics = topic_names.len(),
             max = MAX_BRIDGE_BACKED_TOPICS,
             "DeleteTopics request addresses too many topics; rejecting"
         );
         let message = StrBytes::from(format!(
             "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} topic names per DeleteTopics request"
         ));
-        let results = req
-            .topic_names
+        let results = topic_names
             .iter()
             .map(|name| {
                 DeletableTopicResult::default()
@@ -145,19 +156,97 @@ pub async fn handle(
     // Real Kafka (`ControllerApis.deleteTopics`) refuses every occurrence of a duplicate name
     // with `INVALID_REQUEST` (42) and deletes nothing for it, the same choice this gateway's own
     // `CreateTopics` already makes for a repeated topic name.
-    let duplicate_names = find_duplicate_names(&req.topic_names);
+    let duplicate_names = find_duplicate_names(&topic_names);
 
+    // The answer names each deleted topic's id from v6, which has to be read before the delete.
+    let ids = if api_version >= TOPIC_ID_MIN_VERSION {
+        topic_ids(bridge, &topic_names).await
+    } else {
+        HashMap::new()
+    };
     let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
-    let results = delete_all_topics(
+    let mut results = delete_all_topics(
         bridge,
         &state.partition_growth,
-        &req.topic_names,
+        &topic_names,
         &duplicate_names,
         deadline,
     )
     .await;
+    for result in &mut results {
+        let Some(name) = &result.name else {
+            continue;
+        };
+        if result.error_code == ERROR_NONE {
+            state.topic_ids.forget(name.as_str());
+        }
+        if let Some(id) = ids.get(name.as_str()) {
+            result.topic_id = *id;
+        }
+    }
+    results.append(&mut answered);
     let resp = DeleteTopicsResponse::default().with_responses(results);
     respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics")
+}
+
+/// The names of a v6 request's topics, and the answers of those that name none.
+///
+/// As in Kafka's `ControllerApis.deleteTopics`, an entry with both a name and an id is refused with
+/// `INVALID_REQUEST`, and an id no topic has with `UNKNOWN_TOPIC_ID` (see [`learn_topic_ids`]).
+async fn name_topics(
+    state: &GatewayState,
+    bridge: &IggyBridge,
+    topics: &[DeleteTopicState],
+) -> (Vec<TopicName>, Vec<DeletableTopicResult>) {
+    let by_id = topics
+        .iter()
+        .filter(|topic| topic.name.is_none())
+        .map(|topic| topic.topic_id);
+    let refusal = learn_topic_ids(state, bridge, by_id, REQUEST_DEADLINE).await;
+    let mut names = Vec::with_capacity(topics.len());
+    let mut answered = Vec::new();
+    for topic in topics {
+        match (&topic.name, topic.topic_id.is_nil()) {
+            (Some(_), false) => answered.push(
+                DeletableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_topic_id(topic.topic_id)
+                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_message(Some(StrBytes::from_static_str(
+                        "You may not specify both topic name and topic id.",
+                    ))),
+            ),
+            (Some(name), true) => names.push(name.clone()),
+            (None, _) => match state.topic_ids.name(&topic.topic_id) {
+                Some(name) if !topic.topic_id.is_nil() => {
+                    names.push(TopicName(StrBytes::from_string(name)));
+                }
+                _ => answered.push(
+                    DeletableTopicResult::default()
+                        .with_name(None)
+                        .with_topic_id(topic.topic_id)
+                        .with_error_code(refusal)
+                        .with_error_message(None),
+                ),
+            },
+        }
+    }
+    (names, answered)
+}
+
+/// The current id of each of `names` that exists. A failed read leaves the ids out, which the
+/// answer then reports as zero.
+async fn topic_ids(bridge: &IggyBridge, names: &[TopicName]) -> HashMap<String, Uuid> {
+    let names: Vec<StrBytes> = names.iter().map(|name| name.0.clone()).collect();
+    match tokio::time::timeout(REQUEST_DEADLINE, bridge.get_kafka_topics(&names)).await {
+        Ok(Ok(found)) => found
+            .into_iter()
+            .filter_map(|(name, metadata)| {
+                metadata.map(|metadata| (name.as_str().to_string(), metadata.topic_id))
+            })
+            .collect(),
+        _ => HashMap::new(),
+    }
 }
 
 /// Denies every requested topic when `principal` is not allowed to delete topic data, or when
@@ -379,6 +468,21 @@ pub fn encode_error_response(version: i16, error_code: i16) -> Result<Bytes> {
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
 pub fn encode_response(version: i16, req: &DeleteTopicsRequest) -> Result<Bytes> {
+    if version >= TOPIC_ID_MIN_VERSION {
+        let results = req
+            .topics
+            .iter()
+            .map(|topic| {
+                DeletableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_topic_id(topic.topic_id)
+                    .with_error_code(ERROR_NOT_CONTROLLER)
+                    .with_error_message(None)
+            })
+            .collect();
+        let resp = DeleteTopicsResponse::default().with_responses(results);
+        return encode_message(&resp, version, 256);
+    }
     encode_inner(version, &req.topic_names, ERROR_NOT_CONTROLLER)
 }
 

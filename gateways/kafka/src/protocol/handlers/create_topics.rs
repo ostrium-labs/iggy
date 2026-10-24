@@ -37,7 +37,7 @@ use crate::protocol::api::{
     API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
     ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
+    ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::topic_config::{
@@ -51,8 +51,11 @@ use crate::protocol::handlers::{
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_CREATE_TOPICS,
     min_version: 2,
-    max_version: 5,
+    max_version: 7,
 };
+
+/// First version whose answer carries the created topic's id (KIP-516).
+const TOPIC_ID_MIN_VERSION: i16 = 7;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
@@ -123,7 +126,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     }
 
     let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
-    let results = create_all_topics(
+    let mut results = create_all_topics(
         bridge,
         &state.partition_growth,
         &req.topics,
@@ -132,8 +135,45 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         deadline,
     )
     .await;
+    if api_version >= TOPIC_ID_MIN_VERSION && !req.validate_only {
+        add_topic_ids(state, bridge, &mut results).await;
+    }
     let resp = CreateTopicsResponse::default().with_topics(results);
     respond_or_close(encode_message(&resp, api_version, 256), "CreateTopics")
+}
+
+/// Gives each created topic its id, as v7 answers do, and records the id for later requests. A
+/// failed read leaves the id zero, which a client treats as unknown and learns from Metadata.
+async fn add_topic_ids(
+    state: &GatewayState,
+    bridge: &IggyBridge,
+    results: &mut [CreatableTopicResult],
+) {
+    let created: Vec<StrBytes> = results
+        .iter()
+        .filter(|result| result.error_code == ERROR_NONE)
+        .map(|result| result.name.0.clone())
+        .collect();
+    if created.is_empty() {
+        return;
+    }
+    let Ok(Ok(found)) =
+        tokio::time::timeout(REQUEST_DEADLINE, bridge.get_kafka_topics(&created)).await
+    else {
+        return;
+    };
+    for (name, metadata) in found {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        state.topic_ids.register(name.as_str(), metadata.topic_id);
+        if let Some(result) = results
+            .iter_mut()
+            .find(|result| result.name.0 == name && result.error_code == ERROR_NONE)
+        {
+            result.topic_id = metadata.topic_id;
+        }
+    }
 }
 
 /// Creates (or reports on) every requested topic, skipping the bridge entirely for a duplicate

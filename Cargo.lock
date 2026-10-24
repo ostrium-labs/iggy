@@ -7285,6 +7285,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64 0.23.1",
+ "blake3",
  "bytes",
  "crc32c",
  "flate2",

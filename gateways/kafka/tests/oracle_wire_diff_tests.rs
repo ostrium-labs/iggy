@@ -116,10 +116,11 @@ enum Scenario {
     InitProducerId,
     IdempotentProducer,
     DescribeConfigs,
+    TopicIds,
 }
 
 impl Scenario {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -129,6 +130,7 @@ impl Scenario {
         Self::InitProducerId,
         Self::IdempotentProducer,
         Self::DescribeConfigs,
+        Self::TopicIds,
     ];
 
     const fn name(self) -> &'static str {
@@ -142,6 +144,7 @@ impl Scenario {
             Self::InitProducerId => "init_producer_id",
             Self::IdempotentProducer => "idempotent_producer",
             Self::DescribeConfigs => "describe_configs",
+            Self::TopicIds => "topic_ids",
         }
     }
 
@@ -158,6 +161,7 @@ impl Scenario {
             Self::InitProducerId => init_producer_id(cx, &mut client, &mut facts).await?,
             Self::IdempotentProducer => idempotent_producer(cx, &mut client, &mut facts).await?,
             Self::DescribeConfigs => describe_configs(cx, &mut client, &mut facts).await?,
+            Self::TopicIds => topic_ids(cx, &mut client, &mut facts).await?,
         }
         Ok(facts)
     }
@@ -1103,6 +1107,284 @@ async fn describe_configs(
 }
 
 /// Skips, or fails under `KAFKA_E2E_REQUIRED=1`.
+/// Metadata at v12 or later for topics named by `name` or by `id`: each topic's error, name and
+/// id.
+async fn metadata_ids(
+    client: &mut WireClient,
+    topics: &[(Option<&str>, uuid::Uuid)],
+) -> Result<Vec<(i16, Option<String>, uuid::Uuid)>, String> {
+    let request = MetadataRequest::default()
+        .with_topics(Some(
+            topics
+                .iter()
+                .map(|(name, id)| {
+                    MetadataRequestTopic::default()
+                        .with_name(name.map(topic))
+                        .with_topic_id(*id)
+                })
+                .collect(),
+        ))
+        .with_allow_auto_topic_creation(false);
+    let version = version(client, ApiKey::Metadata, 13)?;
+    if version < 12 {
+        return Err(format!("Metadata v{version} cannot name topics by id"));
+    }
+    let response = client.send(&request, version).await?;
+    Ok(response
+        .topics
+        .into_iter()
+        .map(|found| {
+            (
+                found.error_code,
+                found.name.map(|name| name.as_str().to_string()),
+                found.topic_id,
+            )
+        })
+        .collect())
+}
+
+/// Topic ids (KIP-516) across the APIs that carry them: Metadata, `CreateTopics`, Fetch, Produce,
+/// `ListOffsets` v8+ sentinels and `DeleteTopics` by id. Ids themselves differ per broker, so the
+/// facts are whether they agree with each other.
+async fn topic_ids(cx: &Context, client: &mut WireClient, facts: &mut Facts) -> Result<(), String> {
+    let name = cx.name("topic_ids", "t");
+    let request = CreateTopicsRequest::default()
+        .with_timeout_ms(TIMEOUT_MS)
+        .with_topics(vec![
+            CreatableTopic::default()
+                .with_name(topic(&name))
+                .with_num_partitions(PARTITIONS)
+                .with_replication_factor(-1),
+        ]);
+    let create_version = version(client, ApiKey::CreateTopics, 7)?;
+    let created = client.send(&request, create_version).await?;
+    let created = created
+        .topics
+        .first()
+        .ok_or_else(|| "CreateTopics answered no topic".to_string())?;
+    facts.set("create.error", created.error_code);
+    await_topic(client, &name).await?;
+
+    let by_name = metadata_ids(client, &[(Some(&name), uuid::Uuid::nil())]).await?;
+    let (error, _, id) = by_name
+        .first()
+        .cloned()
+        .ok_or_else(|| "Metadata answered no topic".to_string())?;
+    facts.set("metadata_by_name.error", error);
+    facts.set("metadata_by_name.id_is_zero", id.is_nil());
+    if create_version >= 7 {
+        facts.set("create.id_matches_metadata", created.topic_id == id);
+    }
+    let missing = metadata_ids(
+        client,
+        &[(Some(&cx.name("topic_ids", "missing")), uuid::Uuid::nil())],
+    )
+    .await?;
+    facts.set("metadata_missing_name.error", missing[0].0);
+    facts.set("metadata_missing_name.id_is_zero", missing[0].2.is_nil());
+
+    let unknown = uuid::Uuid::from_u128(0x0bad_cafe_0000_4000_8000_0000_0000_0001);
+    let by_id = metadata_ids(client, &[(None, id), (None, unknown)]).await?;
+    let found = by_id.iter().find(|(_, _, found)| *found == id);
+    facts.set(
+        "metadata_by_id.error",
+        found.map_or(-1, |(error, _, _)| *error),
+    );
+    facts.set(
+        "metadata_by_id.name_matches",
+        found.is_some_and(|(_, found, _)| found.as_deref() == Some(name.as_str())),
+    );
+    let stranger = by_id.iter().find(|(_, _, found)| *found == unknown);
+    facts.set(
+        "metadata_unknown_id.error",
+        stranger.map_or(-1, |(error, _, _)| *error),
+    );
+    facts.set(
+        "metadata_unknown_id.name",
+        stranger.map_or_else(|| "absent".to_string(), |(_, name, _)| format!("{name:?}")),
+    );
+
+    topic_ids_data(client, facts, &name, id, unknown).await?;
+    topic_ids_admin(cx, client, facts, &name, id, unknown).await
+}
+
+/// Produce v13 and Fetch v13+ by id, for [`topic_ids`].
+async fn topic_ids_data(
+    client: &mut WireClient,
+    facts: &mut Facts,
+    name: &str,
+    id: uuid::Uuid,
+    unknown: uuid::Uuid,
+) -> Result<(), String> {
+    let start = now_ms() - 60_000;
+    let produce_version = version(client, ApiKey::Produce, 13)?;
+    if produce_version >= 13 {
+        for (label, target) in [("produce_by_id", id), ("produce_unknown_id", unknown)] {
+            let request = ProduceRequest::default()
+                .with_acks(-1)
+                .with_timeout_ms(TIMEOUT_MS)
+                .with_topic_data(vec![
+                    TopicProduceData::default()
+                        .with_topic_id(target)
+                        .with_partition_data(vec![
+                            PartitionProduceData::default()
+                                .with_index(0)
+                                .with_records(Some(batch(&RECORDS[..2], start)?)),
+                        ]),
+                ]);
+            let response = client.send(&request, produce_version).await?;
+            let topic = response
+                .responses
+                .first()
+                .ok_or_else(|| "Produce answered no topic".to_string())?;
+            facts.set(format!("{label}.id_echoed"), topic.topic_id == target);
+            let partition = topic
+                .partition_responses
+                .first()
+                .ok_or_else(|| "Produce answered no partition".to_string())?;
+            facts.set(format!("{label}.error"), partition.error_code);
+        }
+    } else {
+        produce(client, name, 0, batch(&RECORDS[..2], start)?).await?;
+    }
+
+    let fetch_version = version(client, ApiKey::Fetch, 18)?;
+    if fetch_version >= 13 {
+        let request = FetchRequest::default()
+            .with_max_wait_ms(500)
+            .with_min_bytes(1)
+            .with_max_bytes(1 << 20)
+            .with_session_epoch(-1)
+            .with_topics(
+                [id, unknown]
+                    .into_iter()
+                    .map(|target| {
+                        FetchTopic::default()
+                            .with_topic_id(target)
+                            .with_partitions(vec![
+                                FetchPartition::default()
+                                    .with_partition(0)
+                                    .with_current_leader_epoch(-1)
+                                    .with_fetch_offset(0)
+                                    .with_last_fetched_epoch(-1)
+                                    .with_log_start_offset(-1)
+                                    .with_partition_max_bytes(1 << 20),
+                            ])
+                    })
+                    .collect(),
+            );
+        let response = client.send(&request, fetch_version).await?;
+        for (label, target) in [("fetch_by_id", id), ("fetch_unknown_id", unknown)] {
+            let topic = response
+                .responses
+                .iter()
+                .find(|topic| topic.topic_id == target);
+            let partition = topic.and_then(|topic| topic.partitions.first());
+            facts.set(
+                format!("{label}.error"),
+                partition.map_or(-1, |partition| partition.error_code),
+            );
+            let records = partition
+                .and_then(|partition| partition.records.clone())
+                .map_or(0, |mut bytes| {
+                    RecordBatchDecoder::decode_all(&mut bytes).map_or(0, |sets| {
+                        sets.into_iter().map(|set| set.records.len()).sum()
+                    })
+                });
+            facts.set(format!("{label}.records"), records);
+        }
+    }
+    Ok(())
+}
+
+/// The `ListOffsets` v8+ sentinels and `DeleteTopics` v6 by id, for [`topic_ids`].
+async fn topic_ids_admin(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+    name: &str,
+    id: uuid::Uuid,
+    unknown: uuid::Uuid,
+) -> Result<(), String> {
+    use kafka_protocol::messages::DeleteTopicsRequest;
+    use kafka_protocol::messages::delete_topics_request::DeleteTopicState;
+
+    // ListOffsets v8 (KIP-405) and v9 (KIP-1005) sentinels, on a broker without tiered storage.
+    let list_version = version(client, ApiKey::ListOffsets, 10)?;
+    for (label, timestamp, needs) in [("earliest_local", -4, 8), ("latest_tiered", -5, 9)] {
+        if list_version < needs {
+            continue;
+        }
+        let request = ListOffsetsRequest::default()
+            .with_replica_id(BrokerId(-1))
+            .with_timeout_ms(TIMEOUT_MS)
+            .with_topics(vec![
+                ListOffsetsTopic::default()
+                    .with_name(topic(name))
+                    .with_partitions(vec![
+                        ListOffsetsPartition::default()
+                            .with_partition_index(0)
+                            .with_current_leader_epoch(-1)
+                            .with_timestamp(timestamp),
+                    ]),
+            ]);
+        let response = client.send(&request, list_version).await?;
+        let answer = response
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .ok_or_else(|| "ListOffsets answered no partition".to_string())?;
+        facts.set(format!("{label}.error"), answer.error_code);
+        facts.set(format!("{label}.offset"), answer.offset);
+        facts.set(format!("{label}.timestamp"), answer.timestamp);
+    }
+
+    let delete_version = version(client, ApiKey::DeleteTopics, 6)?;
+    if delete_version >= 6 {
+        let request = DeleteTopicsRequest::default()
+            .with_timeout_ms(TIMEOUT_MS)
+            .with_topics(vec![
+                DeleteTopicState::default().with_topic_id(id),
+                DeleteTopicState::default().with_topic_id(unknown),
+                DeleteTopicState::default()
+                    .with_name(Some(topic(&cx.name("topic_ids", "both"))))
+                    .with_topic_id(unknown),
+            ]);
+        let response = client.send(&request, delete_version).await?;
+        for (label, wanted) in [("delete_by_id", Some(id)), ("delete_unknown_id", None)] {
+            let result = response.responses.iter().find(|result| {
+                wanted.map_or_else(
+                    || result.topic_id == unknown && result.name.is_none(),
+                    |wanted| result.topic_id == wanted,
+                )
+            });
+            facts.set(
+                format!("{label}.error"),
+                result.map_or(-1, |result| result.error_code),
+            );
+            facts.set(
+                format!("{label}.name"),
+                result.map_or_else(
+                    || "absent".to_string(),
+                    |result| format!("{:?}", result.name.as_ref().map(|name| name.as_str())),
+                ),
+            );
+        }
+        let both = response
+            .responses
+            .iter()
+            .find(|result| result.name.is_some() && result.topic_id == unknown);
+        facts.set(
+            "delete_name_and_id.error",
+            both.map_or(-1, |result| result.error_code),
+        );
+        // A deleted id is unknown at once in Kafka; the gateway forgets it with the delete.
+        let after = metadata_ids(client, &[(None, id)]).await?;
+        facts.set("metadata_deleted_id.error", after[0].0);
+    }
+    Ok(())
+}
+
 fn skip(reason: &str) {
     assert!(
         !env_flag("KAFKA_E2E_REQUIRED"),

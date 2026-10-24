@@ -44,7 +44,7 @@ use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_OFFSETS,
     min_version: 1,
-    max_version: 7,
+    max_version: 10,
 };
 
 /// Cap on distinct topics one `ListOffsets` request resolves through the bridge in one pass.
@@ -68,6 +68,12 @@ const EARLIEST_TIMESTAMP: i64 = -2;
 /// KIP-734 sentinel, from v7. Kafka answers the record with the largest timestamp, this gateway
 /// the last record appended.
 const MAX_TIMESTAMP: i64 = -3;
+/// KIP-405 sentinel, from v8: the first offset in local storage. Iggy has no tiered storage, so
+/// it is the earliest offset.
+const EARLIEST_LOCAL_TIMESTAMP: i64 = -4;
+/// KIP-1005 sentinel, from v9: the last offset in tiered storage. A broker without tiered storage
+/// (Kafka with `remote.log.storage.system.enable=false`) answers offset -1 with no error.
+const LATEST_TIERED_TIMESTAMP: i64 = -5;
 
 /// Most of the request deadline one record lookup may take, so a partition that stalls leaves
 /// time for the rest.
@@ -361,7 +367,8 @@ fn resolve_one_partition(
         // consumer with `auto.offset.reset=earliest` would seek into a hole. Fetch there reads
         // from the oldest kept message, so the consumer skips the gap. Not fixable client-side;
         // needs the bridge to expose a real start offset.
-        EARLIEST_TIMESTAMP => offset_response(index, 0),
+        EARLIEST_TIMESTAMP | EARLIEST_LOCAL_TIMESTAMP => offset_response(index, 0),
+        LATEST_TIERED_TIMESTAMP => offset_response(index, UNKNOWN_OFFSET),
         timestamp => {
             let lookup = match timestamp {
                 MAX_TIMESTAMP => RecordLookup::Last,

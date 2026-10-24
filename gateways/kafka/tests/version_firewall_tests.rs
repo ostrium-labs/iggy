@@ -231,11 +231,11 @@ async fn metadata_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn metadata_above_max_version_closes_connection() {
-    // v10 request uses flexible encoding; a clamped v9 reply would not survive client parsing.
+    // A clamped v13 reply would not survive client parsing at v14.
     assert!(
         handle_request(
             API_KEY_METADATA,
-            10,
+            14,
             build_metadata_flexible_request_v10(&["test-topic"]),
             &default_broker(),
         )
@@ -251,8 +251,8 @@ async fn e2e_metadata_above_max_version_closes_tcp_connection() {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let body = build_metadata_flexible_request_v10(&["orders"]);
-    let frame = build_request_frame(API_KEY_METADATA, 10, 44, Some("n9-test"), &body);
-    stream.write_all(&frame).await.expect("write metadata v10");
+    let frame = build_request_frame(API_KEY_METADATA, 14, 44, Some("n9-test"), &body);
+    stream.write_all(&frame).await.expect("write metadata v14");
 
     assert_eq!(
         read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
@@ -296,9 +296,9 @@ async fn fetch_below_min_version_closes_connection() {
 
 #[tokio::test]
 async fn fetch_unsupported_version_above_max_closes_connection() {
-    // Fetch v13+ response shape differs from the v12 encoder; a clamped body is unparsable.
+    // Above v18 there is no schema to encode a response at.
     assert!(
-        handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker())
+        handle_request(API_KEY_FETCH, 19, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "Fetch above encoder max must close rather than return a clamped body"
@@ -308,7 +308,7 @@ async fn fetch_unsupported_version_above_max_closes_connection() {
 #[tokio::test]
 async fn produce_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_PRODUCE, 13, Bytes::new(), &default_broker())
+        handle_request(API_KEY_PRODUCE, 14, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "Produce above encoder max must close rather than return a clamped body"
@@ -318,7 +318,7 @@ async fn produce_unsupported_version_above_max_closes_connection() {
 #[tokio::test]
 async fn create_topics_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_CREATE_TOPICS, 7, Bytes::new(), &default_broker())
+        handle_request(API_KEY_CREATE_TOPICS, 8, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "CreateTopics above encoder max must close rather than return a clamped body"
@@ -328,7 +328,7 @@ async fn create_topics_unsupported_version_above_max_closes_connection() {
 #[tokio::test]
 async fn list_offsets_unsupported_version_above_max_closes_connection() {
     assert!(
-        handle_request(API_KEY_LIST_OFFSETS, 8, Bytes::new(), &default_broker())
+        handle_request(API_KEY_LIST_OFFSETS, 11, Bytes::new(), &default_broker())
             .await
             .is_close(),
         "ListOffsets above encoder max must close rather than return a clamped body"
@@ -631,15 +631,15 @@ async fn apiversions_v0_and_v2_e2e_return_success() {
 }
 
 #[tokio::test]
-async fn apiversions_v4_out_of_range_e2e_returns_unsupported() {
+async fn apiversions_v5_out_of_range_e2e_returns_unsupported() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 4, 350, &[]).await;
+    let (corr, body) = round_trip(addr, API_KEY_API_VERSIONS, 5, 350, &[]).await;
     assert_eq!(corr, 350);
     let mut d = Decoder::new(body);
     assert_eq!(
         d.read_i16().unwrap(),
         ERROR_UNSUPPORTED_VERSION,
-        "ApiVersions v4 must return UNSUPPORTED_VERSION per KIP-511"
+        "ApiVersions v5 must return UNSUPPORTED_VERSION per KIP-511"
     );
 }
 
@@ -802,12 +802,12 @@ async fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
 // ── Unsupported-version e2e paths for remaining scoped APIs ─────────────────
 
 #[tokio::test]
-async fn list_offsets_v8_unsupported_e2e_closes_connection() {
+async fn list_offsets_v11_unsupported_e2e_closes_connection() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     let frame = build_request_frame(
         API_KEY_LIST_OFFSETS,
-        8,
+        11,
         370,
         Some("scope-test"),
         &[0x00, 0x00, 0x00, 0x00],
@@ -816,7 +816,7 @@ async fn list_offsets_v8_unsupported_e2e_closes_connection() {
     assert_eq!(
         read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
         ByteRead::Closed,
-        "ListOffsets v8 is above the advertised max and must close"
+        "ListOffsets v11 is above the advertised max and must close"
     );
 }
 
