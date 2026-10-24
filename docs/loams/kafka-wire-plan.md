@@ -201,7 +201,7 @@ breadth. Status is `Planned` unless noted.
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | Planned | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
-| KW-12 | Configurable limits; member client id and host | #4530, #4511 | Planned | KW-0 | Yes |
+| KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Started** (branch `kw12-limits`, not built or tested) | KW-0 | Yes |
 | KW-13 | KIP-848 consumer groups | #4523 | Planned | KW-8 | Yes |
 | KW-14 | DescribeLogDirs, read-only `__consumer_offsets` | #4524 | Planned | KW-7 | Yes |
 | KW-15 | Remaining admin APIs | #4526 | Planned | KW-3, KW-8 | Yes |
@@ -648,6 +648,23 @@ consumers (hosts normalised).
 **Exit.** Every limit in #4530 has a variable and a documented Kafka
 counterpart; `kafka-consumer-groups --describe` shows hosts.
 
+**Status (2026-10-24).** Started and stopped on the owner's instruction. Branch
+`kw12-limits` holds an unbuilt first cut: `src/limits.rs` (group caps and
+session timeouts as `IGGY_KAFKA_GROUP_*`, and
+`IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST` for the 100-topic cap of
+CreateTopics, CreatePartitions, DeleteTopics and the config APIs), with unit
+tests, and the handlers reading the cap. Left: wire `limits` into `main.rs`
+(`apply_group_env`, `set_admin_topics_per_request`, `KNOWN_ENV_VARS` in the
+unknown-variable check), the README limits table (the 1000-partition cap is
+Iggy's `TooManyPartitions`, not a gateway setting; the 246-byte group id
+follows Iggy's 255-byte names), member `client_id`/`client_host` in
+DescribeGroups (the header's `client_id` is cleared in `server.rs` before
+routing and the peer address is not passed to handlers), and commit metadata.
+Commit metadata cannot go in Iggy's `ExternalGroup` offset (a `u64`; changing
+it is the state-save path, which needs the owner's OK), so the default is a
+gateway-owned Iggy topic replayed into memory at startup, like Kafka's
+`__consumer_offsets`; that needs the owner's ruling before it is built.
+
 ### KW-13. KIP-848 consumer groups
 
 **Why.** librdkafka 2.12+ and Java 4.x with `group.protocol=consumer`; the
@@ -690,6 +707,8 @@ SaslHandshake v0 with the pre-KIP-152 raw SASL tokens; message formats v0/v1
 only on request (#4528). Oracle: kafka-python 2.0.2 and Sarama 1.40.1 against
 the gateway and Apache Kafka 3.9 (4.x dropped these versions). Exit: both
 authenticate with SASL PLAIN, produce and consume.
+Status (2026-10-24): not started; lane G stopped after KW-11 on the owner's
+instruction.
 
 ### KW-17. Streams groups and share groups
 
