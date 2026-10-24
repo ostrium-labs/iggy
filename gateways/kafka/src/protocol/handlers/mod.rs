@@ -49,6 +49,7 @@ pub mod offset_commit;
 pub mod offset_delete;
 pub mod offset_fetch;
 pub mod produce;
+pub mod scram_credentials;
 pub mod sync_group;
 pub(crate) mod topic_config;
 

@@ -28,10 +28,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
+use crate::auth::{
+    AuthError, AuthenticatedPrincipal, PrincipalResolver, ScramCredentialSource, resolve_principal,
+};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
+use crate::scram::{ScramCredential, ScramMechanism};
 
 mod cluster_id;
 mod fetch;
@@ -41,6 +44,7 @@ mod log_start;
 mod offsets;
 mod produce;
 mod producer_log;
+mod scram_store;
 mod topics;
 
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
@@ -55,6 +59,8 @@ use log_start::LogStarts;
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{InDoubt, ProduceTurn, Producer, Resolution, SendEnd};
+pub(crate) use scram_store::CredentialChange;
+pub use scram_store::{SCRAM_TOPIC, ScramStore};
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad,
@@ -176,6 +182,10 @@ pub struct IggyBridge {
     scan_client: LazyClient,
     /// The `DeleteRecords` watermarks read lately. See `log_start.rs`.
     log_starts: LogStarts,
+    /// The client of the SCRAM credential log. See `scram_store`.
+    scram_client: LazyClient,
+    /// The SCRAM credentials replayed from that log.
+    scram: ScramStore,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -222,6 +232,8 @@ impl IggyBridge {
             group_index: GroupIndex::new(),
             scan_client: LazyClient::default(),
             log_starts: LogStarts::default(),
+            scram_client: LazyClient::default(),
+            scram: ScramStore::default(),
         })
     }
 
@@ -240,6 +252,12 @@ impl IggyBridge {
             stream_id: Identifier::named(stream_name).map_err(BridgeError::Iggy)?,
             topic_id: Identifier::named(topic_name).map_err(BridgeError::Iggy)?,
         })
+    }
+
+    /// The Iggy stream unmapped Kafka topics live in.
+    #[must_use]
+    pub fn default_stream(&self) -> &str {
+        self.config.topic_mapping.default_stream()
     }
 
     /// Iggy stream and topic names `kafka_topic` resolves to.
@@ -304,6 +322,7 @@ impl IggyBridge {
             auto_create_client,
             offset_clients,
             scan_client,
+            scram_client,
             shared_client,
         ) = tokio::join!(
             self.produce_pool.close(),
@@ -313,6 +332,7 @@ impl IggyBridge {
             self.auto_create_client.close(),
             self.offset_pool.close(),
             self.scan_client.close(),
+            self.scram_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
@@ -322,6 +342,7 @@ impl IggyBridge {
             .and(auto_create_client)
             .and(offset_clients)
             .and(scan_client)
+            .and(scram_client)
             .and(shared_client)
     }
 
@@ -412,6 +433,8 @@ impl IggyBridge {
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
             log_starts: LogStarts::default(),
+            scram_client: LazyClient::default(),
+            scram: ScramStore::default(),
         }
     }
 }
@@ -480,6 +503,24 @@ impl PrincipalResolver for IggyBridge {
             Ok(resolved) => resolved,
             Err(error) => {
                 warn!(%error, "could not reach Iggy to look up the certificate's user");
+                Err(AuthError::Unavailable)
+            }
+        }
+    }
+}
+
+/// SCRAM logins look their credential up in the log the bridge keeps (`scram_store`).
+#[async_trait]
+impl ScramCredentialSource for IggyBridge {
+    async fn scram_credential(
+        &self,
+        username: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<Option<ScramCredential>, AuthError> {
+        match self.load_scram_credential(username, mechanism).await {
+            Ok(credential) => Ok(credential),
+            Err(error) => {
+                warn!(%error, "could not read the SCRAM credential log from Iggy");
                 Err(AuthError::Unavailable)
             }
         }

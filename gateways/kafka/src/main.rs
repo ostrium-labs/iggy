@@ -32,7 +32,9 @@ use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::listener::{
     ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
 };
+use iggy_gateway_kafka::oauth::{JwksValidator, OAuthConfig, load_initial_keys};
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
+use iggy_gateway_kafka::protocol::sasl::{EnabledMechanisms, SaslMechanism};
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -46,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = load_config()?;
     let sasl_enabled = config.sasl_enabled();
+    let mechanisms = load_mechanisms(sasl_enabled)?;
     let plaintext_sasl = config
         .listeners
         .iter()
@@ -63,6 +66,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server = server.with_cluster_id(cluster_id);
     }
     if sasl_enabled {
+        server = server.with_sasl_mechanisms(mechanisms.clone());
+        info!("SASL mechanisms enabled: {mechanisms}");
+    }
+    if mechanisms.contains(SaslMechanism::OAuthBearer) {
+        let validator = Arc::new(JwksValidator::new(OAuthConfig::from_env()?)?);
+        load_initial_keys(&validator).await;
+        tokio::spawn(
+            Arc::clone(&validator)
+                .refresh_until_cancelled(tokio_util::sync::CancellationToken::new()),
+        );
+        info!("SASL/OAUTHBEARER enabled; tokens validated against {validator}");
+        server = server.with_token_validator(validator);
+    }
+    if mechanisms.any_scram() {
+        let Some(bridge) = bridge.clone() else {
+            return Err(
+                "SCRAM keeps its credentials in Iggy through the bridge; set \
+                        IGGY_KAFKA_BRIDGE_ENABLED=true"
+                    .into(),
+            );
+        };
+        info!(
+            "SASL/SCRAM enabled; credentials kept in Iggy topic '{}/{}'",
+            iggy_gateway_kafka::bridge::cluster_id_stream(bridge.default_stream()),
+            iggy_gateway_kafka::bridge::SCRAM_TOPIC
+        );
+        server = server.with_scram_credentials(bridge);
+    }
+    if mechanisms.contains(SaslMechanism::Plain) {
         let authenticator = IggyAuthenticator::from_env()?;
         if plaintext_sasl {
             // This is the hop the Kafka client's password actually crosses. The warning is tied
@@ -154,6 +186,8 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
     "IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED",
     "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
+    "IGGY_KAFKA_SASL_MECHANISMS",
+    "IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS",
 ];
 
 /// The variables of the single-listener form, which `IGGY_KAFKA_LISTENERS` replaces as a whole.
@@ -187,6 +221,7 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
             && !KNOWN_KAFKA_ENV_VARS.contains(&key.as_str())
             && !IggyBridgeConfig::KNOWN_ENV_VARS.contains(&key.as_str())
             && !IggyAuthenticator::KNOWN_ENV_VARS.contains(&key.as_str())
+            && !OAuthConfig::KNOWN_ENV_VARS.contains(&key.as_str())
         {
             return Err(format!(
                 "unknown Kafka gateway env var '{key}' (not in the recognized IGGY_KAFKA_* set - \
@@ -332,6 +367,18 @@ fn load_config() -> Result<GatewayConfig, String> {
             "auto topic creation is on: a Metadata lookup of a missing topic creates it"
         );
     }
+    if let Some(raw) = env_var("IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS") {
+        if !config.sasl_enabled() {
+            return Err(
+                "IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS is set but no listener runs SASL".to_string(),
+            );
+        }
+        // 0 is Kafka's default and means no limit, as it does there.
+        let millis: u64 = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS `{raw}`: {e}"))?;
+        config.connections_max_reauth = (millis > 0).then(|| Duration::from_millis(millis));
+    }
     reject_unread_iggy_tls(
         config.sasl_enabled(),
         bridge_enabled()?,
@@ -339,6 +386,33 @@ fn load_config() -> Result<GatewayConfig, String> {
     )?;
 
     Ok(config)
+}
+
+/// The SASL mechanisms (`IGGY_KAFKA_SASL_MECHANISMS`, default `PLAIN`), refusing the settings
+/// nothing would read: a mechanism list with no SASL listener, and OAuth settings without
+/// OAUTHBEARER.
+fn load_mechanisms(sasl_enabled: bool) -> Result<EnabledMechanisms, String> {
+    let mechanisms = match env_var("IGGY_KAFKA_SASL_MECHANISMS") {
+        Some(_) if !sasl_enabled => {
+            return Err(
+                "IGGY_KAFKA_SASL_MECHANISMS is set but no listener runs SASL; add a \
+                 SASL_PLAINTEXT or SASL_SSL listener, or unset it"
+                    .to_string(),
+            );
+        }
+        Some(raw) => EnabledMechanisms::parse(&raw)
+            .map_err(|e| format!("invalid IGGY_KAFKA_SASL_MECHANISMS: {e}"))?,
+        None if sasl_enabled => EnabledMechanisms::default(),
+        None => EnabledMechanisms::new([]),
+    };
+    if OAuthConfig::any_env_set() && !mechanisms.contains(SaslMechanism::OAuthBearer) {
+        return Err(
+            "IGGY_KAFKA_OAUTH_* is set but OAUTHBEARER is not in IGGY_KAFKA_SASL_MECHANISMS; \
+             nothing would read it"
+                .to_string(),
+        );
+    }
+    Ok(mechanisms)
 }
 
 /// The listeners, from `IGGY_KAFKA_LISTENERS` or from the single-listener variables.
