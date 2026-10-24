@@ -249,7 +249,7 @@ fn entry<'a>(
 
 #[tokio::test]
 #[serial]
-async fn describe_configs_returns_retention_without_cleanup_and_alter_persists_retention() {
+async fn describe_configs_returns_every_topic_config_and_alter_persists_retention() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
@@ -265,7 +265,11 @@ async fn describe_configs_returns_retention_without_cleanup_and_alter_persists_r
     .await;
     let result = &described.results[0];
     assert_eq!(result.error_code, ERROR_NONE);
-    assert_eq!(result.configs.len(), 1);
+    assert_eq!(
+        result.configs.len(),
+        33,
+        "every Kafka 4.x topic configuration"
+    );
     let retention = entry(&result.configs, "retention.ms");
     assert_eq!(retention.value.as_ref().map(StrBytes::as_str), Some("-1"));
     assert!(!retention.read_only);
@@ -297,12 +301,10 @@ async fn describe_configs_returns_retention_without_cleanup_and_alter_persists_r
         true,
     )
     .await;
-    // Kafka Connect starts when the entry is missing and refuses a topic that reports `delete`.
     assert_eq!(filtered.results[0].error_code, ERROR_NONE);
-    assert_eq!(
-        filtered.results[0].configs,
-        [] as [DescribeConfigsResourceResult; 0]
-    );
+    let policy = entry(&filtered.results[0].configs, "cleanup.policy");
+    assert_eq!(policy.value.as_ref().map(StrBytes::as_str), Some("delete"));
+    assert_eq!(policy.config_source, SOURCE_DEFAULT);
 
     let v1 = describe(
         &state,
@@ -313,7 +315,7 @@ async fn describe_configs_returns_retention_without_cleanup_and_alter_persists_r
     )
     .await;
     assert_eq!(v1.results[0].error_code, ERROR_NONE);
-    assert_eq!(v1.results[0].configs.len(), 1);
+    assert_eq!(v1.results[0].configs.len(), 33);
 
     let validated = alter(
         &state,
@@ -412,24 +414,39 @@ async fn describe_and_alter_configs_reject_unknown_nontopic_missing_and_invalid_
                 .with_resource_name(StrBytes::from_static_str("1"))
                 .with_configuration_keys(None),
             describe_resource("orders", Some(vec!["cleanup.policy"])),
+            DescribeConfigsResource::default()
+                .with_resource_type(4)
+                .with_resource_name(StrBytes::from_static_str("7"))
+                .with_configuration_keys(None),
+            DescribeConfigsResource::default()
+                .with_resource_type(8)
+                .with_resource_name(StrBytes::from_static_str("1"))
+                .with_configuration_keys(None),
         ],
         false,
         false,
     )
     .await;
-    assert_eq!(broker.results[0].error_code, ERROR_INVALID_REQUEST);
-    assert_eq!(
-        broker.results[0].configs,
-        [] as [DescribeConfigsResourceResult; 0]
-    );
-    assert_eq!(
+    assert_eq!(broker.results[0].error_code, ERROR_NONE);
+    let partitions = entry(&broker.results[0].configs, "num.partitions");
+    assert_eq!(partitions.value.as_ref().map(StrBytes::as_str), Some("1"));
+    assert!(partitions.read_only);
+    assert!(
         broker.results[0]
+            .configs
+            .iter()
+            .all(|config| config.name.as_str() != "inter.broker.protocol.version")
+    );
+    assert_eq!(broker.results[1].error_code, ERROR_NONE);
+    assert_eq!(broker.results[2].error_code, ERROR_INVALID_REQUEST);
+    assert_eq!(broker.results[3].error_code, ERROR_INVALID_REQUEST);
+    assert_eq!(
+        broker.results[3]
             .error_message
             .as_ref()
             .map(StrBytes::as_str),
-        Some("only topic resources are supported")
+        Some("only topic and broker resources are supported")
     );
-    assert_eq!(broker.results[1].error_code, ERROR_NONE);
 
     let missing = describe(
         &state,
@@ -488,18 +505,18 @@ async fn describe_and_alter_configs_reject_unknown_nontopic_missing_and_invalid_
     );
     assert_eq!(still.results[0].configs[0].config_source, SOURCE_DEFAULT);
 
-    let readonly = alter(
+    let bad_policy = alter(
         &state,
         ALTER_V2,
         vec![alter_resource(
             "orders",
             TOPIC,
-            &[("cleanup.policy", "compact")],
+            &[("cleanup.policy", "Compact")],
         )],
         false,
     )
     .await;
-    assert_eq!(readonly.responses[0].error_code, ERROR_INVALID_CONFIG);
+    assert_eq!(bad_policy.responses[0].error_code, ERROR_INVALID_CONFIG);
 
     let missing_alter = alter(
         &state,
@@ -680,10 +697,10 @@ async fn describe_configs_rejects_every_occurrence_of_a_duplicate_resource_name(
     assert_eq!(described.results[1].error_code, ERROR_INVALID_REQUEST);
 }
 
-/// An empty alter list is not a reset. Kafka would replace the set; this gateway rejects it.
+/// `AlterConfigs` replaces the whole set, as Kafka's does: an empty list is a reset to defaults.
 #[tokio::test]
 #[serial]
-async fn alter_configs_rejects_an_empty_list_and_leaves_retention_unchanged() {
+async fn alter_configs_replaces_the_set_and_an_empty_list_resets_it() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
@@ -692,11 +709,57 @@ async fn alter_configs_rejects_an_empty_list_and_leaves_retention_unchanged() {
     let first = alter(
         &state,
         ALTER_V2,
-        vec![alter_resource("orders", TOPIC, &[("retention.ms", "4000")])],
+        vec![alter_resource(
+            "orders",
+            TOPIC,
+            &[("retention.ms", "4000"), ("min.insync.replicas", "2")],
+        )],
         false,
     )
     .await;
     assert_eq!(first.responses[0].error_code, ERROR_NONE);
+
+    let replaced = alter(
+        &state,
+        ALTER_V2,
+        vec![alter_resource(
+            "orders",
+            TOPIC,
+            &[("cleanup.policy", "compact")],
+        )],
+        false,
+    )
+    .await;
+    assert_eq!(replaced.responses[0].error_code, ERROR_NONE);
+    let described = describe(
+        &state,
+        DESCRIBE_V4,
+        vec![describe_resource(
+            "orders",
+            Some(vec![
+                "cleanup.policy",
+                "min.insync.replicas",
+                "retention.ms",
+            ]),
+        )],
+        false,
+        false,
+    )
+    .await;
+    let configs = &described.results[0].configs;
+    assert_eq!(
+        entry(configs, "cleanup.policy")
+            .value
+            .as_ref()
+            .map(StrBytes::as_str),
+        Some("compact")
+    );
+    let replicas = entry(configs, "min.insync.replicas");
+    assert_eq!(replicas.value.as_ref().map(StrBytes::as_str), Some("1"));
+    assert_eq!(replicas.config_source, SOURCE_DEFAULT);
+    let retention = entry(configs, "retention.ms");
+    assert_eq!(retention.value.as_ref().map(StrBytes::as_str), Some("-1"));
+    assert_eq!(retention.config_source, SOURCE_DEFAULT);
 
     let reset = alter(
         &state,
@@ -705,31 +768,18 @@ async fn alter_configs_rejects_an_empty_list_and_leaves_retention_unchanged() {
         false,
     )
     .await;
-    assert_eq!(reset.responses[0].error_code, ERROR_INVALID_CONFIG);
-    assert!(
-        reset.responses[0]
-            .error_message
-            .as_ref()
-            .is_some_and(|message| message.as_str().contains("empty"))
-    );
-
+    assert_eq!(reset.responses[0].error_code, ERROR_NONE);
     let described = describe(
         &state,
         DESCRIBE_V4,
-        vec![describe_resource("orders", Some(vec!["retention.ms"]))],
+        vec![describe_resource("orders", Some(vec!["cleanup.policy"]))],
         false,
         false,
     )
     .await;
-    assert_eq!(
-        described.results[0].configs[0]
-            .value
-            .as_ref()
-            .map(StrBytes::as_str),
-        Some("4000"),
-        "an empty configs list must not clear a previously set retention.ms"
-    );
-    assert_eq!(described.results[0].configs[0].config_source, SOURCE_TOPIC);
+    let policy = &described.results[0].configs[0];
+    assert_eq!(policy.value.as_ref().map(StrBytes::as_str), Some("delete"));
+    assert_eq!(policy.config_source, SOURCE_DEFAULT);
 }
 
 #[tokio::test]
@@ -796,8 +846,8 @@ async fn incremental_alter_configs_sets_deletes_and_validates_retention() {
     );
     assert_eq!(
         retention(&state, "orders").await,
-        ("-1".to_string(), SOURCE_TOPIC),
-        "a delete stores never-expire, and the key stays explicitly set"
+        ("-1".to_string(), SOURCE_DEFAULT),
+        "a delete returns retention.ms to its default"
     );
 
     assert_eq!(
@@ -826,7 +876,7 @@ async fn incremental_alter_configs_sets_deletes_and_validates_retention() {
     );
     assert_eq!(
         retention(&state, "orders").await,
-        ("-1".to_string(), SOURCE_TOPIC)
+        ("-1".to_string(), SOURCE_DEFAULT)
     );
 
     assert_eq!(
@@ -852,15 +902,14 @@ async fn incremental_alter_configs_sets_deletes_and_validates_retention() {
     );
     assert_eq!(
         retention(&state, "orders").await,
-        ("-1".to_string(), SOURCE_TOPIC)
+        ("-1".to_string(), SOURCE_DEFAULT)
     );
 }
 
-/// A delete writes never-expire even where nothing was ever set, so the describe source flips
-/// to the topic although the value does not change. Kafka writes nothing there.
+/// A delete where nothing was ever set changes nothing, as in Kafka.
 #[tokio::test]
 #[serial]
-async fn incremental_alter_configs_delete_on_a_never_altered_topic_marks_retention_explicit() {
+async fn incremental_alter_configs_delete_on_a_never_altered_topic_changes_nothing() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
@@ -882,8 +931,116 @@ async fn incremental_alter_configs_delete_on_a_never_altered_topic_marks_retenti
     );
     assert_eq!(
         retention(&state, "orders").await,
-        ("-1".to_string(), SOURCE_TOPIC)
+        ("-1".to_string(), SOURCE_DEFAULT)
     );
+}
+
+/// Echoed configurations, the compact policy and list operations, through a real server.
+#[tokio::test]
+#[serial]
+async fn incremental_alter_configs_stores_echoed_configs_and_the_cleanup_policy() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    create_topic(&state, "orders").await;
+
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[
+                ("retention.ms", OP_SET, Some("4000")),
+                ("min.insync.replicas", OP_SET, Some("2")),
+                ("cleanup.policy", OP_APPEND, Some("compact")),
+            ]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    let keys = Some(vec![
+        "cleanup.policy",
+        "min.insync.replicas",
+        "retention.ms",
+    ]);
+    let described = describe(
+        &state,
+        DESCRIBE_V4,
+        vec![describe_resource("orders", keys.clone())],
+        false,
+        false,
+    )
+    .await;
+    let configs = &described.results[0].configs;
+    let policy = entry(configs, "cleanup.policy");
+    assert_eq!(
+        policy.value.as_ref().map(StrBytes::as_str),
+        Some("compact,delete")
+    );
+    assert_eq!(policy.config_source, SOURCE_TOPIC);
+    assert_eq!(
+        entry(configs, "min.insync.replicas")
+            .value
+            .as_ref()
+            .map(StrBytes::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("4000".to_string(), SOURCE_TOPIC)
+    );
+
+    // Without delete, nothing expires; retention.ms is kept and still reported.
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("cleanup.policy", OP_SUBTRACT, Some("delete"))]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    let bridge = state.bridge.as_ref().expect("bridge");
+    let details = bridge
+        .get_kafka_topic("orders")
+        .await
+        .expect("read")
+        .expect("exists");
+    assert_eq!(
+        details.resolved_options().message_expiry,
+        iggy::prelude::IggyExpiry::NeverExpire,
+        "a compact topic never expires until KW-6 compacts it"
+    );
+    assert_eq!(
+        retention(&state, "orders").await,
+        ("4000".to_string(), SOURCE_TOPIC)
+    );
+
+    assert_eq!(
+        incremental_one(
+            &state,
+            INCREMENTAL_V1,
+            "orders",
+            &[("min.insync.replicas", OP_DELETE, None)]
+        )
+        .await,
+        (ERROR_NONE, String::new())
+    );
+    let described = describe(
+        &state,
+        DESCRIBE_V4,
+        vec![describe_resource(
+            "orders",
+            Some(vec!["min.insync.replicas"]),
+        )],
+        false,
+        false,
+    )
+    .await;
+    let replicas = &described.results[0].configs[0];
+    assert_eq!(replicas.value.as_ref().map(StrBytes::as_str), Some("1"));
+    assert_eq!(replicas.config_source, SOURCE_DEFAULT);
 }
 
 /// Request faults are answered without an Iggy call, so a missing topic still gets
@@ -950,20 +1107,20 @@ async fn incremental_alter_configs_answers_request_faults_then_config_faults() {
             "Can't SUBTRACT to key no.such because its type is not LIST.",
         ),
         (
-            &[("cleanup.policy", OP_APPEND, Some("compact"))],
-            "cleanup.policy is read-only",
+            &[("cleanup.policy", OP_SUBTRACT, Some("delete"))],
+            "Invalid value  for configuration cleanup.policy",
         ),
         (
             &[("no.such", OP_SET, Some("1"))],
-            "unknown config key 'no.such'",
+            "Unknown topic config name: no.such",
         ),
         (
-            &[("cleanup.policy", OP_SET, Some("compact"))],
-            "cleanup.policy is read-only",
+            &[("cleanup.policy", OP_SET, Some("Compact"))],
+            "Invalid value Compact for configuration cleanup.policy",
         ),
         (
             &[("retention.ms", OP_SET, Some("abc"))],
-            "retention.ms must be -1 or a positive count",
+            "Invalid value abc for configuration retention.ms: Not a number of type LONG",
         ),
     ];
     for (configs, message) in config_faults {

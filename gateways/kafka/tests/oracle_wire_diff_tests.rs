@@ -45,6 +45,10 @@ use kafka_protocol::messages::delete_records_request::{
 };
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
+use kafka_protocol::messages::incremental_alter_configs_request::{
+    AlterConfigsResource as IncrementalAlterConfigsResource,
+    AlterableConfig as IncrementalAlterableConfig,
+};
 use kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol;
 use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
@@ -57,9 +61,10 @@ use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProdu
 use kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment;
 use kafka_protocol::messages::{
     ApiKey, BrokerId, CreateTopicsRequest, DeleteRecordsRequest, DescribeConfigsRequest,
-    FetchRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest, InitProducerIdRequest,
-    JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
-    OffsetFetchRequest, ProduceRequest, ProducerId, SyncGroupRequest, TopicName, TransactionalId,
+    FetchRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest,
+    IncrementalAlterConfigsRequest, InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest,
+    ListOffsetsRequest, MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
+    ProducerId, SyncGroupRequest, TopicName, TransactionalId,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
@@ -129,10 +134,11 @@ enum Scenario {
     IdempotentProducer,
     IdempotentRestart,
     DescribeConfigs,
+    TopicConfigs,
 }
 
 impl Scenario {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -145,6 +151,7 @@ impl Scenario {
         Self::IdempotentProducer,
         Self::IdempotentRestart,
         Self::DescribeConfigs,
+        Self::TopicConfigs,
     ];
 
     const fn name(self) -> &'static str {
@@ -161,6 +168,7 @@ impl Scenario {
             Self::IdempotentProducer => "idempotent_producer",
             Self::IdempotentRestart => "idempotent_restart",
             Self::DescribeConfigs => "describe_configs",
+            Self::TopicConfigs => "topic_configs",
         }
     }
 
@@ -185,6 +193,7 @@ impl Scenario {
             Self::IdempotentProducer => idempotent_producer(cx, &mut client, &mut facts).await?,
             Self::IdempotentRestart => idempotent_restart(cx, &mut client, &mut facts).await?,
             Self::DescribeConfigs => describe_configs(cx, &mut client, &mut facts).await?,
+            Self::TopicConfigs => topic_configs(cx, &mut client, &mut facts).await?,
         }
         Ok(facts)
     }
@@ -1468,6 +1477,258 @@ async fn describe_configs(
         );
         facts.set(format!("{key}.source"), config.config_source);
         facts.set(format!("{key}.read_only"), config.read_only);
+    }
+    Ok(())
+}
+
+/// The configurations Kafka frameworks create their own topics with (apache/iggy#4508).
+const FRAMEWORK_CONFIGS: [(&str, &[(&str, &str)]); 5] = [
+    // Kafka Connect's config, offset and status topics.
+    ("connect", &[("cleanup.policy", "compact")]),
+    // Kafka Streams changelog and repartition topics.
+    (
+        "streams_changelog",
+        &[
+            ("cleanup.policy", "compact"),
+            ("message.timestamp.type", "CreateTime"),
+        ],
+    ),
+    (
+        "streams_repartition",
+        &[
+            ("cleanup.policy", "delete"),
+            ("message.timestamp.type", "CreateTime"),
+            ("retention.ms", "-1"),
+            ("segment.bytes", "52428800"),
+        ],
+    ),
+    // Debezium's schema history topic.
+    (
+        "debezium_history",
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", "-1"),
+            ("retention.ms", "9223372036854775807"),
+        ],
+    ),
+    // Values Kafka normalises before it stores them.
+    (
+        "normalised",
+        &[
+            ("cleanup.policy", "compact, delete"),
+            ("min.cleanable.dirty.ratio", "1"),
+            ("min.insync.replicas", "+2"),
+            ("unclean.leader.election.enable", "TRUE"),
+        ],
+    ),
+];
+
+/// The broker configurations the gateway answers for its node.
+const BROKER_KEYS: [&str; 11] = [
+    "auto.create.topics.enable",
+    "compression.type",
+    "default.replication.factor",
+    "delete.topic.enable",
+    "log.cleanup.policy",
+    "log.retention.bytes",
+    "log.retention.ms",
+    "log.segment.bytes",
+    "min.insync.replicas",
+    "num.partitions",
+    "unclean.leader.election.enable",
+];
+
+/// Describes `keys` (all of them when `None`) of topic `name`, as facts under `label`.
+async fn describe_topic(
+    client: &mut WireClient,
+    name: &str,
+    keys: Option<&[&str]>,
+    label: &str,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let request = DescribeConfigsRequest::default().with_resources(vec![
+        DescribeConfigsResource::default()
+            .with_resource_type(2)
+            .with_resource_name(s(name))
+            .with_configuration_keys(keys.map(|keys| keys.iter().map(|key| s(key)).collect())),
+    ]);
+    let version = version(client, ApiKey::DescribeConfigs, 4)?;
+    let response = client.send(&request, version).await?;
+    let result = response
+        .results
+        .first()
+        .ok_or_else(|| "DescribeConfigs answered no resource".to_string())?;
+    facts.set(format!("{label}.error"), result.error_code);
+    for config in &result.configs {
+        let key = config.name.as_str();
+        facts.set(
+            format!("{label}.{key}.value"),
+            config.value.as_ref().map_or("null", |value| value.as_str()),
+        );
+        facts.set(format!("{label}.{key}.source"), config.config_source);
+    }
+    Ok(())
+}
+
+/// One `IncrementalAlterConfigs` resource on topic `name`: its error code.
+async fn incremental(
+    client: &mut WireClient,
+    name: &str,
+    configs: &[(&str, i8, Option<&str>)],
+) -> Result<i16, String> {
+    let request = IncrementalAlterConfigsRequest::default().with_resources(vec![
+        IncrementalAlterConfigsResource::default()
+            .with_resource_type(2)
+            .with_resource_name(s(name))
+            .with_configs(
+                configs
+                    .iter()
+                    .map(|(key, operation, value)| {
+                        IncrementalAlterableConfig::default()
+                            .with_name(s(key))
+                            .with_config_operation(*operation)
+                            .with_value(value.map(s))
+                    })
+                    .collect(),
+            ),
+    ]);
+    let version = version(client, ApiKey::IncrementalAlterConfigs, 1)?;
+    let response = client.send(&request, version).await?;
+    response
+        .responses
+        .first()
+        .map(|result| result.error_code)
+        .ok_or_else(|| "IncrementalAlterConfigs answered no resource".to_string())
+}
+
+/// Every Kafka topic configuration through create, describe and both alters.
+async fn topic_configs(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    // Every key, its type and its default, on a topic that sets nothing.
+    let plain = cx.name("topic_configs", "plain");
+    create_topic(client, &plain, &[]).await?;
+    await_topic(client, &plain).await?;
+    let request = DescribeConfigsRequest::default().with_resources(vec![
+        DescribeConfigsResource::default()
+            .with_resource_type(2)
+            .with_resource_name(s(&plain))
+            .with_configuration_keys(None),
+    ]);
+    let version = version(client, ApiKey::DescribeConfigs, 4)?;
+    let response = client.send(&request, version).await?;
+    let result = response
+        .results
+        .first()
+        .ok_or_else(|| "DescribeConfigs answered no resource".to_string())?;
+    let mut names: Vec<&str> = result
+        .configs
+        .iter()
+        .map(|config| config.name.as_str())
+        .collect();
+    names.sort_unstable();
+    facts.set("all.names", names.join(","));
+    for config in &result.configs {
+        let key = config.name.as_str();
+        facts.set(format!("all.{key}.type"), config.config_type);
+        facts.set(format!("all.{key}.read_only"), config.read_only);
+        facts.set(
+            format!("all.{key}.value"),
+            config.value.as_ref().map_or("null", |value| value.as_str()),
+        );
+    }
+
+    // The framework sets: created, then described back.
+    for (label, configs) in FRAMEWORK_CONFIGS {
+        let name = cx.name("topic_configs", &label.replace('_', "-"));
+        facts.set(
+            format!("{label}.create.error"),
+            create_topic(client, &name, configs).await?,
+        );
+        await_topic(client, &name).await?;
+        let keys: Vec<&str> = configs.iter().map(|(key, _)| *key).collect();
+        describe_topic(client, &name, Some(&keys), label, facts).await?;
+    }
+
+    // Refused creates.
+    for (label, config) in [
+        ("create_unknown", ("foo.bar", "1")),
+        ("create_bad_value", ("min.insync.replicas", "0")),
+        ("create_bad_policy", ("cleanup.policy", "Compact")),
+    ] {
+        let name = cx.name("topic_configs", &label.replace('_', "-"));
+        facts.set(
+            format!("{label}.error"),
+            create_topic(client, &name, &[config]).await?,
+        );
+    }
+
+    // Incremental alters on the plain topic.
+    let keys = ["cleanup.policy", "min.insync.replicas", "retention.ms"];
+    facts.set(
+        "set.error",
+        incremental(
+            client,
+            &plain,
+            &[
+                ("min.insync.replicas", 0, Some("2")),
+                ("cleanup.policy", 0, Some("compact")),
+                ("retention.ms", 0, Some("3600000")),
+            ],
+        )
+        .await?,
+    );
+    describe_topic(client, &plain, Some(&keys), "after_set", facts).await?;
+    facts.set(
+        "append.error",
+        incremental(client, &plain, &[("cleanup.policy", 2, Some("delete"))]).await?,
+    );
+    facts.set(
+        "delete.error",
+        incremental(
+            client,
+            &plain,
+            &[("min.insync.replicas", 1, None), ("retention.ms", 1, None)],
+        )
+        .await?,
+    );
+    describe_topic(client, &plain, Some(&keys), "after_delete", facts).await?;
+    for (label, config) in [
+        ("set_unknown", ("foo.bar", 0, Some("1"))),
+        ("set_bad_value", ("segment.ms", 0, Some("0"))),
+        ("append_not_list", ("retention.ms", 2, Some("1"))),
+        ("delete_unknown", ("foo.bar", 1, None)),
+    ] {
+        facts.set(
+            format!("{label}.error"),
+            incremental(client, &plain, &[config]).await?,
+        );
+    }
+
+    // The broker.
+    let request = DescribeConfigsRequest::default().with_resources(vec![
+        DescribeConfigsResource::default()
+            .with_resource_type(4)
+            .with_resource_name(s("1"))
+            .with_configuration_keys(Some(BROKER_KEYS.iter().map(|key| s(key)).collect())),
+    ]);
+    let response = client.send(&request, version).await?;
+    let result = response
+        .results
+        .first()
+        .ok_or_else(|| "DescribeConfigs answered no broker".to_string())?;
+    facts.set("broker.error", result.error_code);
+    for key in BROKER_KEYS {
+        let entry = result
+            .configs
+            .iter()
+            .find(|config| config.name.as_str() == key);
+        facts.set(format!("broker.{key}.present"), entry.is_some());
+        if let Some(entry) = entry {
+            facts.set(format!("broker.{key}.type"), entry.config_type);
+        }
     }
     Ok(())
 }

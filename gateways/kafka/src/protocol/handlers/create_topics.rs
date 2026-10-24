@@ -22,7 +22,9 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::create_topics_request::{CreatableReplicaAssignment, CreatableTopic};
-use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
+use kafka_protocol::messages::create_topics_response::{
+    CreatableTopicConfigs, CreatableTopicResult,
+};
 use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse};
 use kafka_protocol::protocol::StrBytes;
 
@@ -34,14 +36,18 @@ use crate::bridge::{
 };
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
+    API_KEY_CREATE_TOPICS, ApiVersionRange, ERROR_INVALID_PARTITIONS,
     ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
     ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
     ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
+use crate::protocol::handlers::kafka_topic_configs::{
+    TOPIC_CONFIGS, TopicConfigSnapshot, TopicWrite, plan_create, requested_set,
+};
 use crate::protocol::handlers::topic_config::{
-    MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
+    CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC, MAX_CONFIG_TOPICS, fault_response,
+    find_duplicate_names, refused_option, topic_cap_message,
 };
 use crate::protocol::handlers::{
     clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
@@ -241,8 +247,8 @@ async fn create_one_topic(
         .with_error_message(None);
     let kafka_topic = topic.name.as_str();
 
-    let partition_count = match local_shape_error(topic) {
-        Ok(count) => count,
+    let (partition_count, configs) = match local_shape_error(topic) {
+        Ok(planned) => planned,
         Err((error_code, error_message)) => {
             return match bridge.get_kafka_topic(kafka_topic).await {
                 Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
@@ -261,6 +267,7 @@ async fn create_one_topic(
             .with_error_code(ERROR_NONE)
             .with_num_partitions(i32::try_from(partition_count).unwrap_or(i32::MAX))
             .with_replication_factor(1)
+            .with_configs(Some(created_configs(partition_count, &configs)))
     };
 
     if validate_only {
@@ -275,7 +282,7 @@ async fn create_one_topic(
     // a topic created under that name from appearing between its read and its write.
     let _growth = partition_growth.lock().await;
     match bridge
-        .create_kafka_topic(kafka_topic, partition_count)
+        .create_kafka_topic_with(kafka_topic, partition_count, &configs)
         .await
     {
         // The second arm: the write committed on its first attempt, the SDK's own reconnect path
@@ -288,25 +295,58 @@ async fn create_one_topic(
         Ok(TopicCreationOutcome::AlreadyExists) => {
             result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS)
         }
-        Err(err) => bridge_error_result(result, kafka_topic, &err),
+        Err(err) => match refused_option(&err) {
+            Some((code, message)) => result.with_error_code(code).with_error_message(message),
+            None => bridge_error_result(result, kafka_topic, &err),
+        },
     }
 }
 
-/// `configs`-then-shape local validation, bundled so [`create_one_topic`] can probe existence
+/// Every Kafka topic configuration of the topic a create with `configs` makes, as `CreateTopics`
+/// v5+ returns them: what a `DescribeConfigs` right after the create reports.
+fn created_configs(partition_count: u32, configs: &TopicWrite) -> Vec<CreatableTopicConfigs> {
+    let snapshot = TopicConfigSnapshot::after_create(partition_count, configs);
+    TOPIC_CONFIGS
+        .iter()
+        .filter_map(|key| {
+            let (value, explicit) = snapshot.describe(key).ok()?;
+            Some(
+                CreatableTopicConfigs::default()
+                    .with_name(StrBytes::from_static_str(key.name))
+                    .with_value(Some(StrBytes::from(value)))
+                    .with_read_only(false)
+                    .with_config_source(if explicit {
+                        CONFIG_SOURCE_TOPIC
+                    } else {
+                        CONFIG_SOURCE_DEFAULT
+                    })
+                    .with_is_sensitive(false),
+            )
+        })
+        .collect()
+}
+
+/// Shape-then-`configs` local validation, bundled so [`create_one_topic`] can probe existence
 /// once, only on the rejection path. Returns `(error_code, error_message)` rather than a whole
 /// [`CreatableTopicResult`] to keep this `Result`'s `Err` arm small (`clippy::result_large_err`);
 /// the caller already holds the shared `name`/base fields to rebuild the full result from.
-fn local_shape_error(topic: &CreatableTopic) -> core::result::Result<u32, (i16, Option<StrBytes>)> {
-    if !topic.configs.is_empty() {
-        return Err((
-            ERROR_INVALID_CONFIG,
-            Some(StrBytes::from(
-                "CreateTopics does not apply per-topic configs. Set retention.ms with AlterConfigs"
-                    .to_string(),
-            )),
-        ));
-    }
-    validate_create_topic_shape(topic).map_err(|code| (code, None))
+///
+/// Every Kafka topic configuration is accepted. Four are applied through Iggy topic options and
+/// the rest are stored verbatim (`kafka_topic_configs`); an unknown name or a value Kafka would
+/// refuse is `INVALID_CONFIG` (40).
+fn local_shape_error(
+    topic: &CreatableTopic,
+) -> core::result::Result<(u32, TopicWrite), (i16, Option<StrBytes>)> {
+    let partition_count = validate_create_topic_shape(topic).map_err(|code| (code, None))?;
+    let configs = requested_set(topic.configs.iter().map(|config| {
+        (
+            config.name.as_str(),
+            config.value.as_ref().map(StrBytes::as_str),
+        )
+    }))
+    .and_then(|set| plan_create(&set, partition_count))
+    .map_err(|fault| fault_response(&fault))?;
+    Ok((partition_count, configs))
 }
 
 /// Maps a bridge failure to a Kafka result, logging the real cause server-side.
@@ -421,13 +461,12 @@ fn validate_create_topic_shape(topic: &CreatableTopic) -> core::result::Result<u
         return Err(ERROR_INVALID_PARTITIONS);
     }
 
-    // Exactly 1, not merely positive: this gateway advertises exactly one broker (node id 1,
-    // `metadata.rs`'s `BrokerId(1)`), the same ceiling the manual-assignment branch above already
-    // enforces per partition (`assignment_replicas_are_valid`). A real single-broker Kafka
-    // controller rejects `replication_factor > 1` the same way (`ReplicationControlManager`) -
-    // accepting it here and silently reporting back `1` (`success()`, below) would tell the
-    // client its request succeeded as sent when it didn't.
-    if topic.replication_factor != -1 && topic.replication_factor != 1 {
+    // Any positive factor is accepted. Iggy replicates the topic itself, whatever the client
+    // asks for, and this gateway advertises one broker, so the result reports a factor of 1, as
+    // Metadata does. Kafka Connect asks for 3 on its internal topics and MirrorMaker 2 for 2,
+    // and a single-broker Kafka would refuse both; refusing them here would stop both
+    // frameworks against an Iggy cluster that does replicate (#4508, open question 2).
+    if topic.replication_factor != -1 && topic.replication_factor < 1 {
         return Err(ERROR_INVALID_REPLICATION_FACTOR);
     }
 
@@ -636,16 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn replication_factor_above_one_is_rejected_even_though_positive() {
-        // This gateway advertises exactly one broker - the manual-assignment branch already
-        // rejects a multi-replica assignment (`manual_assignment_with_a_duplicated_replica_is_rejected`);
-        // the equivalent numeric-field request must be rejected the same way, not merely
-        // accepted-and-silently-downgraded.
+    fn replication_factor_above_one_is_accepted_as_iggy_replicates_itself() {
+        // Kafka Connect asks for 3 on its internal topics (#4508, open question 2).
         let topic = creatable_topic(1, 3);
-        assert_eq!(
-            validate_create_topic_shape(&topic),
-            Err(ERROR_INVALID_REPLICATION_FACTOR)
-        );
+        assert_eq!(validate_create_topic_shape(&topic), Ok(1));
     }
 
     #[test]

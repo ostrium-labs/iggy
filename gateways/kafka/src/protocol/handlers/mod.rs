@@ -40,6 +40,7 @@ pub mod heartbeat;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
 pub mod join_group;
+pub mod kafka_topic_configs;
 pub mod leave_group;
 pub mod list_groups;
 pub mod list_offsets;
