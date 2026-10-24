@@ -50,7 +50,9 @@ use iggy_gateway_kafka::protocol::api::{
     API_KEY_FETCH, API_KEY_PRODUCE, ConnectionState, GatewayState, handle_connection_request,
     handle_request_bounded,
 };
-use iggy_gateway_kafka::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
+use iggy_gateway_kafka::records::{
+    PRODUCER_MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy,
+};
 
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
@@ -155,7 +157,7 @@ fn unmappable() -> IggyMessage {
     let mut headers = BTreeMap::new();
     headers.insert(
         HeaderKey::try_from(VERSION_HEADER).expect("valid header name"),
-        HeaderValue::try_from(&[MAPPING_VERSION + 1][..]).expect("valid header value"),
+        HeaderValue::try_from(&[PRODUCER_MAPPING_VERSION + 1][..]).expect("valid header value"),
     );
     IggyMessage::builder()
         .payload(Bytes::from_static(b"v"))
