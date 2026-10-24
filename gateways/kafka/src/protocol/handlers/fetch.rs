@@ -1779,7 +1779,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::probe_board::{Good, ProbeBoard};
-    use crate::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
+    use crate::records::{PRODUCER_MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
     const CREATE_TIME: i64 = 1_700_000_000_123;
     /// Every partition code Fetch sends. The Java consumer throws on 29 on purpose, and on 1
@@ -1822,7 +1822,7 @@ mod tests {
         let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from(VERSION_HEADER).unwrap(),
-            HeaderValue::try_from(&[MAPPING_VERSION + 1][..]).unwrap(),
+            HeaderValue::try_from(&[PRODUCER_MAPPING_VERSION + 1][..]).unwrap(),
         );
         let mut message = IggyMessage::builder()
             .payload(Bytes::from_static(b"v"))
