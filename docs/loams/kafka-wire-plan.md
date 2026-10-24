@@ -208,12 +208,12 @@ breadth. Status is `Planned` unless noted.
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned; design note drafted (`docs/loams/compaction-design.md`, PR #13), nothing built | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
-| KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
+| KW-8 | Newer protocol versions and topic ids | #4527 | **Built, in review** (see As built) | KW-1 | Yes |
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (fork PR #12; auth oracle and real-client e2e green in local CI; see "As built") | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned (design notes below; not started) | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
 | KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Started** (branch `kw12-limits`, not built or tested) | KW-0 | Yes |
-| KW-13 | KIP-848 consumer groups | #4523 | Planned | KW-8 | Yes |
+| KW-13 | KIP-848 consumer groups | #4523 | **Started, not wired** (branch `kw13-kip848-draft`) | KW-8 | Yes |
 | KW-14 | DescribeLogDirs, read-only `__consumer_offsets` | #4524 | Planned | KW-7 | Yes |
 | KW-15 | Remaining admin APIs | #4526 | Planned | KW-3, KW-8 | Yes |
 | KW-16 | Old and pinned clients | #4528 | Planned | KW-2 | Yes |
@@ -660,6 +660,23 @@ the new versions in the smoke matrix; `@platformatic/kafka` consumes two topics
 
 **Exit.** #4527's acceptance criteria pass.
 
+**As built (2026-10-24).** Topic ids are derived, not stored: `src/topic_id.rs` hashes (keyed
+BLAKE3) the Iggy stream name, the topic's numeric id and its creation time into an RFC 9562 v8
+UUID. Every input is replicated Iggy state, so gateways agree with no write (KW-5 gets this for
+free), a restart changes nothing and a recreated topic gets a new id. This replaces the plan's
+"topic option written once", which needed a catalog key in `core/common` and a race between
+gateways. A registry in `GatewayState` maps ids back to names; a miss lists the topics once.
+Served now: Metadata 0-13 (ids from v10, lookups by id from v12), Fetch 4-18 (by id from v13),
+Produce 3-13 (by id at v13), ListOffsets 1-10 (-4 EARLIEST_LOCAL as EARLIEST, -5 LATEST_TIERED
+answers -1), CreateTopics 2-7 (id in the answer), DeleteTopics 1-6 (by name or id), ApiVersions
+0-4. Tests: unit tests for the derivation and registry, real-bridge tests per API at the new
+versions, the version-firewall matrix moved to the new maxima, and a `topic_ids` oracle scenario
+against Apache Kafka 4.3.1. Status at hand-off: lint (`clippy -D warnings`) green locally; the full
+suite and the oracle diff run in fork CI on the PR (the shared machine's build queue did not let
+the local run finish). Left: OffsetCommit and OffsetFetch v10 and ListOffsets v11 wait for a
+`kafka-protocol` release that has their schemas (0.18 stops at 9, 9 and 10); `@platformatic/kafka`
+and Sarama nightly checks belong to KW-2's matrix; FindCoordinator v5-6 not advertised.
+
 ### KW-9. SASL OAUTHBEARER, then SCRAM
 
 **Why.** Loams' identity is Zitadel (Loams design 76): Loams credentials
@@ -869,6 +886,17 @@ a time keeping offsets; assignments and rebalance outcomes compared with Apache
 Kafka 4.x.
 
 **Exit.** #4523's acceptance criteria pass.
+
+**Status (2026-10-24): started, not wired, not built.** Branch `kw13-kip848-draft` holds a first
+cut that was never compiled: `src/group/consumer_protocol.rs` (the state machine: group and member
+epochs, revoke-before-assign reconciliation, partition ownership, uniform and range assignors,
+static members, regex subscriptions, session and revocation expiry, `STALE_MEMBER_EPOCH` commit
+check, with unit tests), `src/group/consumer_coordinator.rs` (consumer groups beside classic ones,
+`group.consumer.migration.policy=disabled` semantics), and handlers for 68 and 69. Still to do:
+wire them in (API keys, `SUPPORTED_RANGES`, dispatch, shape guards, `ListGroups` type,
+`DeleteGroups`/`OffsetDelete`/`OffsetCommit` hooks), build and fix, a Java 4
+`group.protocol=consumer` e2e (two members, leave and resume; classic-to-consumer offsets carried
+over), a KIP-848 oracle scenario, then online migration as part 2.
 
 ### KW-14. DescribeLogDirs and a read-only `__consumer_offsets`
 
