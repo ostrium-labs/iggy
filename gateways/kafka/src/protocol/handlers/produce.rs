@@ -48,7 +48,7 @@ use crate::protocol::handlers::{
 use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
     Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
-    is_compressed, producer_id, record_slots, to_iggy,
+    is_compressed, producer_id, record_slots, to_iggy_with,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -505,18 +505,19 @@ fn plan_partition(
     };
 
     // The clone is a refcount, and `decode_batch` drains what it is given.
-    let records = decode_batch(&mut blob.clone(), budget, zstd).map_err(refuse)?;
+    let batch = decode_batch(&mut blob.clone(), budget, zstd).map_err(refuse)?;
+    let records = &batch.records;
     // An empty blob decodes to no batch rather than to an error, so this rules on it.
     if records.is_empty() {
         return Err(ERROR_INVALID_RECORD.into());
     }
 
     // One window for the whole batch, so it fits one send.
-    let window = TimestampWindow::of(&records);
+    let window = TimestampWindow::of(records);
     let mut messages = Vec::with_capacity(records.len());
     let mut size = 0u64;
-    for record in &records {
-        let message = to_iggy(record, window).map_err(refuse)?;
+    for (index, record) in records.iter().enumerate() {
+        let message = to_iggy_with(record, batch.headers(index), window).map_err(refuse)?;
         size = size.saturating_add(message.get_size_bytes().as_bytes_u64());
         messages.push(message);
     }
@@ -696,12 +697,12 @@ const fn record_error_code(error: &RecordCodecError) -> i16 {
         | RecordCodecError::HeaderCountTooLarge { .. }
         | RecordCodecError::RecordTruncated
         | RecordCodecError::RecordFieldLength(_)
-        | RecordCodecError::RepeatedHeaderName(_)
         // Raised by `from_iggy` only, so Fetch is what actually answers for these.
         | RecordCodecError::UserHeadersUnreadable(_)
         | RecordCodecError::MappingVersion(_)
         | RecordCodecError::ValueMarker(_)
         | RecordCodecError::HeaderNameCollision(_)
+        | RecordCodecError::HeaderOrder(_)
         | RecordCodecError::TimestampHeader(_)
         | RecordCodecError::EnvelopeTruncated { .. }
         | RecordCodecError::EnvelopeTrailingBytes(_)
@@ -1446,13 +1447,13 @@ mod tests {
 
     #[test]
     fn given_a_codec_refusal_when_answered_should_carry_its_reason() {
-        let refusal = Refusal::from(RecordCodecError::RepeatedHeaderName("a".to_string()));
+        let refusal = Refusal::from(RecordCodecError::RecordTruncated);
         let response = partition_outcome(0, Err(refusal));
 
         assert_eq!(response.error_code, ERROR_INVALID_RECORD);
         assert_eq!(
             response.error_message.as_deref(),
-            Some("record repeats header name a"),
+            Some("record batch ends inside a record"),
             "Java shows this text instead of a generic one"
         );
         assert_eq!(

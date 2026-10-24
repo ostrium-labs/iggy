@@ -200,7 +200,7 @@ breadth. Status is `Planned` unless noted.
 | KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | Planned | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned | KW-9 | Yes (design first) |
-| KW-11 | Repeated header names and header order | #4517 | Planned | KW-1 | Yes |
+| KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
 | KW-12 | Configurable limits; member client id and host | #4530, #4511 | Planned | KW-0 | Yes |
 | KW-13 | KIP-848 consumer groups | #4523 | Planned | KW-8 | Yes |
 | KW-14 | DescribeLogDirs, read-only `__consumer_offsets` | #4524 | Planned | KW-7 | Yes |
@@ -614,6 +614,19 @@ byte-identical in key, value and headers after Produce and Fetch, compared
 with Apache Kafka.
 
 **Exit.** #4517's acceptance criteria pass.
+
+**As built (2026-10-24).** Produce reads a record's full header list from the
+raw bytes when a name repeats (`records::scan_records`) and stores it in the
+envelope; Fetch writes the list back into the encoded batch
+(`records/headers.rs`, `splice`), so the record is byte-identical to what
+Kafka serves. Natively stored headers out of name order carry `kafka.ho` (one
+rank byte per header); more than 255 unsorted headers take the envelope. The
+mapping version stays 1: an older gateway ignores `kafka.ho` and serves the
+headers sorted. A foreign Iggy message with two key kinds naming one header
+now serves both. The oracle scenario `record_headers` compares the record
+bytes (from the attributes on) with Apache Kafka for a repeated name with a
+null, an unsorted set and a sorted set; the `produce_fetch` header-order
+difference is gone from `allowed_differences.toml`.
 
 ### KW-12. Configurable limits; member client id and host
 

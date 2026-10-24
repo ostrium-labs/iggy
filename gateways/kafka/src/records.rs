@@ -35,6 +35,11 @@ use kafka_protocol::records::{
 };
 use thiserror::Error;
 
+mod headers;
+
+pub use headers::{Header, HeaderList, RepeatedHeaders, headers_at};
+use headers::{Order, fold, order_of, read_list, reorder, repeats_a_name, splice};
+
 /// Iggy header whose one-byte value is the storage mapping version.
 ///
 /// Written on every message this gateway produces and on no other, which is what lets the read
@@ -52,6 +57,8 @@ pub const VALUE_MARKER_HEADER: &str = "kafka.value";
 pub const TIMESTAMP_HEADER: &str = "kafka.ts";
 /// Prefix every Kafka record header name is stored under.
 pub const HEADER_PREFIX: &str = "kafka.h.";
+/// Iggy header holding the producer's header order, when it is not the sorted one Iggy keeps.
+pub const ORDER_HEADER: &str = "kafka.ho";
 /// Iggy header whose one-byte value is the envelope byte layout version.
 pub const ENVELOPE_HEADER: &str = "kafka.envelope";
 /// Envelope byte layout version this build writes and reads.
@@ -162,8 +169,8 @@ pub enum RecordCodecError {
     RequestBudgetSpent,
     #[error("zstd batch in a request older than Produce v7")]
     ZstdTooEarly,
-    #[error("record repeats header name {0}")]
-    RepeatedHeaderName(String),
+    #[error("header order {0:?} does not fit the stored headers")]
+    HeaderOrder(Bytes),
 }
 
 type Result<T> = std::result::Result<T, RecordCodecError>;
@@ -178,12 +185,36 @@ type Result<T> = std::result::Result<T, RecordCodecError>;
 /// Returns an error when the timestamp does not fit, when the envelope would exceed
 /// `MAX_PAYLOAD_SIZE`, or when Iggy rejects the message for a reason the envelope does not fix.
 pub fn to_iggy(record: &Record, window: TimestampWindow) -> Result<IggyMessage> {
+    to_iggy_with(record, None, window)
+}
+
+/// [`to_iggy`] for a record whose headers `Record::headers` may not hold in full.
+///
+/// `headers` is the record's full list when it repeats a name ([`DecodedBatch::headers`]), and
+/// then replaces `Record::headers`. Such a record takes the envelope, which stores a list.
+///
+/// # Errors
+///
+/// As [`to_iggy`].
+pub fn to_iggy_with(
+    record: &Record,
+    headers: Option<&[Header]>,
+    window: TimestampWindow,
+) -> Result<IggyMessage> {
     let stamp = window.stamp(record.timestamp)?;
+    if let Some(list) = headers {
+        return envelope_message(
+            record,
+            list.iter().map(|(name, value)| (name, value)),
+            stamp,
+        );
+    }
     if let Some(value) = plain_value(record, stamp) {
         return plain_message(value.clone(), stamp.origin);
     }
-    if needs_envelope(record) {
-        return envelope_message(record, stamp);
+    let order = order_of(record.headers.keys());
+    if matches!(order, Order::TooMany) || needs_envelope(record) {
+        return envelope_message(record, record.headers.iter(), stamp);
     }
     let (payload, marker) = split_value(record.value.as_ref());
     let mut headers = gateway_headers(stamp.header);
@@ -203,10 +234,16 @@ pub fn to_iggy(record: &Record, window: TimestampWindow) -> Result<IggyMessage> 
             header_value(value),
         );
     }
+    if let Order::Ranks(ranks) = order {
+        headers.insert(header_key(ORDER_HEADER), header_value(&ranks));
+    }
 
     // The only limit left is the 100 KB budget over all headers together, which no per-field
     // check can see. Let the constructor rule on it rather than duplicating its arithmetic.
-    build(payload, headers, stamp.origin)?.map_or_else(|| envelope_message(record, stamp), Ok)
+    build(payload, headers, stamp.origin)?.map_or_else(
+        || envelope_message(record, record.headers.iter(), stamp),
+        Ok,
+    )
 }
 
 /// The `origin_timestamp` range one Iggy send holds: `u32::MAX` µs, about 71.6 min.
@@ -268,29 +305,32 @@ struct Stamp {
 /// Returns an error when the stored user headers do not parse, when `kafka.v` names a mapping
 /// version this build does not implement, or when a marker or an envelope is malformed.
 pub fn from_iggy(message: &IggyMessage, offset: i64) -> Result<Record> {
+    from_iggy_with(message, offset).map(|(record, _)| record)
+}
+
+/// [`from_iggy`], plus the record's full header list when `Record::headers` cannot hold it
+/// because two headers share a name. [`encode_batch_with`] writes that list.
+///
+/// # Errors
+///
+/// As [`from_iggy`].
+pub fn from_iggy_with(message: &IggyMessage, offset: i64) -> Result<(Record, Option<HeaderList>)> {
     // The common record: a value alone, which `plain_message` wrote. Skips the header map.
     if message.user_headers.as_deref() == Some(version_only()) {
         let value = Some(message.payload.clone());
-        return Ok(record(
-            None,
-            value,
-            IndexMap::new(),
-            offset,
-            timestamp_out(message),
-        ));
+        let record = record(None, value, IndexMap::new(), offset, timestamp_out(message));
+        return Ok((record, None));
     }
     let stored = user_headers(message)?;
     let timestamp = stored_timestamp(message, &stored)?;
-    if !stored.contains_key(&VERSION_KEY) {
-        let (key, value, headers) = foreign_fields(message, &stored);
-        return Ok(record(key, value, headers, offset, timestamp));
-    }
-
-    let (key, value, headers) = match stored.get(&ENVELOPE_KEY) {
-        Some(envelope) => decode_envelope(envelope.as_bytes(), &message.payload)?,
-        None => gateway_fields(message, &stored)?,
+    let (key, value, headers, list) = if !stored.contains_key(&VERSION_KEY) {
+        foreign_fields(message, &stored)
+    } else if let Some(envelope) = stored.get(&ENVELOPE_KEY) {
+        decode_envelope(envelope.as_bytes(), &message.payload)?
+    } else {
+        gateway_fields(message, &stored)?
     };
-    Ok(record(key, value, headers, offset, timestamp))
+    Ok((record(key, value, headers, offset, timestamp), list))
 }
 
 /// The timestamp [`from_iggy`] reports for `message`, read from its headers alone.
@@ -372,7 +412,8 @@ fn server_timestamp(message: &IggyMessage) -> i64 {
 
 /// Whether any field of `record` is one Iggy refuses to hold natively.
 ///
-/// A repeated header name never reaches here: `scan_records` refuses it.
+/// A record that repeats a header name never reaches here: its full list goes straight to the
+/// envelope.
 fn needs_envelope(record: &Record) -> bool {
     let key_unholdable = record
         .key
@@ -449,34 +490,42 @@ fn build(
     Ok(Some(message))
 }
 
-fn envelope_message(record: &Record, stamp: Stamp) -> Result<IggyMessage> {
+/// Headers as the envelope reads them, whichever of a `Record`'s map or a full list holds them.
+trait HeaderIter<'a>: Iterator<Item = (&'a StrBytes, &'a Option<Bytes>)> + Clone {}
+
+impl<'a, I: Iterator<Item = (&'a StrBytes, &'a Option<Bytes>)> + Clone> HeaderIter<'a> for I {}
+
+fn envelope_message<'a>(
+    record: &Record,
+    headers: impl HeaderIter<'a>,
+    stamp: Stamp,
+) -> Result<IggyMessage> {
     // The envelope moves the key and the headers into the payload, so a record whose value alone
     // clears `MAX_PAYLOAD_SIZE` can be one the fallback cannot hold. Say so before spending the
     // allocation, since the native path has already been ruled out and nothing else is left.
-    let size = envelope_size(record);
+    let size = envelope_size(record, headers.clone());
     if size > MAX_PAYLOAD_SIZE as usize {
         return Err(RecordCodecError::EnvelopeTooLarge { size });
     }
 
+    let payload = encode_envelope(record, headers, size);
     let mut headers = gateway_headers(stamp.header);
     headers.insert(
         header_key(ENVELOPE_HEADER),
         header_value(&[ENVELOPE_VERSION]),
     );
-    build(encode_envelope(record, size), headers, stamp.origin)?
+    build(payload, headers, stamp.origin)?
         .ok_or(IggyError::TooBigUserHeaders)
         .map_err(Into::into)
 }
 
-/// Exactly what `encode_envelope` writes for `record`.
-fn envelope_size(record: &Record) -> usize {
+/// Exactly what `encode_envelope` writes for `record` with `headers`.
+fn envelope_size<'a>(record: &Record, headers: impl HeaderIter<'a>) -> usize {
     let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
     ENVELOPE_OVERHEAD
         + field(record.key.as_ref())
         + field(record.value.as_ref())
-        + record
-            .headers
-            .iter()
+        + headers
             .map(|(name, value)| {
                 ENVELOPE_HEADER_OVERHEAD + name.as_str().len() + field(value.as_ref())
             })
@@ -484,7 +533,7 @@ fn envelope_size(record: &Record) -> usize {
 }
 
 /// 13 bytes of fixed overhead plus 9 per header, little-endian throughout.
-fn encode_envelope(record: &Record, size: usize) -> Bytes {
+fn encode_envelope<'a>(record: &Record, headers: impl HeaderIter<'a>, size: usize) -> Bytes {
     let mut flags = 0u8;
     if record.key.is_some() {
         flags |= FLAG_KEY;
@@ -497,8 +546,8 @@ fn encode_envelope(record: &Record, size: usize) -> Bytes {
     buf.put_u8(flags);
     put_field(&mut buf, record.key.as_ref());
     put_field(&mut buf, record.value.as_ref());
-    buf.put_u32_le(u32::try_from(record.headers.len()).unwrap_or(u32::MAX));
-    for (name, value) in &record.headers {
+    buf.put_u32_le(u32::try_from(headers.clone().count()).unwrap_or(u32::MAX));
+    for (name, value) in headers {
         let name = name.as_str().as_bytes();
         buf.put_u32_le(u32::try_from(name.len()).unwrap_or(u32::MAX));
         buf.put_slice(name);
@@ -508,10 +557,12 @@ fn encode_envelope(record: &Record, size: usize) -> Bytes {
     buf.freeze()
 }
 
+/// Key, value, the headers a `Record` holds, and the full list when that map cannot hold it.
 type RecordFields = (
     Option<Bytes>,
     Option<Bytes>,
     IndexMap<StrBytes, Option<Bytes>>,
+    Option<HeaderList>,
 );
 
 fn decode_envelope(version: &[u8], payload: &Bytes) -> Result<RecordFields> {
@@ -539,14 +590,13 @@ fn decode_envelope(version: &[u8], payload: &Bytes) -> Result<RecordFields> {
         });
     }
 
-    let mut headers = IndexMap::with_capacity(count);
+    let mut list = Vec::with_capacity(count);
     for _ in 0..count {
         let name = take_field(&mut buf)?;
-        let name =
-            String::from_utf8(name.to_vec()).map_err(|_| RecordCodecError::EnvelopeHeaderName)?;
+        let name = StrBytes::try_from(name).map_err(|_| RecordCodecError::EnvelopeHeaderName)?;
         let present = take(&mut buf, 1)?[0] != 0;
         let value = take_field(&mut buf)?;
-        headers.insert(StrBytes::from_string(name), present.then_some(value));
+        list.push((name, present.then_some(value)));
     }
 
     // Every byte of an envelope is accounted for above, so a leftover means this payload is not
@@ -555,10 +605,12 @@ fn decode_envelope(version: &[u8], payload: &Bytes) -> Result<RecordFields> {
         return Err(RecordCodecError::EnvelopeTrailingBytes(buf.remaining()));
     }
 
+    let (headers, list) = fold(list);
     Ok((
         (flags & FLAG_KEY != 0).then_some(key),
         (flags & FLAG_VALUE != 0).then_some(value),
         headers,
+        list,
     ))
 }
 
@@ -597,7 +649,12 @@ fn gateway_fields(
             return Err(RecordCodecError::HeaderNameCollision(name.to_string()));
         }
     }
-    Ok((key, value, headers))
+    // Iggy hands the headers back sorted by name. `kafka.ho` is there when the producer's order
+    // was another one.
+    if let Some(order) = stored.get(&ORDER_KEY) {
+        headers = reorder(&headers, &order.value())?;
+    }
+    Ok((key, value, headers, None))
 }
 
 /// The reading of a message an Iggy client wrote, which no marker on it can change.
@@ -607,25 +664,24 @@ fn gateway_fields(
 /// `kafka.`-prefixed header hide every other header on the message.
 ///
 /// Two keys holding the same bytes under different kinds are two stored headers and one Kafka
-/// header, and the later one in key order wins. Kafka carries headers as a list and would hold
-/// both, but a `Record` keys them in an `IndexMap`, so there is no shape here that keeps the
-/// pair. Refusing the message instead would let one Iggy writer stall a partition for every
-/// Kafka consumer of it, which is the worse of the two. `BRIDGE_MAPPING.md` records the loss.
+/// name. Kafka carries headers as a list, so both reach the consumer, in key order, through the
+/// full list `Record::headers` cannot hold.
 fn foreign_fields(
     message: &IggyMessage,
     stored: &BTreeMap<HeaderKey, HeaderValue>,
 ) -> RecordFields {
-    let mut headers = IndexMap::new();
-    for (name, stored_value) in stored {
-        let Some(name) = header_name(name) else {
-            continue;
-        };
-        headers.insert(
-            StrBytes::from_string(name.to_string()),
-            Some(stored_value.value()),
-        );
-    }
-    (None, Some(message.payload.clone()), headers)
+    let list = stored
+        .iter()
+        .filter_map(|(name, stored_value)| {
+            let name = header_name(name)?;
+            Some((
+                StrBytes::from_string(name.to_string()),
+                Some(stored_value.value()),
+            ))
+        })
+        .collect();
+    let (headers, list) = fold(list);
+    (None, Some(message.payload.clone()), headers, list)
 }
 
 /// A Kafka header name for an Iggy header key, or `None` when the key is not text.
@@ -706,6 +762,7 @@ static ENVELOPE_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(ENVELOPE_
 static TIMESTAMP_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(TIMESTAMP_HEADER));
 static KEY_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(KEY_HEADER));
 static VALUE_MARKER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(VALUE_MARKER_HEADER));
+static ORDER_KEY: LazyLock<HeaderKey> = LazyLock::new(|| header_key(ORDER_HEADER));
 
 /// Both are infallible for the names and values this module builds: every one is non-empty and
 /// within `MAX_FIELD`, which `needs_envelope` guarantees for caller-supplied bytes.
@@ -924,7 +981,27 @@ pub fn record_slots(blob: &[u8], most: usize) -> usize {
     slots.min(most)
 }
 
+/// One decoded Produce batch.
+#[derive(Debug, Default)]
+pub struct DecodedBatch {
+    /// The records, in batch order.
+    pub records: Vec<Record>,
+    /// The full header list of each record that repeats a name, which `Record::headers` folds.
+    pub repeated: RepeatedHeaders,
+}
+
+impl DecodedBatch {
+    /// The full header list of record `index`, when its `Record::headers` does not hold it all.
+    #[must_use]
+    pub fn headers(&self, index: usize) -> Option<&[Header]> {
+        headers_at(&self.repeated, index)
+    }
+}
+
 /// Decodes the one record batch a Produce partition carries.
+///
+/// A record may repeat a header name, as Kafka allows. `kafka_protocol` keeps the last value of
+/// each name only, so the record's full list comes back in [`DecodedBatch::repeated`].
 ///
 /// # Errors
 ///
@@ -936,20 +1013,22 @@ pub fn decode_batch(
     buf: &mut Bytes,
     budget: &DecompressionBudget,
     zstd: Zstd,
-) -> Result<Vec<Record>> {
+) -> Result<DecodedBatch> {
     budget.start_entry()?;
     preflight(buf, budget, zstd)?;
     if !buf.has_remaining() {
-        return Ok(Vec::new());
+        return Ok(DecodedBatch::default());
     }
 
     let walked = Cell::new(0);
+    let repeated = Cell::new(Vec::new());
     let set = RecordBatchDecoder::decode_with_custom_compression(
         buf,
         Some(
             |compressed: &mut Bytes, compression| -> anyhow::Result<Bytes> {
-                let (records, count) = decompress(compressed, compression, budget)?;
-                walked.set(count);
+                let (records, scan) = decompress(compressed, compression, budget)?;
+                walked.set(scan.records);
+                repeated.set(scan.repeated);
                 Ok(records)
             },
         ),
@@ -962,7 +1041,10 @@ pub fn decode_batch(
             walked: walked.get(),
         });
     }
-    Ok(set.records)
+    Ok(DecodedBatch {
+        records: set.records,
+        repeated: repeated.take(),
+    })
 }
 
 /// Checks the batch header before anything decodes a record.
@@ -1029,6 +1111,16 @@ fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()
 ///
 /// Returns an error when `kafka_protocol` cannot encode the batch.
 pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
+    encode_batch_with(records, &RepeatedHeaders::new())
+}
+
+/// [`encode_batch`], writing the full header list in `repeated` for each record it names in place
+/// of that record's `Record::headers`.
+///
+/// # Errors
+///
+/// As [`encode_batch`].
+pub fn encode_batch_with(records: &mut [Record], repeated: &RepeatedHeaders) -> Result<Bytes> {
     let Some(base) = records.first().map(|record| record.offset) else {
         return Ok(Bytes::new());
     };
@@ -1046,7 +1138,11 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
     };
     RecordBatchEncoder::encode(&mut buf, records.iter(), &options)
         .map_err(|error| RecordCodecError::Batch(error.to_string()))?;
-    Ok(buf.freeze())
+    let batch = buf.freeze();
+    if repeated.is_empty() {
+        return Ok(batch);
+    }
+    splice(&batch, repeated)
 }
 
 /// An upper bound on the bytes `record` adds to a batch [`encode_batch`] writes.
@@ -1054,13 +1150,21 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
 /// Fetch sums these against its byte budget before it encodes.
 #[must_use]
 pub(crate) fn record_size_bound(record: &Record) -> usize {
+    record_size_bound_with(record, None)
+}
+
+/// [`record_size_bound`] for a record written with `headers`, its full list, when there is one.
+#[must_use]
+pub(crate) fn record_size_bound_with(record: &Record, headers: Option<&[Header]>) -> usize {
     let field = |field: Option<&Bytes>| field.map_or(0, Bytes::len);
+    let headers: &mut dyn Iterator<Item = (&StrBytes, &Option<Bytes>)> = match headers {
+        Some(list) => &mut list.iter().map(|(name, value)| (name, value)),
+        None => &mut record.headers.iter(),
+    };
     RECORD_FRAMING_BYTES
         + field(record.key.as_ref())
         + field(record.value.as_ref())
-        + record
-            .headers
-            .iter()
+        + headers
             .map(|(name, value)| HEADER_FRAMING_BYTES + name.as_str().len() + field(value.as_ref()))
             .sum::<usize>()
 }
@@ -1082,12 +1186,12 @@ fn batch_size(records: &[Record]) -> usize {
 /// The decoder calls this for every batch, uncompressed ones included, which is what makes it the
 /// one place that sees the record bytes before anything reserves from what they declare.
 ///
-/// Returns the records and how many there are.
+/// Returns the records and what the scan found in them.
 fn decompress(
     compressed: &mut Bytes,
     compression: Compression,
     budget: &DecompressionBudget,
-) -> anyhow::Result<(Bytes, usize)> {
+) -> anyhow::Result<(Bytes, Scan)> {
     let body = compressed.copy_to_bytes(compressed.remaining());
     let mut writer = BudgetedWriter::new(budget);
     let records = match compression {
@@ -1118,7 +1222,7 @@ fn decompress(
     };
 
     match scan_records(&records, budget) {
-        Ok(count) => Ok((records, count)),
+        Ok(scan) => Ok((records, scan)),
         Err(reason) => Err(budget.refuse(reason).into()),
     }
 }
@@ -1126,27 +1230,39 @@ fn decompress(
 /// Headers that cost one record slot. A decoded header takes about a third of a slot's memory.
 const HEADERS_PER_SLOT: usize = 3;
 
+/// What [`scan_records`] found in one batch's records.
+struct Scan {
+    /// How many there are, which `decode_batch` checks against the batch header.
+    records: usize,
+    /// The full header list of each record that repeats a name.
+    repeated: RepeatedHeaders,
+}
+
 /// Walks the records of one batch before the decoder reserves for them.
 ///
 /// - Refuses a header count the record cannot hold. The decoder reserves an `IndexMap` from it
 ///   (`kafka-protocol-0.18.0/src/records.rs:896`), and that memory is resident.
 /// - Charges headers to the record budget, [`HEADERS_PER_SLOT`] per slot.
-/// - Returns the record count, which `decode_batch` checks against the batch header.
-fn scan_records(records: &Bytes, budget: &DecompressionBudget) -> Result<usize> {
+/// - Reads the full header list of a record that repeats a name, which the decoder folds.
+fn scan_records(records: &Bytes, budget: &DecompressionBudget) -> Result<Scan> {
     let mut blob = records.as_ref();
     let mut walked = 0;
     let mut slots = 0;
     let mut names = Vec::new();
+    let mut repeated = RepeatedHeaders::new();
     while !blob.is_empty() {
-        let (headers, mut record) = take_record(&mut blob)?;
-        if headers > 1 {
-            check_header_names(&mut record, headers, &mut names)?;
+        let (headers, record) = take_record(&mut blob)?;
+        if headers > 1 && repeats_a_name(record, headers, &mut names)? {
+            repeated.push((walked, read_list(records, record, headers)?));
         }
         slots += headers / HEADERS_PER_SLOT;
         walked += 1;
     }
     budget.charge_records(slots)?;
-    Ok(walked)
+    Ok(Scan {
+        records: walked,
+        repeated,
+    })
 }
 
 /// Steps over one record of `blob`. Returns its header count and its header bytes, and refuses a
@@ -1171,29 +1287,6 @@ fn take_record<'a>(blob: &mut &'a [u8]) -> Result<(usize, &'a [u8])> {
         .filter(|headers| headers.saturating_mul(MIN_HEADER_BYTES) <= limit)
         .ok_or(RecordCodecError::HeaderCountTooLarge { count, limit })?;
     Ok((headers, record))
-}
-
-/// Refuses a record that repeats a header name. `kafka_protocol` keeps only the last value.
-///
-/// `names` is scratch space, reused across records.
-fn check_header_names<'a>(
-    record: &mut &'a [u8],
-    count: usize,
-    names: &mut Vec<&'a [u8]>,
-) -> Result<()> {
-    names.clear();
-    for _ in 0..count {
-        let len = take_varint(record)?;
-        let len = usize::try_from(len).map_err(|_| RecordCodecError::RecordFieldLength(len))?;
-        names.push(take_bytes(record, len)?);
-        skip_field(record)?; // value
-    }
-    names.sort_unstable();
-    if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
-        let name = String::from_utf8_lossy(pair[0]).into_owned();
-        return Err(RecordCodecError::RepeatedHeaderName(name));
-    }
-    Ok(())
 }
 
 /// Reads a zigzag varint, five bytes at most, the way `kafka_protocol` reads one.
@@ -1870,7 +1963,9 @@ mod tests {
         let mut records = vec![record_at_offset(0, b"1"), record_at_offset(1, b"2")];
         let mut encoded = encode_batch(&mut records).unwrap();
         let budget = partition_budget(1024, usize::MAX);
-        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed)
+            .unwrap()
+            .records;
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[1].value.as_deref(), Some(&b"2"[..]));
     }
@@ -1979,7 +2074,9 @@ mod tests {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Gzip);
         let budget = partition_budget(1024, usize::MAX);
-        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed)
+            .unwrap()
+            .records;
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -1988,7 +2085,9 @@ mod tests {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Snappy);
         let budget = partition_budget(1024, usize::MAX);
-        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed)
+            .unwrap()
+            .records;
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -1997,7 +2096,9 @@ mod tests {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Lz4);
         let budget = partition_budget(1024, usize::MAX);
-        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed)
+            .unwrap()
+            .records;
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -2006,7 +2107,9 @@ mod tests {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Zstd);
         let budget = partition_budget(1024, usize::MAX);
-        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed)
+            .unwrap()
+            .records;
         assert_eq!(decoded[0].value.as_deref(), Some(&b"compressed"[..]));
     }
 
@@ -2281,23 +2384,218 @@ mod tests {
         batch.freeze()
     }
 
-    #[test]
-    fn given_a_repeated_header_name_when_decoded_should_reject() {
+    /// A one-record batch whose headers are `a=x, b=y`, with `b` renamed `a` on the wire.
+    fn batch_repeating_a_name() -> Bytes {
         let headers = [("a", Some(&b"x"[..])), ("b", Some(&b"y"[..]))];
-        let mut records = [record_with(None, Some(b"v"), &headers)];
+        let mut records = [record_with(Some(b"k"), Some(b"v"), &headers)];
         let batch = encode_batch(&mut records).unwrap();
-        // Rename header "b" to "a". Same length, so only the CRC needs repair.
+        // Same length, so only the CRC needs repair.
         let at = batch
             .windows(4)
             .position(|window| window == [0x02, b'b', 0x02, b'y'])
             .unwrap();
-        let mut batch = patch_header(&batch, at + 1, b"a");
+        patch_header(&batch, at + 1, b"a")
+    }
+
+    fn list(headers: &[(&str, Option<&[u8]>)]) -> HeaderList {
+        headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    StrBytes::from_string((*name).to_string()),
+                    value.map(Bytes::copy_from_slice),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn given_a_repeated_header_name_when_decoded_should_keep_every_header() {
+        let mut batch = batch_repeating_a_name();
         let budget = partition_budget(1024, usize::MAX);
 
-        assert!(matches!(
-            decode_batch(&mut batch, &budget, Zstd::Allowed),
-            Err(RecordCodecError::RepeatedHeaderName(name)) if name == "a"
-        ));
+        let decoded = decode_batch(&mut batch, &budget, Zstd::Allowed).unwrap();
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(
+            decoded.records[0].headers.len(),
+            1,
+            "kafka_protocol folds the pair, which is why the list travels beside the record"
+        );
+        assert_eq!(
+            decoded.headers(0),
+            Some(list(&[("a", Some(b"x")), ("a", Some(b"y"))]).as_slice())
+        );
+    }
+
+    #[test]
+    fn given_distinct_header_names_when_decoded_should_carry_no_list() {
+        let headers = [("b", Some(&b"x"[..])), ("a", Some(&b"y"[..]))];
+        let mut batch = encode_batch(&mut [record_with(None, Some(b"v"), &headers)]).unwrap();
+        let budget = partition_budget(1024, usize::MAX);
+
+        let decoded = decode_batch(&mut batch, &budget, Zstd::Allowed).unwrap();
+        assert_eq!(decoded.repeated, RepeatedHeaders::new());
+        assert_eq!(decoded.headers(0), None);
+    }
+
+    #[test]
+    fn given_a_repeated_header_name_when_produced_and_fetched_should_return_the_same_bytes() {
+        let original = batch_repeating_a_name();
+        let budget = partition_budget(1024, usize::MAX);
+        let decoded = decode_batch(&mut original.clone(), &budget, Zstd::Allowed).unwrap();
+        let window = TimestampWindow::of(&decoded.records);
+        let message = to_iggy_with(&decoded.records[0], decoded.headers(0), window).unwrap();
+        assert!(is_enveloped(&message), "the envelope is what stores a list");
+
+        let (record, headers) = from_iggy_with(&message, 0).unwrap();
+        assert_eq!(headers, Some(list(&[("a", Some(b"x")), ("a", Some(b"y"))])));
+        let repeated = vec![(0, headers.unwrap())];
+        let fetched = encode_batch_with(&mut [record], &repeated).unwrap();
+        assert_eq!(fetched, original, "key, value and headers byte for byte");
+    }
+
+    #[test]
+    fn given_a_repeated_name_among_null_values_when_round_tripped_should_keep_the_nulls() {
+        let headers = list(&[
+            ("t", None),
+            ("s", Some(b"1")),
+            ("t", Some(b"2")),
+            ("t", None),
+        ]);
+        let record = record_with(None, Some(b"v"), &[]);
+        let message = to_iggy_with(&record, Some(&headers), TimestampWindow::of(&[])).unwrap();
+
+        let (back, list) = from_iggy_with(&message, 0).unwrap();
+        assert_eq!(list.as_ref(), Some(&headers));
+        assert_eq!(back.headers.len(), 2);
+
+        let mut records = [back];
+        let mut batch = encode_batch_with(&mut records, &vec![(0, list.unwrap())]).unwrap();
+        let budget = partition_budget(1024, usize::MAX);
+        let decoded = decode_batch(&mut batch, &budget, Zstd::Allowed).unwrap();
+        assert_eq!(decoded.headers(0), Some(headers.as_slice()));
+    }
+
+    #[test]
+    fn given_spliced_records_when_batched_should_leave_the_others_untouched() {
+        let mut records = vec![
+            record_at_offset(0, b"first"),
+            record_at_offset(1, b"second"),
+            record_at_offset(2, b"third"),
+        ];
+        let plain = encode_batch(&mut records).unwrap();
+        let headers = list(&[("h", Some(b"1")), ("h", Some(b"2"))]);
+        let spliced = encode_batch_with(&mut records, &vec![(1, headers.clone())]).unwrap();
+
+        let budget = partition_budget(4096, usize::MAX);
+        let decoded = decode_batch(&mut spliced.clone(), &budget, Zstd::Allowed).unwrap();
+        assert_eq!(decoded.records.len(), 3);
+        assert_eq!(decoded.headers(1), Some(headers.as_slice()));
+        assert_eq!(decoded.repeated.len(), 1);
+        let values: Vec<_> = decoded
+            .records
+            .iter()
+            .map(|record| record.value.clone().unwrap())
+            .collect();
+        assert_eq!(values, [&b"first"[..], b"second", b"third"]);
+        assert_eq!(
+            spliced.len(),
+            plain.len() + headers_section_len(&headers) - 1,
+            "only the middle record grows, by its new header section over the empty one"
+        );
+    }
+
+    /// Bytes a header section of `list` takes: its count and each name and value, all short.
+    fn headers_section_len(list: &[Header]) -> usize {
+        1 + list
+            .iter()
+            .map(|(name, value)| 2 + name.len() + value.as_ref().map_or(0, Bytes::len))
+            .sum::<usize>()
+    }
+
+    #[test]
+    fn given_headers_out_of_name_order_when_round_tripped_should_keep_their_order() {
+        let sent = [
+            ("zulu", Some(&b"1"[..])),
+            ("alpha", Some(&b"2"[..])),
+            ("mike", Some(&b"3"[..])),
+        ];
+        let message = to_iggy_alone(&record_with(Some(b"k"), Some(b"v"), &sent)).unwrap();
+        assert!(
+            !is_enveloped(&message),
+            "order alone does not need the envelope"
+        );
+        let stored = message.user_headers_map().unwrap().unwrap();
+        assert_eq!(
+            stored
+                .get(&header_key(ORDER_HEADER))
+                .map(HeaderValue::value),
+            Some(Bytes::from_static(&[2, 0, 1])),
+            "the sorted rank of each header, in send order"
+        );
+
+        let back = from_iggy(&message, 0).unwrap();
+        let names: Vec<&str> = back.headers.keys().map(StrBytes::as_str).collect();
+        assert_eq!(names, ["zulu", "alpha", "mike"]);
+    }
+
+    #[test]
+    fn given_headers_in_name_order_when_encoded_should_store_no_order() {
+        let sent = [("alpha", Some(&b"1"[..])), ("beta", Some(&b"2"[..]))];
+        let message = to_iggy_alone(&record_with(None, Some(b"v"), &sent)).unwrap();
+        let stored = message.user_headers_map().unwrap().unwrap();
+        assert!(!stored.contains_key(&header_key(ORDER_HEADER)));
+    }
+
+    #[test]
+    fn given_more_unsorted_headers_than_one_order_byte_ranks_when_encoded_should_envelope() {
+        let names: Vec<String> = (0..300).rev().map(|at| format!("h{at:03}")).collect();
+        let sent: Vec<(&str, Option<&[u8]>)> = names
+            .iter()
+            .map(|name| (name.as_str(), Some(&b"v"[..])))
+            .collect();
+        let message = to_iggy_alone(&record_with(None, Some(b"v"), &sent)).unwrap();
+        assert!(is_enveloped(&message));
+
+        let back = from_iggy(&message, 0).unwrap();
+        let order: Vec<&str> = back.headers.keys().map(StrBytes::as_str).collect();
+        assert_eq!(order, names);
+    }
+
+    #[test]
+    fn given_an_order_that_is_not_a_permutation_when_read_should_fail() {
+        for order in [&[0, 0][..], &[0][..], &[0, 2][..], &[1, 0, 2][..]] {
+            let message = gateway_message(
+                b"v",
+                &[
+                    ("kafka.h.a", b"1"),
+                    ("kafka.h.b", b"2"),
+                    (ORDER_HEADER, order),
+                ],
+            );
+            assert!(
+                matches!(
+                    from_iggy(&message, 0),
+                    Err(RecordCodecError::HeaderOrder(_))
+                ),
+                "{order:?}"
+            );
+        }
+        let message = gateway_message(
+            b"v",
+            &[
+                ("kafka.h.a", b"1"),
+                ("kafka.h.b", b"2"),
+                (ORDER_HEADER, &[1, 0]),
+            ],
+        );
+        let names: Vec<String> = from_iggy(&message, 0)
+            .unwrap()
+            .headers
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["b", "a"]);
     }
 
     #[test]
@@ -2325,6 +2623,7 @@ mod tests {
         assert_eq!(
             decode_batch(&mut batch, &budget, Zstd::Allowed)
                 .unwrap()
+                .records
                 .len(),
             1
         );
@@ -2341,7 +2640,9 @@ mod tests {
         let mut encoded = encode_batch(&mut with_headers).unwrap();
         let budget = partition_budget(1024, usize::MAX);
 
-        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed).unwrap();
+        let decoded = decode_batch(&mut encoded, &budget, Zstd::Allowed)
+            .unwrap()
+            .records;
         assert_eq!(
             decoded[0].headers.get(&StrBytes::from_static_str("trace")),
             Some(&Some(Bytes::from_static(b"abc")))
@@ -2387,7 +2688,7 @@ mod tests {
     }
 
     #[test]
-    fn given_two_key_kinds_naming_one_header_on_an_iggy_message_when_read_should_keep_one() {
+    fn given_two_key_kinds_naming_one_header_on_an_iggy_message_when_read_should_keep_both() {
         let mut headers = BTreeMap::new();
         headers.insert(header_key("trace"), header_value(b"string"));
         headers.insert(
@@ -2400,11 +2701,16 @@ mod tests {
             .build()
             .unwrap();
 
-        let record = from_iggy(&message, 0).unwrap();
+        let (record, list) = from_iggy_with(&message, 0).unwrap();
         assert_eq!(
             record.headers.len(),
             1,
-            "a Record keys headers in an IndexMap, so the pair cannot both survive"
+            "a Record keys headers in an IndexMap, so the pair cannot both survive there"
+        );
+        assert_eq!(
+            list.map(|list| list.len()),
+            Some(2),
+            "Kafka carries a list, so both reach the consumer"
         );
         assert!(
             record

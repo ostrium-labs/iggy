@@ -39,6 +39,7 @@ Produce, per record:
 | record value | `payload` |
 | record key | `kafka.key` user header, `Raw` |
 | record header `name` | `kafka.h.<name>` user header, `Raw` |
+| record header order, when not sorted by name | `kafka.ho` user header, one byte per header |
 | record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds, plus `kafka.ts` when that cannot hold it |
 | record offset | partition offset, assigned by Iggy |
 | partition index | partition index, both 0-based |
@@ -155,10 +156,16 @@ A record takes the fallback when any of these hold:
 - a header name, prefixed with `kafka.h.`, is longer than 255 bytes
 - a header value is null, empty, or longer than 255 bytes
 - the headers together would exceed the 100 KB user-header budget
+- two headers share a name (KafkaJS array headers, Spring's repeated trace headers)
+- the headers are not in name order and there are more than 255 of them, too many for
+  `kafka.ho` (see Header order)
 
-A repeated header name is refused with `INVALID_RECORD` (87). Kafka allows one, but
-`kafka_protocol` decodes headers into an `IndexMap` and keeps only the last value. The gateway
-checks the raw record bytes first (`scan_records`).
+A repeated name needs the envelope because Iggy keys headers in a map. It also gets past
+`kafka_protocol`, which decodes headers into an `IndexMap` and keeps only the last value of a
+name: Produce reads the full list from the raw record bytes (`scan_records`) and hands it to the
+encoder beside the `Record`, and Fetch writes the list back into the encoded batch
+(`records::headers::splice`), fixing the record length, the batch length and the CRC. The record
+reaches the consumer with every header, in send order, byte for byte as Kafka would serve it.
 
 Such a record is stored with a `kafka.envelope` header whose value is one byte, the byte layout
 version, currently `1`. The payload holds the key, the value and the headers in the layout below.
@@ -362,13 +369,23 @@ Repeated entries for one partition and time are looked up once.
 
 ### Header order
 
-Kafka carries record headers as an ordered list. Iggy keys them in a `BTreeMap`, so Fetch emits
-them sorted by name and the producer's order is gone.
+Kafka carries record headers as an ordered list. Iggy keys them in a `BTreeMap`, so a record
+stored natively comes back with its headers sorted by name.
 
-There is no fallback for this, because the gateway cannot tell whether a record's header order
-carries meaning. The envelope does preserve order, since it stores the headers as a list, but a
-record only reaches the envelope for one of the reasons above. A consumer that depends on header
-order therefore sees a different order through the gateway than a real broker would give it.
+When the producer's order is not that sorted order, Produce adds a `kafka.ho` header: one byte
+per header, in send order, each the header's rank in name order. `[2, 0, 1]` on headers sent as
+`zulu, alpha, mike` says the first header sent is the third by name. Fetch reorders by it. The
+common record, with no headers, one header or headers already in name order, carries no
+`kafka.ho` and pays nothing.
+
+One byte ranks at most 255 headers, which is also one header value's cap. A record with more
+headers than that, out of order, takes the envelope, which stores the headers as a list and so
+keeps any order.
+
+A `kafka.ho` that is not a permutation of the record's stored headers fails Fetch with
+`INVALID_RECORD`, like any other malformed marker on a message that says the gateway wrote it.
+A gateway built before `kafka.ho` existed ignores it and serves the headers sorted by name; the
+mapping version stays `1`, because nothing an older build reads changed meaning.
 
 ### Header name collisions
 
@@ -377,14 +394,11 @@ An Iggy header key is bytes plus a kind, and the key orders on kind before bytes
 different kinds are therefore two stored headers. A Kafka header name is a string, so both map to
 one name.
 
-Kafka carries headers as a list and holds both. A `kafka_protocol` `Record` keys them in an
-`IndexMap`, so nothing here keeps the pair, and the later key in stored order wins.
+Kafka carries headers as a list and holds both. On a message an Iggy client wrote, Fetch serves
+both, in stored key order, through the same full-list path a repeated Kafka name takes.
 
 On a message the gateway wrote this cannot happen, because `to_iggy` writes one key kind. Fetch
-therefore refuses such a message, rather than dropping a header from it quietly. On a message an
-Iggy client wrote it can happen, and Fetch keeps one header and loses the other. Refusing that
-message lets one Iggy writer stall the partition for every Kafka consumer of it, which is the
-worse of the two.
+therefore refuses such a message rather than guess which of the two is the header it wrote.
 
 ## Partitioning
 
