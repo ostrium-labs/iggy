@@ -264,8 +264,22 @@ struct ResolvedTopic {
 #[derive(Debug)]
 enum PartitionAnswer {
     Answered(ListOffsetsPartitionResponse),
-    /// Its timestamp needs a record lookup, which [`locate_records`] runs.
+    /// It needs a record lookup, which [`locate_records`] runs.
     Pending(PendingLookup),
+}
+
+/// What a lookup answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Lookup {
+    /// `EARLIEST`: the log start offset, the first record retention kept or the `DeleteRecords`
+    /// watermark, whichever is higher.
+    Earliest,
+    /// `MAX_TIMESTAMP`: the last record.
+    Last,
+    /// The first record whose timestamp is at or after this, in Kafka milliseconds. The
+    /// timestamp is the one Fetch shows, the producer's when it set one, as a Kafka broker
+    /// searches a `CreateTime` topic.
+    Time(i64),
 }
 
 /// A record lookup still to run, with what the probe saw of its partition.
@@ -275,16 +289,19 @@ struct PendingLookup {
     partition_index: i32,
     /// The same index, as Iggy takes it.
     partition: u32,
-    lookup: RecordLookup,
+    lookup: Lookup,
     /// Messages the probe counted. 0 also when the server has no stats for the partition.
     retained: u64,
     high_watermark: u64,
+    /// The `DeleteRecords` watermark. Nothing below it is answered.
+    deleted_below: u64,
 }
 
 /// Resolves every requested topic entry via [`group_requested_topics`] +
 /// [`resolve_topic_lookups`], then stamps each requested partition with its topic's
-/// [`TopicLookup`] outcome. `EARLIEST` and `LATEST` are answered from the watermark here. Every
-/// other timestamp is left [`PartitionAnswer::Pending`] for [`locate_records`].
+/// [`TopicLookup`] outcome. `LATEST` is answered from the watermark here, and `EARLIEST` when the
+/// `DeleteRecords` watermark reaches the high watermark. Every other lookup is left
+/// [`PartitionAnswer::Pending`] for [`locate_records`].
 async fn resolve_all_topics(
     bridge: &IggyBridge,
     loading: &Mutex<Spells>,
@@ -353,30 +370,29 @@ fn resolve_one_partition(
     };
     let watermark = i64::try_from(probe.high_watermark).unwrap_or(i64::MAX);
 
-    let answer = match requested.timestamp {
-        LATEST_TIMESTAMP => offset_response(index, watermark),
-        // Real only for a partition retention has never trimmed: Iggy tracks no rolling
-        // low-watermark distinct from partition creation, so a `0` here for an older,
-        // already-trimmed partition names a log-start offset that no longer exists - a real
-        // consumer with `auto.offset.reset=earliest` would seek into a hole. Fetch there reads
-        // from the oldest kept message, so the consumer skips the gap. Not fixable client-side;
-        // needs the bridge to expose a real start offset.
-        EARLIEST_TIMESTAMP => offset_response(index, 0),
-        timestamp => {
-            let lookup = match timestamp {
-                MAX_TIMESTAMP => RecordLookup::Last,
-                millis => RecordLookup::AppendedAtOrAfter(millis),
-            };
-            return PartitionAnswer::Pending(PendingLookup {
-                partition_index: index,
-                partition: partition_index,
-                lookup,
-                retained: probe.messages_count,
-                high_watermark: probe.high_watermark,
-            });
+    let lookup = match requested.timestamp {
+        LATEST_TIMESTAMP => return PartitionAnswer::Answered(offset_response(index, watermark)),
+        // Every record is deleted, or the partition was never written to: no read can say more.
+        // A server without stats reads a high watermark of 0 too, and then 0 is still a start
+        // offset a consumer can read from.
+        EARLIEST_TIMESTAMP
+            if probe.deleted_below >= probe.high_watermark || probe.high_watermark == 0 =>
+        {
+            let start = i64::try_from(probe.deleted_below).unwrap_or(i64::MAX);
+            return PartitionAnswer::Answered(offset_response(index, start));
         }
+        EARLIEST_TIMESTAMP => Lookup::Earliest,
+        MAX_TIMESTAMP => Lookup::Last,
+        millis => Lookup::Time(millis),
     };
-    PartitionAnswer::Answered(answer)
+    PartitionAnswer::Pending(PendingLookup {
+        partition_index: index,
+        partition: partition_index,
+        lookup,
+        retained: probe.messages_count,
+        high_watermark: probe.high_watermark,
+        deleted_below: probe.deleted_below,
+    })
 }
 
 fn error_answer(partition: i32, error_code: i16) -> PartitionAnswer {
@@ -447,7 +463,15 @@ async fn locate_records(
     responses
 }
 
+/// What one read of a lookup found. `None` when it did not end in time.
+type Read = Option<core::result::Result<Option<LocatedRecord>, BridgeError>>;
+
 /// Answers one `pending` lookup, reusing `slot` or taking a new one into it.
+///
+/// - `EARLIEST` reads the first record Iggy keeps.
+/// - `MAX_TIMESTAMP` reads the last record.
+/// - A time reads the last record, then searches between the `DeleteRecords` watermark and it,
+///   one record per read, for the first record at or after the time. See [`TimeSearch`].
 async fn locate_one(
     bridge: &Arc<IggyBridge>,
     unproven_empty: &Mutex<Spells>,
@@ -463,19 +487,51 @@ async fn locate_one(
         ..
     } = pending;
     let deadline = lookup_deadline(Instant::now(), request_deadline);
-    let Some(found) = poll_record(bridge, slot, topic, partition, lookup, deadline).await else {
-        return error_response(partition_index, ERROR_REQUEST_TIMED_OUT);
+    let first = match lookup {
+        Lookup::Earliest => RecordLookup::First,
+        Lookup::Last | Lookup::Time(_) => RecordLookup::Last,
     };
-    let last = match (&found, lookup) {
-        (Ok(None), RecordLookup::AppendedAtOrAfter(_)) => {
-            match poll_record(bridge, slot, topic, partition, RecordLookup::Last, deadline).await {
-                Some(last) => Some(last),
-                None => return error_response(partition_index, ERROR_REQUEST_TIMED_OUT),
+    let read = poll_record(bridge, slot, topic, partition, first, deadline).await;
+    let (millis, last) = match (lookup, read) {
+        (_, None) => return error_response(partition_index, ERROR_REQUEST_TIMED_OUT),
+        (Lookup::Earliest, Some(found)) => {
+            return earliest_answer(unproven_empty, topic, pending, found);
+        }
+        (Lookup::Last, Some(found)) => return last_answer(unproven_empty, topic, pending, found),
+        (Lookup::Time(millis), Some(found)) => {
+            match bounded_by_last(unproven_empty, topic, pending, found) {
+                Ok(last) => (millis, last),
+                Err(answer) => return answer,
             }
         }
-        _ => None,
     };
-    lookup_answer(unproven_empty, topic, pending, found, last.as_ref())
+    let mut search = TimeSearch::new(millis, pending.deleted_below, last);
+    while let Some(at) = search.next_read() {
+        let read = poll_record(
+            bridge,
+            slot,
+            topic,
+            partition,
+            RecordLookup::At(at),
+            deadline,
+        )
+        .await;
+        match read {
+            None => return error_response(partition_index, ERROR_REQUEST_TIMED_OUT),
+            Some(Ok(Some(record))) => search.take(at, record),
+            Some(Ok(None)) => {
+                return unproven(unproven_empty, topic, pending, Some(at));
+            }
+            Some(Err(error)) => {
+                tracing::warn!(topic, partition, %error, "ListOffsets record lookup by time failed");
+                return error_response(partition_index, retriable_code(&error));
+            }
+        }
+    }
+    search.answer().map_or_else(
+        || not_found_response(partition_index),
+        |record| record_response(partition_index, record),
+    )
 }
 
 /// One [`IggyBridge::locate_record`] on `slot`, or on a new slot for the first lookup or after a
@@ -488,7 +544,7 @@ async fn poll_record(
     partition: u32,
     lookup: RecordLookup,
     deadline: Instant,
-) -> Option<core::result::Result<Option<LocatedRecord>, BridgeError>> {
+) -> Read {
     // A poll started now would time out at once and drop the slot's client.
     if Instant::now() >= deadline {
         return None;
@@ -509,30 +565,79 @@ fn lookup_deadline(now: Instant, request_deadline: Instant) -> Instant {
     request_deadline.min(now + LOOKUP_BUDGET)
 }
 
-/// The answer to one `pending` lookup, from what it `found` and, after an empty
-/// `AppendedAtOrAfter`, the `last` record.
+/// The `EARLIEST` answer from the first record Iggy keeps: its offset, or the `DeleteRecords`
+/// watermark above it.
 ///
-/// Iggy also polls empty on a read fault or before a partition seeds its commit point, and a node
-/// that lags the probed one can serve a shorter tail. So "no record" needs the last record appended
-/// before the time and reaching the probed high watermark, or, where the probe counted no message,
-/// a last poll that is empty too. A last record short of the high watermark is no answer to
-/// `Last` either. Anything else answers [`ERROR_NOT_LEADER_OR_FOLLOWER`] to retry.
-fn lookup_answer(
+/// Iggy also polls empty on a read fault or before a partition seeds its commit point. So an
+/// empty poll answers the high watermark only where the probe counted no message, retention having
+/// removed them all. Anything else answers [`ERROR_NOT_LEADER_OR_FOLLOWER`] to retry, never -1:
+/// the async Java consumer throws on an EARLIEST entry with no offset.
+fn earliest_answer(
     unproven_empty: &Mutex<Spells>,
     topic: &str,
     pending: PendingLookup,
     found: core::result::Result<Option<LocatedRecord>, BridgeError>,
-    last: Option<&core::result::Result<Option<LocatedRecord>, BridgeError>>,
 ) -> ListOffsetsPartitionResponse {
     let PendingLookup {
         partition_index,
         partition,
-        lookup,
         retained,
         high_watermark,
+        deleted_below,
+        ..
+    } = pending;
+    let start = match found {
+        Ok(Some(record)) => u64::try_from(record.offset).unwrap_or(0),
+        Ok(None) if retained == 0 => high_watermark,
+        Ok(None) => return unproven(unproven_empty, topic, pending, None),
+        Err(error) => {
+            tracing::warn!(topic, partition, %error, "ListOffsets first record lookup failed");
+            return error_response(partition_index, retriable_code(&error));
+        }
+    };
+    let start = start.max(deleted_below);
+    offset_response(partition_index, i64::try_from(start).unwrap_or(i64::MAX))
+}
+
+/// The `MAX_TIMESTAMP` answer from the last record.
+///
+/// The polled node can lag the probed one and serve a shorter tail, so a last record short of the
+/// probed high watermark answers [`ERROR_NOT_LEADER_OR_FOLLOWER`], and so does an empty poll
+/// where the probe counted messages. A last record below the `DeleteRecords` watermark is no
+/// record a client may read.
+fn last_answer(
+    unproven_empty: &Mutex<Spells>,
+    topic: &str,
+    pending: PendingLookup,
+    found: core::result::Result<Option<LocatedRecord>, BridgeError>,
+) -> ListOffsetsPartitionResponse {
+    match bounded_by_last(unproven_empty, topic, pending, found) {
+        Ok(last) => last.map_or_else(
+            || not_found_response(pending.partition_index),
+            |last| record_response(pending.partition_index, last),
+        ),
+        Err(answer) => answer,
+    }
+}
+
+/// The last record a client may read, after a read of the last record: `Ok(None)` when there is
+/// none. `Err` with the answer when the read proves nothing. See [`last_answer`].
+fn bounded_by_last(
+    unproven_empty: &Mutex<Spells>,
+    topic: &str,
+    pending: PendingLookup,
+    found: core::result::Result<Option<LocatedRecord>, BridgeError>,
+) -> core::result::Result<Option<LocatedRecord>, ListOffsetsPartitionResponse> {
+    let PendingLookup {
+        partition_index,
+        partition,
+        retained,
+        high_watermark,
+        deleted_below,
+        ..
     } = pending;
     match found {
-        Ok(Some(record)) if lookup == RecordLookup::Last && !reaches(&record, high_watermark) => {
+        Ok(Some(record)) if !reaches(&record, high_watermark) => {
             tracing::debug!(
                 topic,
                 partition,
@@ -541,55 +646,119 @@ fn lookup_answer(
                 "ListOffsets last record falls short of the probed high watermark; answering \
                  retriable"
             );
-            error_response(partition_index, ERROR_NOT_LEADER_OR_FOLLOWER)
+            Err(error_response(
+                partition_index,
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+            ))
         }
-        Ok(Some(record)) => ListOffsetsPartitionResponse::default()
-            .with_partition_index(partition_index)
-            .with_timestamp(record.timestamp)
-            .with_offset(record.offset),
+        Ok(Some(record)) if u64::try_from(record.offset).is_ok_and(|at| at < deleted_below) => {
+            Ok(None)
+        }
+        Ok(Some(record)) => Ok(Some(record)),
+        Ok(None) if retained == 0 => Ok(None),
+        Ok(None) => Err(unproven(unproven_empty, topic, pending, None)),
         Err(error) => {
-            tracing::warn!(topic, partition, %error, "ListOffsets record lookup by time failed");
-            error_response(partition_index, retriable_code(&error))
+            tracing::warn!(topic, partition, %error, "ListOffsets last record lookup failed");
+            Err(error_response(partition_index, retriable_code(&error)))
         }
-        Ok(None) => {
-            let proven = match (lookup, last) {
-                (_, Some(Err(error))) => {
-                    tracing::warn!(topic, partition, %error, "ListOffsets last record lookup failed");
-                    return error_response(partition_index, retriable_code(error));
-                }
-                (RecordLookup::Last, _) | (_, Some(Ok(None))) => retained == 0,
-                (RecordLookup::AppendedAtOrAfter(millis), Some(Ok(Some(last)))) => {
-                    last.appended_before(millis) && reaches(last, high_watermark)
-                }
-                (RecordLookup::AppendedAtOrAfter(_), None) => false,
-            };
-            if proven {
-                return not_found_response(partition_index);
-            }
-            if sight_first(unproven_empty, topic, partition, Instant::now()) {
-                tracing::warn!(
-                    topic,
-                    partition,
-                    retained,
-                    high_watermark,
-                    ?lookup,
-                    ?last,
-                    "ListOffsets lookup polled empty without proof that no record matches; \
-                     answering retriable"
-                );
-            } else {
-                tracing::debug!(
-                    topic,
-                    partition,
-                    retained,
-                    high_watermark,
-                    ?lookup,
-                    ?last,
-                    "ListOffsets lookup still polls empty without proof that no record matches"
-                );
-            }
-            error_response(partition_index, ERROR_NOT_LEADER_OR_FOLLOWER)
+    }
+}
+
+/// The answer to a read that polled empty where records should be: retriable, and a warning the
+/// first time in a spell.
+fn unproven(
+    unproven_empty: &Mutex<Spells>,
+    topic: &str,
+    pending: PendingLookup,
+    at: Option<u64>,
+) -> ListOffsetsPartitionResponse {
+    let PendingLookup {
+        partition_index,
+        partition,
+        lookup,
+        retained,
+        high_watermark,
+        ..
+    } = pending;
+    if sight_first(unproven_empty, topic, partition, Instant::now()) {
+        tracing::warn!(
+            topic,
+            partition,
+            retained,
+            high_watermark,
+            ?lookup,
+            ?at,
+            "ListOffsets lookup polled empty without proof that no record matches; answering \
+             retriable"
+        );
+    } else {
+        tracing::debug!(
+            topic,
+            partition,
+            retained,
+            high_watermark,
+            ?lookup,
+            ?at,
+            "ListOffsets lookup still polls empty without proof that no record matches"
+        );
+    }
+    error_response(partition_index, ERROR_NOT_LEADER_OR_FOLLOWER)
+}
+
+/// A binary search for the first record whose timestamp is at or after a time, over the offsets
+/// from the `DeleteRecords` watermark to the last record, one read per step.
+///
+/// Exact when timestamps do not decrease along the log, which holds for records stamped as they
+/// are written and for a backfill replayed in order. Where they go back and forth, it finds a
+/// record at or after the time whose predecessor in the search is before it, where a Kafka broker
+/// finds the first such record of the whole log. A read at an offset that retention removed
+/// returns the first record after it, so the search skips the hole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimeSearch {
+    millis: i64,
+    /// The first offset the answer can be.
+    low: u64,
+    /// One past the last offset the answer can be.
+    high: u64,
+    found: Option<LocatedRecord>,
+}
+
+impl TimeSearch {
+    /// A search from `deleted_below` to `last`, the last record if there is one.
+    fn new(millis: i64, deleted_below: u64, last: Option<LocatedRecord>) -> Self {
+        let high = last
+            .and_then(|last| u64::try_from(last.offset).ok())
+            .map_or(deleted_below, |offset| offset.saturating_add(1));
+        Self {
+            millis,
+            low: deleted_below,
+            high: high.max(deleted_below),
+            found: None,
         }
+    }
+
+    /// The offset to read next. `None` once the search is done.
+    fn next_read(&self) -> Option<u64> {
+        (self.low < self.high).then(|| self.low + (self.high - self.low) / 2)
+    }
+
+    /// Takes the record a read at `at` returned: the record at `at`, or the first one after it.
+    fn take(&mut self, at: u64, record: LocatedRecord) {
+        // Never below the read, whatever the node sent.
+        let offset = u64::try_from(record.offset).unwrap_or(0).max(at);
+        if offset >= self.high {
+            // No record from `at` to the end of the search.
+            self.high = at;
+        } else if record.timestamp >= self.millis {
+            self.found = Some(record);
+            self.high = at;
+        } else {
+            self.low = offset + 1;
+        }
+    }
+
+    const fn answer(&self) -> Option<LocatedRecord> {
+        self.found
     }
 }
 
@@ -607,6 +776,13 @@ const fn retriable_code(error: &BridgeError) -> i16 {
         }
         code => code,
     }
+}
+
+fn record_response(partition: i32, record: LocatedRecord) -> ListOffsetsPartitionResponse {
+    ListOffsetsPartitionResponse::default()
+        .with_partition_index(partition)
+        .with_timestamp(record.timestamp)
+        .with_offset(record.offset)
 }
 
 fn offset_response(partition: i32, offset: i64) -> ListOffsetsPartitionResponse {
@@ -700,13 +876,14 @@ mod tests {
         }
     }
 
-    fn pending(lookup: RecordLookup, retained: u64, high_watermark: u64) -> PendingLookup {
+    fn pending(lookup: Lookup, retained: u64, high_watermark: u64) -> PendingLookup {
         PendingLookup {
             partition_index: 3,
             partition: 3,
             lookup,
             retained,
             high_watermark,
+            deleted_below: 0,
         }
     }
 
@@ -716,20 +893,22 @@ mod tests {
             .with_timestamp(timestamp)
     }
 
+    fn probe(high_watermark: u64, messages_count: u64, deleted_below: u64) -> PartitionProbe {
+        PartitionProbe {
+            high_watermark,
+            average_size: 0,
+            messages_count,
+            deleted_below,
+        }
+    }
+
     /// Partitions that retain every message below their high watermark.
     fn ok_watermarks(
         entries: &[(u32, u64)],
     ) -> Vec<(u32, core::result::Result<PartitionProbe, BridgeError>)> {
         entries
             .iter()
-            .map(|&(id, high_watermark)| {
-                let probe = PartitionProbe {
-                    high_watermark,
-                    average_size: 0,
-                    messages_count: high_watermark,
-                };
-                (id, Ok(probe))
-            })
+            .map(|&(id, high_watermark)| (id, Ok(probe(high_watermark, high_watermark, 0))))
             .collect()
     }
 
@@ -742,26 +921,39 @@ mod tests {
     }
 
     #[test]
-    fn earliest_resolves_to_zero_regardless_of_the_watermark() {
-        let lookup = TopicLookup::Probed(Ok(ok_watermarks(&[(0, 42)])));
-        let resp = resolved(&partition(0, EARLIEST_TIMESTAMP), &lookup);
-        assert_eq!(resp.error_code, ERROR_NONE);
-        assert_eq!(resp.offset, 0);
+    fn earliest_on_a_partition_with_records_reads_the_first_one() {
+        let lookup = TopicLookup::Probed(Ok(vec![(0, Ok(probe(42, 30, 5)))]));
+        let answer = resolve_one_partition(&partition(0, EARLIEST_TIMESTAMP), &lookup);
+        let PartitionAnswer::Pending(pending) = answer else {
+            panic!("EARLIEST answered without a lookup: {answer:?}");
+        };
+        assert_eq!(pending.lookup, Lookup::Earliest);
+        assert_eq!(pending.deleted_below, 5);
+    }
+
+    #[test]
+    fn earliest_answers_the_watermark_without_a_read_when_nothing_is_left_to_read() {
+        for (high_watermark, deleted_below) in [(0, 0), (42, 42)] {
+            let lookup = TopicLookup::Probed(Ok(vec![(
+                0,
+                Ok(probe(high_watermark, high_watermark, deleted_below)),
+            )]));
+            let resp = resolved(&partition(0, EARLIEST_TIMESTAMP), &lookup);
+            assert_eq!(resp.error_code, ERROR_NONE);
+            assert_eq!(resp.offset, i64::try_from(deleted_below).unwrap());
+        }
     }
 
     #[test]
     fn a_timestamp_or_max_timestamp_is_left_for_a_record_lookup() {
         let lookup = TopicLookup::Probed(Ok(ok_watermarks(&[(0, 42)])));
         let expected = [
-            (
-                1_700_000_000_000,
-                RecordLookup::AppendedAtOrAfter(1_700_000_000_000),
-            ),
-            (0, RecordLookup::AppendedAtOrAfter(0)),
-            (MAX_TIMESTAMP, RecordLookup::Last),
-            (-7, RecordLookup::AppendedAtOrAfter(-7)),
+            (1_700_000_000_000, Lookup::Time(1_700_000_000_000)),
+            (0, Lookup::Time(0)),
+            (MAX_TIMESTAMP, Lookup::Last),
+            (-7, Lookup::Time(-7)),
         ];
-        for (requested, record_lookup) in expected {
+        for (requested, lookup_wanted) in expected {
             let answer = resolve_one_partition(&partition(0, requested), &lookup);
             let PartitionAnswer::Pending(pending) = answer else {
                 panic!("timestamp {requested} answered without a lookup: {answer:?}");
@@ -769,9 +961,10 @@ mod tests {
             let want = PendingLookup {
                 partition_index: 0,
                 partition: 0,
-                lookup: record_lookup,
+                lookup: lookup_wanted,
                 retained: 42,
                 high_watermark: 42,
+                deleted_below: 0,
             };
             assert_eq!(pending, want, "timestamp {requested}");
         }
@@ -780,14 +973,9 @@ mod tests {
     /// Retention leaves a count of 0 below a high watermark, and so does a server without stats
     /// for the partition, so only a lookup tells whether records remain.
     #[test]
-    fn a_timestamp_where_the_probe_counts_no_message_below_a_high_watermark_is_looked_up() {
-        let uncounted = PartitionProbe {
-            high_watermark: 42,
-            average_size: 0,
-            messages_count: 0,
-        };
-        let lookup = TopicLookup::Probed(Ok(vec![(0, Ok(uncounted))]));
-        for requested in [1_700_000_000_000, MAX_TIMESTAMP] {
+    fn a_lookup_where_the_probe_counts_no_message_below_a_high_watermark_is_looked_up() {
+        let lookup = TopicLookup::Probed(Ok(vec![(0, Ok(probe(42, 0, 0)))]));
+        for requested in [1_700_000_000_000, MAX_TIMESTAMP, EARLIEST_TIMESTAMP] {
             let answer = resolve_one_partition(&partition(0, requested), &lookup);
             assert!(
                 matches!(
@@ -804,71 +992,39 @@ mod tests {
     }
 
     #[test]
-    fn an_uncounted_partition_whose_lookups_both_poll_empty_is_not_found() {
-        // Every message expired: the probe and both polls agree nothing is retained.
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let resp = lookup_answer(
-            &Mutex::default(),
-            "orders",
-            pending(time, 0, 42),
-            Ok(None),
-            Some(&Ok(None)),
-        );
-        assert_eq!(answer(&resp), (ERROR_NONE, -1, -1));
-        let resp = lookup_answer(
-            &Mutex::default(),
-            "orders",
-            pending(RecordLookup::Last, 0, 42),
-            Ok(None),
-            None,
-        );
-        assert_eq!(answer(&resp), (ERROR_NONE, -1, -1));
-    }
-
-    #[test]
-    fn an_uncounted_partition_answers_the_record_a_lookup_finds() {
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let found = Ok(Some(record(17, REQUESTED_MILLIS + 5)));
-        let resp = lookup_answer(
-            &Mutex::default(),
-            "orders",
-            pending(time, 0, 42),
-            found,
-            None,
-        );
-        assert_eq!(answer(&resp), (ERROR_NONE, 17, REQUESTED_MILLIS + 5));
-    }
-
-    /// A server without stats for the partition reads a high watermark of 0 too, so only a
-    /// lookup tells it from one that was never appended to.
-    #[test]
-    fn a_timestamp_on_a_partition_with_a_high_watermark_of_zero_is_looked_up() {
-        let lookup = TopicLookup::Probed(Ok(ok_watermarks(&[(0, 0)])));
-        for requested in [1_700_000_000_000, MAX_TIMESTAMP] {
-            let answer = resolve_one_partition(&partition(0, requested), &lookup);
-            assert!(
-                matches!(
-                    answer,
-                    PartitionAnswer::Pending(PendingLookup {
-                        retained: 0,
-                        high_watermark: 0,
-                        ..
-                    })
-                ),
-                "timestamp {requested}: {answer:?}"
-            );
-        }
-    }
-
-    #[test]
     fn earliest_and_latest_never_answer_no_error_with_offset_minus_one() {
         // The async Java consumer dereferences a null for that entry and throws.
         for watermark in [0, 42] {
             let lookup = TopicLookup::Probed(Ok(ok_watermarks(&[(0, watermark)])));
             for requested in [EARLIEST_TIMESTAMP, LATEST_TIMESTAMP] {
-                let resp = resolved(&partition(0, requested), &lookup);
-                assert_eq!(resp.error_code, ERROR_NONE);
-                assert!(resp.offset >= 0, "{requested} on watermark {watermark}");
+                if let PartitionAnswer::Answered(resp) =
+                    resolve_one_partition(&partition(0, requested), &lookup)
+                {
+                    assert_eq!(resp.error_code, ERROR_NONE);
+                    assert!(resp.offset >= 0, "{requested} on watermark {watermark}");
+                }
+            }
+        }
+        let found = [
+            Ok(Some(record(7, REQUESTED_MILLIS))),
+            Ok(None),
+            Err(BridgeError::Timeout),
+        ];
+        for retained in [0, 42] {
+            for found in &found {
+                let found = found
+                    .as_ref()
+                    .map_or_else(|_| Err(BridgeError::Timeout), |found| Ok(*found));
+                let resp = earliest_answer(
+                    &Mutex::default(),
+                    "orders",
+                    pending(Lookup::Earliest, retained, 42),
+                    found,
+                );
+                assert!(
+                    !(resp.error_code == ERROR_NONE && resp.offset == UNKNOWN_OFFSET),
+                    "EARLIEST must not answer no error with offset -1"
+                );
             }
         }
     }
@@ -895,7 +1051,11 @@ mod tests {
         ];
         for lookup in &lookups {
             for requested in [EARLIEST_TIMESTAMP, LATEST_TIMESTAMP] {
-                let resp = resolved(&partition(0, requested), lookup);
+                let PartitionAnswer::Answered(resp) =
+                    resolve_one_partition(&partition(0, requested), lookup)
+                else {
+                    continue;
+                };
                 assert_ne!(resp.error_code, UNSUPPORTED_FOR_MESSAGE_FORMAT);
                 assert!(
                     !(resp.error_code == ERROR_NONE && resp.offset == UNKNOWN_OFFSET),
@@ -903,6 +1063,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn earliest_answers_the_first_kept_record_or_the_deleted_records_watermark_above_it() {
+        let earliest = |deleted_below, found| {
+            let mut pending = pending(Lookup::Earliest, 30, 42);
+            pending.deleted_below = deleted_below;
+            answer(&earliest_answer(
+                &Mutex::default(),
+                "orders",
+                pending,
+                found,
+            ))
+        };
+        // Retention removed offsets 0 to 11.
+        let first = Ok(Some(record(12, REQUESTED_MILLIS)));
+        assert_eq!(earliest(0, first), (ERROR_NONE, 12, LATEST_TIMESTAMP));
+        let first = Ok(Some(record(12, REQUESTED_MILLIS)));
+        assert_eq!(earliest(20, first), (ERROR_NONE, 20, LATEST_TIMESTAMP));
+    }
+
+    #[test]
+    fn earliest_on_an_empty_poll_answers_the_end_only_where_no_message_is_counted() {
+        let resp = earliest_answer(
+            &Mutex::default(),
+            "orders",
+            pending(Lookup::Earliest, 0, 42),
+            Ok(None),
+        );
+        assert_eq!(answer(&resp), (ERROR_NONE, 42, LATEST_TIMESTAMP));
+        let resp = earliest_answer(
+            &Mutex::default(),
+            "orders",
+            pending(Lookup::Earliest, 42, 42),
+            Ok(None),
+        );
+        assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
     }
 
     #[test]
@@ -916,13 +1113,18 @@ mod tests {
                 assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER, "{requested}");
             }
         }
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let resp = lookup_answer(
+        let resp = last_answer(
             &Mutex::default(),
             "orders",
-            pending(lookup, 42, 42),
+            pending(Lookup::Last, 42, 42),
             Err(refused()),
-            None,
+        );
+        assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
+        let resp = earliest_answer(
+            &Mutex::default(),
+            "orders",
+            pending(Lookup::Earliest, 42, 42),
+            Err(refused()),
         );
         assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
     }
@@ -931,35 +1133,27 @@ mod tests {
     #[test]
     fn a_rejected_bridge_login_answers_unknown_server_error_from_a_record_lookup() {
         let rejected = || BridgeError::Iggy(IggyError::InvalidCredentials);
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let found = lookup_answer(
+        let last = last_answer(
             &Mutex::default(),
             "orders",
-            pending(lookup, 42, 42),
+            pending(Lookup::Time(REQUESTED_MILLIS), 42, 42),
             Err(rejected()),
-            None,
         );
-        let last = Some(Err(rejected()));
-        let after_empty = lookup_answer(
+        let earliest = earliest_answer(
             &Mutex::default(),
             "orders",
-            pending(lookup, 42, 42),
-            Ok(None),
-            last.as_ref(),
+            pending(Lookup::Earliest, 42, 42),
+            Err(rejected()),
         );
-        for resp in [found, after_empty] {
+        for resp in [last, earliest] {
             assert_eq!(resp.error_code, ERROR_UNKNOWN_SERVER_ERROR);
         }
     }
 
     const REQUESTED_MILLIS: i64 = 1_700_000_000_000;
 
-    fn record(offset: i64, appended_at_millis: i64) -> LocatedRecord {
-        LocatedRecord {
-            offset,
-            timestamp: appended_at_millis,
-            appended_at: u64::try_from(appended_at_millis).unwrap() * 1000,
-        }
+    fn record(offset: i64, timestamp: i64) -> LocatedRecord {
+        LocatedRecord { offset, timestamp }
     }
 
     fn answer(response: &ListOffsetsPartitionResponse) -> (i16, i64, i64) {
@@ -967,29 +1161,12 @@ mod tests {
     }
 
     #[test]
-    fn a_found_record_answers_its_offset_and_timestamp() {
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let found = Ok(Some(record(17, REQUESTED_MILLIS + 123)));
-        let resp = lookup_answer(
-            &Mutex::default(),
-            "orders",
-            pending(lookup, 42, 42),
-            found,
-            None,
-        );
-        assert_eq!(answer(&resp), (ERROR_NONE, 17, REQUESTED_MILLIS + 123));
-    }
-
-    #[test]
     fn a_failed_lookup_answers_its_error() {
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let failed = Err(BridgeError::Timeout);
-        let resp = lookup_answer(
+        let resp = last_answer(
             &Mutex::default(),
             "orders",
-            pending(lookup, 42, 42),
-            failed,
-            None,
+            pending(Lookup::Last, 42, 42),
+            Err(BridgeError::Timeout),
         );
         assert_eq!(
             resp.error_code,
@@ -997,140 +1174,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_empty_poll_is_not_found_when_the_last_record_was_appended_before_the_time() {
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        for high_watermark in [41, 42] {
-            let last = Some(Ok(Some(record(41, REQUESTED_MILLIS - 1))));
-            let resp = lookup_answer(
-                &Mutex::default(),
-                "orders",
-                pending(lookup, 42, high_watermark),
-                Ok(None),
-                last.as_ref(),
-            );
-            assert_eq!(answer(&resp), (ERROR_NONE, -1, -1), "{high_watermark}");
-        }
-    }
-
-    /// The polled node can lag the probed one and serve a tail that ends before the time.
-    #[test]
-    fn an_empty_poll_whose_last_record_falls_short_of_the_high_watermark_answers_retriable() {
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let last = Some(Ok(Some(record(40, REQUESTED_MILLIS - 1))));
-        let resp = lookup_answer(
-            &Mutex::default(),
-            "orders",
-            pending(lookup, 42, 42),
-            Ok(None),
-            last.as_ref(),
-        );
-        assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
-    }
-
-    #[test]
-    fn an_empty_poll_while_messages_are_retained_without_proof_answers_retriable() {
-        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let unproven = [
-            // The last record matches the time, so the empty poll was a fault.
-            Some(Ok(Some(record(41, REQUESTED_MILLIS)))),
-            Some(Ok(Some(record(41, REQUESTED_MILLIS + 1)))),
-            Some(Ok(None)),
-            None,
-        ];
-        for last in unproven {
-            let shown = format!("{last:?}");
-            let resp = lookup_answer(
-                &Mutex::default(),
-                "orders",
-                pending(lookup, 42, 42),
-                Ok(None),
-                last.as_ref(),
-            );
-            assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER, "{shown}");
-        }
-    }
-
-    #[test]
-    fn an_uncounted_partition_whose_last_record_matches_the_time_answers_retriable() {
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let last = Some(Ok(Some(record(41, REQUESTED_MILLIS + 1))));
-        let resp = lookup_answer(
-            &Mutex::default(),
-            "orders",
-            pending(time, 0, 42),
-            Ok(None),
-            last.as_ref(),
-        );
-        assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
-    }
-
-    #[test]
-    fn a_failed_first_poll_answers_like_a_failed_last_poll() {
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        for (error, code) in [
-            (BridgeError::Timeout, ERROR_REQUEST_TIMED_OUT),
-            (
-                BridgeError::InvalidConfig("bad".to_string()),
-                ERROR_NOT_LEADER_OR_FOLLOWER,
-            ),
-        ] {
-            let shown = format!("{error:?}");
-            let resp = lookup_answer(
-                &Mutex::default(),
-                "orders",
-                pending(time, 42, 42),
-                Err(error),
-                None,
-            );
-            assert_eq!(resp.error_code, code, "{shown}");
-        }
-    }
-
-    #[test]
-    fn a_failed_last_poll_answers_its_error_but_never_unknown_server_error() {
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        let failures = [
-            (BridgeError::Timeout, ERROR_REQUEST_TIMED_OUT),
-            (
-                BridgeError::InvalidConfig("bad".to_string()),
-                ERROR_NOT_LEADER_OR_FOLLOWER,
-            ),
-        ];
-        for (error, code) in failures {
-            let shown = format!("{error:?}");
-            let last = Some(Err(error));
-            let resp = lookup_answer(
-                &Mutex::default(),
-                "orders",
-                pending(time, 42, 42),
-                Ok(None),
-                last.as_ref(),
-            );
-            assert_eq!(resp.error_code, code, "{shown}");
-        }
-    }
-
     /// The polled node can lag the probed one and serve a last record below its high watermark.
     #[test]
     fn a_last_record_short_of_the_high_watermark_answers_retriable() {
         for retained in [0, 42] {
             let short = Ok(Some(record(40, REQUESTED_MILLIS)));
-            let resp = lookup_answer(
+            let resp = last_answer(
                 &Mutex::default(),
                 "orders",
-                pending(RecordLookup::Last, retained, 42),
+                pending(Lookup::Last, retained, 42),
                 short,
-                None,
             );
             assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER, "{retained}");
             let reaching = Ok(Some(record(41, REQUESTED_MILLIS)));
-            let resp = lookup_answer(
+            let resp = last_answer(
                 &Mutex::default(),
                 "orders",
-                pending(RecordLookup::Last, retained, 42),
+                pending(Lookup::Last, retained, 42),
                 reaching,
-                None,
             );
             assert_eq!(
                 answer(&resp),
@@ -1141,15 +1202,117 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_last_poll_while_messages_are_retained_answers_retriable() {
-        let resp = lookup_answer(
+    fn an_empty_last_poll_is_not_found_only_where_no_message_is_counted() {
+        let resp = last_answer(
             &Mutex::default(),
             "orders",
-            pending(RecordLookup::Last, 42, 42),
+            pending(Lookup::Last, 0, 42),
             Ok(None),
-            None,
+        );
+        assert_eq!(answer(&resp), (ERROR_NONE, -1, -1));
+        let resp = last_answer(
+            &Mutex::default(),
+            "orders",
+            pending(Lookup::Last, 42, 42),
+            Ok(None),
         );
         assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn a_last_record_below_the_deleted_records_watermark_is_not_found() {
+        let mut deleted = pending(Lookup::Last, 42, 42);
+        deleted.deleted_below = 42;
+        let resp = last_answer(
+            &Mutex::default(),
+            "orders",
+            deleted,
+            Ok(Some(record(41, REQUESTED_MILLIS))),
+        );
+        assert_eq!(answer(&resp), (ERROR_NONE, -1, -1));
+    }
+
+    /// Runs a [`TimeSearch`] over `log`, `(offset, timestamp)` in offset order with the offsets
+    /// retention removed left out, the way Iggy answers reads: the record at the offset, or the
+    /// first one after it. The found offset and the reads it took.
+    fn search(log: &[(i64, i64)], millis: i64, deleted_below: u64) -> (Option<i64>, usize) {
+        let last = log
+            .last()
+            .map(|&(offset, timestamp)| record(offset, timestamp));
+        let mut search = TimeSearch::new(millis, deleted_below, last);
+        let mut reads = 0;
+        while let Some(at) = search.next_read() {
+            reads += 1;
+            assert!(reads <= 70, "the search must end");
+            let at_or_after =
+                log.partition_point(|&(offset, _)| offset < i64::try_from(at).unwrap());
+            let (offset, timestamp) = log[at_or_after];
+            search.take(at, record(offset, timestamp));
+        }
+        (search.answer().map(|found| found.offset), reads)
+    }
+
+    /// A log of `len` records from offset 0, one a second from `start`.
+    fn steady(len: i64, start: i64) -> Vec<(i64, i64)> {
+        (0..len)
+            .map(|offset| (offset, start + offset * 1000))
+            .collect()
+    }
+
+    #[test]
+    fn a_time_search_finds_the_first_record_at_or_after_the_producer_timestamp() {
+        // A backfill: producer timestamps a day old, appended now.
+        let start = REQUESTED_MILLIS - 86_400_000;
+        let log = steady(100, start);
+        assert_eq!(search(&log, start, 0).0, Some(0));
+        assert_eq!(search(&log, start + 2000, 0).0, Some(2));
+        assert_eq!(search(&log, start + 2500, 0).0, Some(3));
+        assert_eq!(search(&log, start - 10_000, 0).0, Some(0));
+        assert_eq!(search(&log, start + 99_000, 0).0, Some(99));
+        assert_eq!(search(&log, start + 99_001, 0).0, None);
+    }
+
+    #[test]
+    fn a_time_search_takes_a_read_per_halving() {
+        let log = steady(1 << 20, 0);
+        let (found, reads) = search(&log, 777_777_000, 0);
+        assert_eq!(found, Some(777_777));
+        assert!(reads <= 21, "{reads} reads");
+    }
+
+    #[test]
+    fn a_time_search_skips_what_retention_removed_and_what_delete_records_deleted() {
+        // Retention removed offsets 0 to 9.
+        let log: Vec<_> = steady(50, 0).into_iter().skip(10).collect();
+        assert_eq!(search(&log, 0, 0).0, Some(10));
+        assert_eq!(search(&log, 15_000, 0).0, Some(15));
+        // DeleteRecords moved the start to 20.
+        assert_eq!(search(&log, 0, 20).0, Some(20));
+        assert_eq!(search(&log, 30_000, 20).0, Some(30));
+        assert_eq!(search(&log, 60_000, 20).0, None);
+    }
+
+    #[test]
+    fn a_time_search_with_nothing_to_search_is_not_found() {
+        assert_eq!(search(&[], 0, 0), (None, 0));
+        // Every record is below the DeleteRecords watermark.
+        assert_eq!(search(&steady(10, 0), 0, 10), (None, 0));
+    }
+
+    #[test]
+    fn a_time_search_over_timestamps_out_of_order_finds_a_record_at_or_after_the_time() {
+        let log = [(0, 100), (1, 300), (2, 200)];
+        let (found, _) = search(&log, 250, 0);
+        assert_eq!(found, Some(1));
+    }
+
+    #[test]
+    fn a_read_past_the_end_of_the_search_ends_it_below_that_read() {
+        let mut search = TimeSearch::new(0, 0, Some(record(9, 0)));
+        let at = search.next_read().unwrap();
+        // The node served a record past the last one the search knows of.
+        search.take(at, record(10, 0));
+        assert_eq!(search.high, at);
     }
 
     #[test]
@@ -1179,8 +1342,8 @@ mod tests {
         let later = Instant::now() + Duration::from_secs(5);
         let mut slot = bridge.fetch_slot(later).await;
         assert!(slot.is_some());
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        for lookup in [time, RecordLookup::Last] {
+        let time = Lookup::Time(REQUESTED_MILLIS);
+        for lookup in [time, Lookup::Last, Lookup::Earliest] {
             let passed = Instant::now();
             let resp = locate_one(
                 &bridge,

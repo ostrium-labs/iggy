@@ -53,10 +53,11 @@ it knows the server supports flexible encoding.
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
-| 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
-| 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST, a timestamp and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
+| 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s); `OFFSET_OUT_OF_RANGE` (1) below the log start offset. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
+| 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST (the log start offset), a timestamp (searched on the record timestamp) and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default at every version |
 | 20 | DeleteTopics | 1 | 5 | 1, 2, 3, 4, 5 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 (topic-id-based) not advertised - this bridge has no topic-id concept |
+| 21 | DeleteRecords | 0 | 2 | 0, 1, 2 | With a bridge: raises each partition's watermark, and answers the new log start offset (see "DeleteRecords and the log start offset" below). Without one: `NOT_LEADER_OR_FOLLOWER` (6). Flexible encoding at v2 |
 | 37 | CreatePartitions | 0 | 3 | 0, 1, 2, 3 | With a bridge: adds partitions to the Iggy topic through `create_partitions`; a count at or below the current one answers `INVALID_PARTITIONS` (37). Without one: stub returns `NOT_CONTROLLER` (41). Flexible encoding at v2+ |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
 | 9 | OffsetFetch | 1 | 9 | 1 … 9 | With a bridge: reads each offset, -1 when none is stored, and a null topic list reads every topic that holds the group. Without one: 14. Flexible encoding at v6+ |
@@ -161,7 +162,6 @@ All API keys not listed above close the connection (see Governance model above) 
 | 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
 | 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 48 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
-| 21 | DeleteRecords | Not advertised on purpose, see below |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
@@ -192,29 +192,37 @@ Three things enforce that, in the order a client meets them:
 An idempotent (non-transactional) producer is unaffected: it gets a producer id and works
 untouched, at at-least-once delivery. See [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
-### DeleteRecords is not advertised ([#3547](https://github.com/apache/iggy/issues/3547))
+### DeleteRecords and the log start offset ([#4525](https://github.com/apache/iggy/issues/4525))
 
-DeleteRecords (21) asks a broker to drop everything below an offset and to answer with the
-partition's new low watermark. Iggy cannot do either honestly:
+DeleteRecords (21) v0-2 asks a broker to drop everything below an offset and to answer with the
+partition's new low watermark. Iggy deletes whole segments only (`SegmentClient::delete_segments`)
+and exposes no low watermark at offset precision, so the gateway keeps one per partition:
 
-- It deletes whole segments only (`SegmentClient::delete_segments`), so a trim to an offset inside
-  a segment would delete less than asked or more than asked.
-- It exposes no log-start offset, the same gap that makes ListOffsets answer `EARLIEST` with `0`
-  (see the ListOffsets entry under Phase 2 below). A reported low watermark would be contradicted
-  by the next ListOffsets call.
-
-Leaving the key out of ApiVersions is how the Kafka protocol says a broker does not support an
-API, and it is the better answer than a stub. A client checks the advertised keys before sending,
-so `Admin.deleteRecords()` fails at once with `UnsupportedVersionException` and librdkafka with
-`RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE`, without a request ever reaching the gateway. A stub
-could answer `UNSUPPORTED_VERSION` or `POLICY_VIOLATION` per partition, the latter being what a
-real broker returns for a compacted topic. But it would advertise an API that fails on every
-partition, add a decode and encode path for it, and make ApiVersions claim a capability that does
-not exist.
-
-Real support needs Iggy to expose a log-start offset that segment deletion and retention both
-advance. Its internal delete watermark (`deleted_up_to_offset`) is neither readable by clients
-nor moved by retention. That is the same core change the ListOffsets `EARLIEST` gap needs, and DeleteRecords can follow it.
+- **Where.** An offset of the Iggy consumer group `kafka.logstart` on the topic, in the external
+  group kind that Kafka group offsets use ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Iggy
+  replicates it, does not range-check it, does not hold retention back for it, and deletes it with
+  the topic. The prefix is not `kafka.cg.`, so no Kafka group lists it. An Iggy client sees it
+  among the groups of the topic.
+- **DeleteRecords.** `-1` deletes up to the high watermark. An offset past the high watermark, or
+  any other negative offset, answers `OFFSET_OUT_OF_RANGE` (1). An offset below the start offset
+  leaves it. The answer is the new start offset. The principal needs `manage_topics`, as for
+  DeleteTopics. Writes on one gateway run one at a time and never lower the watermark.
+- **Log start offset.** The watermark, or the first offset retention kept if that is higher.
+  `ListOffsets` EARLIEST reads the first record Iggy keeps and answers the higher of the two.
+  Fetch reports it in `log_start_offset`, from the probe's message count, and `-1` where the
+  count cannot tell (a count of 0 below a high watermark, or a load).
+- **Reads below it.** Fetch answers `OFFSET_OUT_OF_RANGE` (1) below the watermark, and below the
+  first record retention kept, as a Kafka broker does below its log start offset. Lookups by time
+  start at the watermark.
+- **Disk.** Iggy keeps the records below the watermark until retention removes their segment.
+  Kafka frees only whole segments below its log start offset too, but on its own schedule, so a
+  Kafka Streams repartition topic created with `retention.ms=-1` shrinks for every reader here
+  and not on disk. Freeing the segments wholly below the watermark needs an Iggy change that can
+  delete to an offset (the server's `TruncatePartition` watermark is offset-precise already; its
+  client command takes a segment count).
+- **Other gateways.** Each probe reads the watermarks again when its copy is over 5 s old, one
+  call per topic when the topic has none. So a DeleteRecords through one gateway shows on another
+  within 5 s, and on the same gateway at once.
 
 ---
 
@@ -452,18 +460,13 @@ below it are still open for the issues that build on top of it.
       reproduction against a real `kcat` before it's re-closed.
 - [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::partition_probes` and
-      `EARLIEST` answers `0`. A timestamp answers the first record Iggy appended at or after it,
-      and `MAX_TIMESTAMP` (v7) the last record ([#4516](https://github.com/apache/iggy/issues/4516));
-      `BRIDGE_MAPPING.md` has the difference from Kafka on `CreateTime` topics.
+      `EARLIEST` the log start offset ([#4525](https://github.com/apache/iggy/issues/4525), see
+      "DeleteRecords and the log start offset" above). A timestamp answers the first record whose
+      timestamp, the producer's on a `CreateTime` topic, is at or after it, and `MAX_TIMESTAMP`
+      (v7) the last record ([#4516](https://github.com/apache/iggy/issues/4516));
+      `BRIDGE_MAPPING.md` has how the search runs.
       `src/protocol/handlers/list_offsets.rs`, `tests/list_offsets_real_bridge_tests.rs`. With the
       bridge off, the stub from #3421 answers `NOT_LEADER_OR_FOLLOWER` (6) as before.
-  - `EARLIEST = 0` is real *only* for a partition this bridge has never had retention trim: Iggy
-    tracks no rolling low-watermark distinct from partition creation, so once a partition is
-    old enough for retention to purge its first segment, `0` names a log-start offset that no
-    longer exists - a real consumer with `auto.offset.reset=earliest` seeks into a hole. Not
-    fixable client-side; needs the bridge to expose a real start offset. Fetch at an offset in
-    that hole reads from the oldest kept message, so the consumer skips the gap. If none is kept,
-    Fetch serves no records until the next write.
   - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
     still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
     one topic probe before any bridge work starts, and every topic gets that probe whatever its

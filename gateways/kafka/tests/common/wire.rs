@@ -45,7 +45,7 @@ pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
 }
 
 /// Admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(21, "DeleteRecords")];
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(24, "AddPartitionsToTxn")];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {

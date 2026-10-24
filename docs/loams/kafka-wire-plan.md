@@ -196,7 +196,7 @@ breadth. Status is `Planned` unless noted.
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
-| KW-7 | Real log start offset and DeleteRecords | #4525 | Planned | KW-1 | Yes |
+| KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | Planned | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned | KW-9 | Yes (design first) |
@@ -568,6 +568,28 @@ topic shrinking in the nightly matrix.
 it, gateway vs Apache Kafka.
 
 **Exit.** #4525's acceptance criteria pass.
+
+**As built (2026-10-23).** Gateway-only; no Iggy wire change, so nothing on the
+STOP list. The watermark is an external-group offset of the Iggy group
+`kafka.logstart` on each topic (`bridge/iggy_bridge/log_start.rs`): replicated
+by Iggy, read again by each gateway every 5 s, raised at once on the gateway
+that wrote it. DeleteRecords v0-2 (`handlers/delete_records.rs`); EARLIEST
+reads the first kept record and answers the higher of it and the watermark;
+Fetch answers `OFFSET_OUT_OF_RANGE` below the watermark and below the first
+kept record (it used to read from the oldest kept one), and reports
+`log_start_offset`. Lookups by time are a binary search on the record
+timestamp Fetch shows (the producer's on `CreateTime`), about 30 reads per
+billion records, exact when timestamps do not decrease along the log; the
+four #4516 declared differences and `fetch.log_start_offset` are gone from
+`allowed_differences.toml`, and the `delete_records` oracle scenario diffs
+DeleteRecords, EARLIEST, a Fetch below and at the new start against Apache
+Kafka. Acceptance criteria: 1 and 2 pass (real-bridge tests
+`delete_records_real_bridge_tests.rs`); 3 (Streams repartition topics shrink)
+holds for readers, not on disk: Iggy deletes whole segments by count only, so
+freeing segments wholly below the watermark needs an Iggy command that trims
+to an offset (`TruncatePartition` is offset-precise inside the server). That
+is an owner decision (new client command), and the nightly Streams check
+waits for KW-2's matrix.
 
 ### KW-8. Newer protocol versions and topic ids
 

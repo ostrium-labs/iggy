@@ -252,6 +252,9 @@ pub struct PartitionProbe {
     pub average_size: u64,
     /// 0 when retention removed every message, or when the server has no stats for the partition.
     pub messages_count: u64,
+    /// The `DeleteRecords` watermark: Kafka clients see no record below it. 0 when none was set.
+    /// See `log_start.rs`.
+    pub deleted_below: u64,
 }
 
 impl PartitionProbe {
@@ -263,6 +266,28 @@ impl PartitionProbe {
     #[must_use]
     pub const fn is_loading(&self) -> bool {
         self.messages_count > self.high_watermark
+    }
+
+    /// The log start offset Fetch reports: the `DeleteRecords` watermark, or the first offset
+    /// retention kept, by the count, if that is higher. `None` when neither is known: a count of
+    /// 0 below a high watermark is retention that removed every message or a server with no
+    /// stats, and a load counts more messages than offsets.
+    ///
+    /// The count and the high watermark are read apart, so a write between them can move the
+    /// estimate by a batch. Nothing decides on it: `ListOffsets` EARLIEST reads the first record.
+    #[must_use]
+    pub const fn log_start(&self) -> Option<u64> {
+        let retained = if self.is_loading() || (self.messages_count == 0 && self.high_watermark > 0)
+        {
+            None
+        } else {
+            Some(self.high_watermark - self.messages_count)
+        };
+        match retained {
+            Some(retained) if retained >= self.deleted_below => Some(retained),
+            _ if self.deleted_below > 0 => Some(self.deleted_below),
+            retained => retained,
+        }
     }
 }
 
@@ -276,6 +301,7 @@ impl From<&Partition> for PartitionProbe {
                 .checked_div(partition.messages_count)
                 .unwrap_or(0),
             messages_count: partition.messages_count,
+            deleted_below: 0,
         }
     }
 }
@@ -284,6 +310,9 @@ impl From<&Partition> for PartitionProbe {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopicProbe {
     partitions: Vec<(u32, PartitionProbe)>,
+    /// When Iggy created the topic, in microseconds, so a topic deleted and created again under
+    /// the same name keeps none of its old `DeleteRecords` watermarks. 0 when not known.
+    created_at: u64,
 }
 
 impl TopicProbe {
@@ -300,13 +329,32 @@ impl TopicProbe {
     pub fn partitions_count(&self) -> u32 {
         u32::try_from(self.partitions.len()).unwrap_or(u32::MAX)
     }
+
+    pub(super) const fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Each partition id, in order.
+    pub(super) fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.partitions.iter().map(|&(id, _)| id)
+    }
+
+    /// Sets each partition's [`PartitionProbe::deleted_below`] from `below`, by id.
+    pub(super) fn set_deleted_below(&mut self, below: impl Fn(u32) -> u64) {
+        for (id, probe) in &mut self.partitions {
+            probe.deleted_below = below(*id);
+        }
+    }
 }
 
 impl FromIterator<(u32, PartitionProbe)> for TopicProbe {
     fn from_iter<I: IntoIterator<Item = (u32, PartitionProbe)>>(partitions: I) -> Self {
         let mut partitions: Vec<_> = partitions.into_iter().collect();
         partitions.sort_unstable_by_key(|&(id, _)| id);
-        Self { partitions }
+        Self {
+            partitions,
+            created_at: 0,
+        }
     }
 }
 
@@ -328,15 +376,17 @@ impl IggyBridge {
     /// [`BridgeError::Timeout`] past `REQUEST_TIMEOUT`.
     pub(crate) async fn probe(&self, kafka_topic: &str) -> Result<TopicProbe, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
-        let probe = self.probe_target(&target).await?;
+        let mut probe = self.probe_target(&target).await?;
         // A load lasts. A commit that raced the read does not.
         if probe
             .partitions
             .iter()
             .any(|(_, partition)| partition.is_loading())
         {
-            return self.probe_target(&target).await;
+            probe = self.probe_target(&target).await?;
         }
+        self.stamp_deleted_below(kafka_topic, &target, &mut probe)
+            .await;
         Ok(probe)
     }
 
@@ -358,11 +408,13 @@ impl IggyBridge {
                     target.stream_id.to_string(),
                 ))
             })?;
-        Ok(details
+        let mut probe: TopicProbe = details
             .partitions
             .iter()
             .map(|partition| (partition.id, PartitionProbe::from(partition)))
-            .collect())
+            .collect();
+        probe.created_at = details.created_at.as_micros();
+        Ok(probe)
     }
 
     /// Reads up to `count` messages of `partition`, from `offset` on, with the client of `slot`.
@@ -673,6 +725,7 @@ mod tests {
             high_watermark,
             average_size: 1,
             messages_count: high_watermark,
+            deleted_below: 0,
         };
         let topic: TopicProbe = [(2, probe(20)), (0, probe(0)), (5, probe(50))]
             .into_iter()
