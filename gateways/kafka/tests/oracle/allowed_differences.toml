@@ -129,3 +129,19 @@ scenario = "describe_configs"
 fact = "cleanup.policy.read_only"
 issue = "apache/iggy#4508"
 reason = "cleanup.policy is left out until a policy is stored per topic"
+
+# After a restart the gateway still deduplicates a retry of an older batch.
+[[difference]]
+scenario = "idempotent_restart"
+fact = "retry_first.error"
+oracles = ["kafka"]
+issue = "apache/iggy#4513"
+reason = "Kafka keeps the last 5 batches per producer in memory, but its snapshot restores only the last one, so after a restart a retry of an older batch gets OUT_OF_ORDER_SEQUENCE_NUMBER (45). The gateway rebuilds all 5 from the kafka.p log markers and deduplicates the retry, answering its original offset. That is the answer Kafka gives without a restart, and nothing is written twice."
+
+# After a restart the gateway still deduplicates a retry of an older batch.
+[[difference]]
+scenario = "idempotent_restart"
+fact = "retry_first.base_offset"
+oracles = ["kafka"]
+issue = "apache/iggy#4513"
+reason = "Kafka keeps the last 5 batches per producer in memory, but its snapshot restores only the last one, so after a restart a retry of an older batch gets OUT_OF_ORDER_SEQUENCE_NUMBER (45). The gateway rebuilds all 5 from the kafka.p log markers and deduplicates the retry, answering its original offset. That is the answer Kafka gives without a restart, and nothing is written twice."
