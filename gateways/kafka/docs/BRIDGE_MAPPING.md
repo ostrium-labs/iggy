@@ -499,10 +499,9 @@ Default: always emit uncompressed, and revisit when a benchmark says it matters.
 
 ### Not asked here
 
-A Kafka `retention.ms` topic config could map onto Iggy's `message_expiry` at creation time.
-`ensure_stream_and_topic` leaves topics on the server default, which never expires. That belongs
-to CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), which owns topic
-configuration, rather than to the record mapping.
+Topic configurations, including `retention.ms` onto Iggy's `message_expiry` at creation time,
+belong to CreateTopics and the config APIs ([`CONFIGS.md`](CONFIGS.md)), not to the record
+mapping. `ensure_stream_and_topic` leaves topics on the server default, which never expires.
 
 ## References
 

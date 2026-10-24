@@ -295,7 +295,15 @@ async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
         text.contains("retention.ms=-1 source=DEFAULT_CONFIG"),
         "{text}"
     );
-    assert!(text.contains("cleanup.policy=absent"), "{text}");
+    assert!(
+        text.contains("cleanup.policy=delete source=DEFAULT_CONFIG"),
+        "{text}"
+    );
+    assert!(text.contains("configs_described=33"), "{text}");
+    assert!(
+        text.contains("connect_topic_cleanup.policy=compact source=DYNAMIC_TOPIC_CONFIG"),
+        "{text}"
+    );
     assert!(
         text.contains("unknown_key_rejected=InvalidConfigurationException"),
         "{text}"

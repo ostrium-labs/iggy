@@ -258,7 +258,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
-- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs, AlterConfigs and IncrementalAlterConfigs for topic `retention.ms`
+- [docs/CONFIGS.md](docs/CONFIGS.md) — topic configurations on CreateTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs: which Iggy honours and which it stores and echoes
 
 ### Delivery guarantees
 
@@ -652,9 +652,10 @@ call created it." A *different* `partition_count` against an already-existing to
 two concurrent callers requesting different counts for the same topic must not both see success.
 
 Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
-default. `AlterConfigs` or `IncrementalAlterConfigs` can set that expiry afterwards through `retention.ms`
-([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does, messages never expire, so a Kafka app
-that assumes the 7-day default will accumulate data on this bridge.
+default. `CreateTopics` can set it with `retention.ms`, and `AlterConfigs` or
+`IncrementalAlterConfigs` afterwards ([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does,
+messages never expire, so a Kafka app that assumes the 7-day default will accumulate data on this
+bridge.
 
 They also use Iggy's default **durability**, `Durability::Replicated` - quorum commit without an
 additional stable-storage barrier, with the disk write itself threshold-gated (flushed at 1024
@@ -712,7 +713,7 @@ topics that rely on creation by first use then work without a `CreateTopics` cal
   rights still gets a new stream when the mapping names one that does not exist yet.
 - Like every topic the gateway creates, an auto-created topic has no message expiry (see
   [Provisioning and idempotency](#provisioning-and-idempotency)): its messages are kept until a
-  client sets `retention.ms` with `AlterConfigs`.
+  client sets `retention.ms` with `AlterConfigs` or `IncrementalAlterConfigs`.
 - Shutdown cancels the creations still running before the bridge signs out, and drops their
   client if any was running, so the sign-out does not wait behind it. An embedder that builds its
   own `GatewayState` calls `shutdown_auto_topic_creation` before closing the bridge.

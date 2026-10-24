@@ -27,6 +27,7 @@ import org.apache.kafka.clients.admin.AlterConfigOp;
 import org.apache.kafka.clients.admin.AlterConfigsOptions;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.InvalidConfigurationException;
 
@@ -60,12 +61,30 @@ public final class ConfigsProbe {
                     retention.source() == ConfigEntry.ConfigSource.DEFAULT_CONFIG,
                     "initial retention source");
             require(!retention.isReadOnly(), "retention.ms is writable");
-            // Kafka Connect refuses an internal topic that reports any cleanup.policy other
-            // than compact, and starts when the entry is missing.
-            require(before.get("cleanup.policy") == null, "cleanup.policy is not reported");
+            ConfigEntry policy = before.get("cleanup.policy");
+            require(policy != null && "delete".equals(policy.value()), "initial cleanup.policy");
+            require(
+                    policy.source() == ConfigEntry.ConfigSource.DEFAULT_CONFIG,
+                    "initial cleanup.policy source");
             System.out.println(
                     "retention.ms=" + retention.value() + " source=" + retention.source());
-            System.out.println("cleanup.policy=absent");
+            System.out.println("cleanup.policy=" + policy.value() + " source=" + policy.source());
+            System.out.println("configs_described=" + before.entries().size());
+
+            // Kafka Connect's internal topics: compact, replication factor 3, then the policy
+            // check Connect runs on them (TopicAdmin.verifyTopicCleanupPolicyOnlyCompact).
+            String internal = topic + "-connect-offsets";
+            admin.createTopics(List.of(new NewTopic(internal, 1, (short) 3)
+                            .configs(Map.of("cleanup.policy", "compact"))))
+                    .all()
+                    .get();
+            ConfigResource internalResource = new ConfigResource(ConfigResource.Type.TOPIC, internal);
+            ConfigEntry compact = describe(admin, internalResource).get("cleanup.policy");
+            require("compact".equals(compact.value()), "connect topic is compact");
+            require(
+                    compact.source() == ConfigEntry.ConfigSource.DYNAMIC_TOPIC_CONFIG,
+                    "connect topic policy source");
+            System.out.println("connect_topic_cleanup.policy=" + compact.value() + " source=" + compact.source());
 
             try {
                 admin.alterConfigs(Map.of(resource, config("no.such", "1"))).all().get();

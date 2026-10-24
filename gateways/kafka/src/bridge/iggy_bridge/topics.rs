@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iggy::prelude::{
-    Identifier, IggyClient, IggyError, IggyExpiry, PartitionClient, StreamClient,
+    Identifier, IggyByteSize, IggyClient, IggyError, PartitionClient, StreamClient,
     StreamCreateOptions, Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 use super::{IggyBridge, REQUEST_TIMEOUT, metadata_write_on, with_request_timeout};
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::protocol::handlers::topic_config::message_expiry_is_explicit;
+use crate::protocol::handlers::kafka_topic_configs::{TopicConfigSnapshot, TopicWrite};
 
 /// Partitions of a topic whose creator leaves the count to the broker: Kafka's own
 /// `num.partitions` default.
@@ -352,27 +352,34 @@ impl IggyBridge {
         with_request_timeout(client.get_topic(&stream_id, &topic_id)).await
     }
 
-    /// Sets `message_expiry` on the Iggy topic backing `kafka_topic`.
+    /// Writes one Kafka configuration change onto the Iggy topic backing `kafka_topic`.
     ///
-    /// Does not create the topic and does not rename it.
+    /// Does not create the topic and does not rename it. A `write` that changes nothing is not
+    /// sent: Iggy refuses an update with nothing in it.
     ///
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
     /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
-    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity, auth, or a
-    /// missing topic.
-    pub async fn update_kafka_topic_message_expiry(
+    /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity, auth, a missing
+    /// topic, or an option value Iggy refuses.
+    pub async fn update_kafka_topic_configs(
         &self,
         kafka_topic: &str,
-        message_expiry: IggyExpiry,
+        write: &TopicWrite,
     ) -> Result<(), BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        if write.is_empty() {
+            return Ok(());
+        }
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
         let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
         let options = TopicUpdateOptions {
-            message_expiry: Some(message_expiry),
+            message_expiry: write.message_expiry,
+            max_topic_size: write.max_topic_size,
+            reset: write.reset.clone(),
+            raw: write.raw_options(),
             ..TopicUpdateOptions::default()
         };
         self.metadata_write(|| self.client.update_topic(&stream_id, &topic_id, &options))
@@ -472,7 +479,24 @@ impl IggyBridge {
         kafka_topic: &str,
         partition_count: u32,
     ) -> Result<TopicCreationOutcome, BridgeError> {
-        self.create_kafka_topic_on(&self.client, kafka_topic, partition_count)
+        self.create_kafka_topic_with(kafka_topic, partition_count, &TopicWrite::default())
+            .await
+    }
+
+    /// [`Self::create_kafka_topic`], storing the topic options `configs` plans from the
+    /// request's Kafka configurations.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::create_kafka_topic`], plus [`BridgeError::Iggy`] for an option value
+    /// Iggy refuses.
+    pub async fn create_kafka_topic_with(
+        &self,
+        kafka_topic: &str,
+        partition_count: u32,
+        configs: &TopicWrite,
+    ) -> Result<TopicCreationOutcome, BridgeError> {
+        self.create_kafka_topic_on(&self.client, kafka_topic, partition_count, configs)
             .await
     }
 
@@ -492,8 +516,13 @@ impl IggyBridge {
         partition_count: u32,
     ) -> Result<TopicCreationOutcome, BridgeError> {
         let create = |connected: Arc<IggyClient>| async move {
-            self.create_kafka_topic_on(&connected, kafka_topic, partition_count)
-                .await
+            self.create_kafka_topic_on(
+                &connected,
+                kafka_topic,
+                partition_count,
+                &TopicWrite::default(),
+            )
+            .await
         };
         self.auto_create_client
             .until(&self.config, Instant::now() + AUTO_CREATE_LIMIT, create)
@@ -514,6 +543,7 @@ impl IggyBridge {
         client: &IggyClient,
         kafka_topic: &str,
         partition_count: u32,
+        configs: &TopicWrite,
     ) -> Result<TopicCreationOutcome, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
         if partition_count == 0 {
@@ -526,6 +556,10 @@ impl IggyBridge {
 
         let options = TopicCreateOptions {
             partitions_count: Some(partition_count),
+            message_expiry: configs.message_expiry,
+            max_topic_size: configs.max_topic_size,
+            segment_size: configs.segment_size.map(IggyByteSize::from),
+            raw: configs.raw_options(),
             ..TopicCreateOptions::default()
         };
         let create_topic = || {
@@ -730,18 +764,6 @@ fn stream_ensured<T>(
     }
 }
 
-/// `message_expiry` and whether it was set explicitly, from one `get_topics` row.
-///
-/// Enough for `DescribeConfigs`. The partition list on `TopicDetails` is not loaded. Only
-/// [`message_expiry_is_explicit`] of the full `ResourceOptions` map a row carries is ever read
-/// downstream, so this stores that one bit instead of cloning the whole map into the cache for
-/// every topic in the stream, including every topic no describe ever names.
-#[derive(Debug, Clone, Copy)]
-pub struct TopicConfigSnapshot {
-    pub message_expiry: IggyExpiry,
-    pub message_expiry_explicit: bool,
-}
-
 /// One stream's `get_topics` result, shared by every Kafka name that resolves there.
 #[derive(Debug, Default)]
 pub struct StreamTopicCache {
@@ -827,15 +849,15 @@ async fn load_stream(
             let ready = topics
                 .into_iter()
                 .map(|topic| {
-                    let message_expiry_explicit = message_expiry_is_explicit(&topic.options);
-                    let message_expiry = topic.resolved_options().message_expiry;
-                    (
-                        topic.name,
-                        TopicConfigSnapshot {
-                            message_expiry,
-                            message_expiry_explicit,
-                        },
-                    )
+                    let resolved = topic.resolved_options();
+                    let snapshot = TopicConfigSnapshot::from_options(
+                        topic.partitions_count,
+                        &topic.options,
+                        resolved.message_expiry,
+                        resolved.max_topic_size,
+                        resolved.runtime.effective_segment_size().as_bytes_u64(),
+                    );
+                    (topic.name, snapshot)
                 })
                 .collect();
             StreamLoad::Ready(ready)

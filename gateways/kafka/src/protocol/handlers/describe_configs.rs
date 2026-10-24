@@ -20,7 +20,6 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::IggyExpiry;
 use kafka_protocol::messages::DescribeConfigsRequest;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::describe_configs_response::{
@@ -30,7 +29,7 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{IggyBridge, StreamTopicCache, TopicLoad};
+use crate::bridge::{DEFAULT_TOPIC_PARTITIONS, IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
     API_KEY_DESCRIBE_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
     ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
@@ -38,15 +37,20 @@ use crate::protocol::api::{
     REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
+use crate::protocol::handlers::create_topics::SINGLE_BROKER_ID;
+use crate::protocol::handlers::kafka_topic_configs::{
+    ConfigType, TOPIC_CONFIGS, TopicConfigSnapshot,
+};
 use crate::protocol::handlers::topic_config::{
-    CONFIG_SOURCE_TOPIC, CONFIG_TYPE_LONG, ListedKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC,
-    RETENTION_DOC, RETENTION_MS, bridge_failure, listed_keys, name_reason, retention_ms,
-    topic_cap_and_duplicates, topic_cap_message,
+    CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC, RESOURCE_TYPE_BROKER, RESOURCE_TYPE_TOPIC,
+    bridge_failure, name_reason, topic_cap_and_duplicates, topic_cap_message,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
     unsupported_version_response,
 };
+
+const ONLY_TOPIC_AND_BROKER_RESOURCES: &str = "only topic and broker resources are supported";
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_DESCRIBE_CONFIGS,
@@ -112,7 +116,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     };
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let results = describe_all(bridge, &req, &duplicate_names, deadline).await;
+    let results = describe_all(state, bridge, &req, &duplicate_names, deadline).await;
     respond_or_close(
         encode_message(&response(results), api_version, 256),
         "DescribeConfigs",
@@ -141,6 +145,7 @@ fn response(results: Vec<DescribeConfigsResult>) -> DescribeConfigsResponse {
 }
 
 async fn describe_all(
+    state: &GatewayState,
     bridge: &IggyBridge,
     req: &DescribeConfigsRequest,
     duplicate_names: &HashSet<&str>,
@@ -179,6 +184,7 @@ async fn describe_all(
         }
 
         let result = describe_one(
+            state,
             bridge,
             &mut cache,
             resource,
@@ -195,17 +201,21 @@ async fn describe_all(
 }
 
 async fn describe_one(
+    state: &GatewayState,
     bridge: &IggyBridge,
     cache: &mut StreamTopicCache,
     resource: &DescribeConfigsResource,
     include_documentation: bool,
     deadline: Instant,
 ) -> DescribeConfigsResult {
+    if resource.resource_type == RESOURCE_TYPE_BROKER {
+        return describe_broker(state, resource, include_documentation);
+    }
     if resource.resource_type != RESOURCE_TYPE_TOPIC {
         return resource_error(
             resource,
             ERROR_INVALID_REQUEST,
-            Some(StrBytes::from_static_str(ONLY_TOPIC_RESOURCES)),
+            Some(StrBytes::from_static_str(ONLY_TOPIC_AND_BROKER_RESOURCES)),
             Vec::new(),
         );
     }
@@ -237,8 +247,7 @@ async fn describe_one(
     };
 
     let (configs, unrepresentable) = described_entries(
-        snapshot.message_expiry,
-        snapshot.message_expiry_explicit,
+        snapshot,
         resource.configuration_keys.as_deref(),
         include_documentation,
     );
@@ -256,45 +265,148 @@ async fn describe_one(
     resource_error(resource, ERROR_NONE, None, configs)
 }
 
+/// Whether `name` is selected by `configuration_keys`: a null or empty list selects every
+/// name.
+fn selected(configuration_keys: Option<&[StrBytes]>, name: &str) -> bool {
+    configuration_keys
+        .filter(|keys| !keys.is_empty())
+        .is_none_or(|keys| keys.iter().any(|key| key.as_str() == name))
+}
+
+/// Every Kafka topic configuration `configuration_keys` selects, sorted by name, and whether the
+/// stored expiry could not be shown as `retention.ms`.
+///
+/// A name Kafka does not define is omitted, as Kafka omits it, and a name repeated in the
+/// request is returned once. A configuration the topic sets is `DYNAMIC_TOPIC_CONFIG`, any other
+/// `DEFAULT_CONFIG` with the value this gateway applies.
 #[must_use]
 fn described_entries(
-    message_expiry: IggyExpiry,
-    message_expiry_explicit: bool,
+    snapshot: &TopicConfigSnapshot,
     configuration_keys: Option<&[StrBytes]>,
     include_documentation: bool,
 ) -> (Vec<DescribeConfigsResourceResult>, bool) {
-    let retention = retention_ms(message_expiry, message_expiry_explicit);
-    let keys = listed_keys(configuration_keys);
     let mut unrepresentable = false;
-    let mut configs = Vec::with_capacity(keys.len());
-    for key in keys {
-        match key {
-            ListedKey::Retention => {
-                let (value, source) = retention.as_ref().map_or_else(
-                    |()| {
-                        // A stored duration that cannot be shown as retention.ms is still the
-                        // topic's expiry, not the never-expire default.
-                        unrepresentable = true;
-                        (None, CONFIG_SOURCE_TOPIC)
-                    },
-                    |retention| (Some(retention.value.as_str()), retention.source),
-                );
-                configs.push(config_entry(
-                    RETENTION_MS,
-                    value,
-                    false,
-                    source,
-                    CONFIG_TYPE_LONG,
-                    include_documentation.then_some(RETENTION_DOC),
-                ));
+    let mut configs = Vec::new();
+    for key in TOPIC_CONFIGS
+        .iter()
+        .filter(|key| selected(configuration_keys, key.name))
+    {
+        let (value, source) = match snapshot.describe(key) {
+            Ok((value, explicit)) => (
+                Some(value),
+                if explicit {
+                    CONFIG_SOURCE_TOPIC
+                } else {
+                    CONFIG_SOURCE_DEFAULT
+                },
+            ),
+            // A stored duration that cannot be shown as retention.ms is still the topic's
+            // expiry, not the never-expire default.
+            Err(()) => {
+                unrepresentable = true;
+                (None, CONFIG_SOURCE_TOPIC)
             }
-            // A resource error makes clients drop every returned config, including
-            // retention.ms. An unmodeled name is omitted and the resource stays successful.
-            ListedKey::Unknown => {}
-        }
+        };
+        configs.push(config_entry(
+            key.name,
+            value.as_deref(),
+            false,
+            source,
+            key.config_type.code(),
+            include_documentation.then_some(key.documentation),
+        ));
     }
     (configs, unrepresentable)
 }
+
+/// The fixed configuration this gateway reports for its one broker, node 1.
+///
+/// Strimzi's Topic Operator and UIs read these at startup. They describe what the gateway does;
+/// none can be altered. `inter.broker.protocol.version` is left out on purpose: kafka-ui picks
+/// its alter API from it.
+fn broker_configs(state: &GatewayState) -> [(&'static str, String, ConfigType); 11] {
+    [
+        (
+            "auto.create.topics.enable",
+            state.auto_topic_creation.is_some().to_string(),
+            ConfigType::Boolean,
+        ),
+        (
+            "compression.type",
+            "producer".to_string(),
+            ConfigType::String,
+        ),
+        (
+            "default.replication.factor",
+            "1".to_string(),
+            ConfigType::Int,
+        ),
+        (
+            "delete.topic.enable",
+            "true".to_string(),
+            ConfigType::Boolean,
+        ),
+        ("log.cleanup.policy", "delete".to_string(), ConfigType::List),
+        ("log.retention.bytes", "-1".to_string(), ConfigType::Long),
+        ("log.retention.ms", "-1".to_string(), ConfigType::Long),
+        (
+            "log.segment.bytes",
+            iggy::prelude::DEFAULT_SEGMENT_SIZE.to_string(),
+            ConfigType::Int,
+        ),
+        ("min.insync.replicas", "1".to_string(), ConfigType::Int),
+        (
+            "num.partitions",
+            DEFAULT_TOPIC_PARTITIONS.to_string(),
+            ConfigType::Int,
+        ),
+        (
+            "unclean.leader.election.enable",
+            "false".to_string(),
+            ConfigType::Boolean,
+        ),
+    ]
+}
+
+fn describe_broker(
+    state: &GatewayState,
+    resource: &DescribeConfigsResource,
+    include_documentation: bool,
+) -> DescribeConfigsResult {
+    let name = resource.resource_name.as_str();
+    // An empty name is the cluster-wide dynamic default set, and this gateway has none.
+    if name.is_empty() {
+        return resource_error(resource, ERROR_NONE, None, Vec::new());
+    }
+    if name != SINGLE_BROKER_ID.to_string() {
+        return resource_error(
+            resource,
+            ERROR_INVALID_REQUEST,
+            Some(StrBytes::from(format!(
+                "this gateway is broker {SINGLE_BROKER_ID}, not {name}"
+            ))),
+            Vec::new(),
+        );
+    }
+    let configs = broker_configs(state)
+        .into_iter()
+        .filter(|(key, _, _)| selected(resource.configuration_keys.as_deref(), key))
+        .map(|(key, value, config_type)| {
+            config_entry(
+                key,
+                Some(&value),
+                true,
+                CONFIG_SOURCE_DEFAULT,
+                config_type.code(),
+                include_documentation.then_some(BROKER_DOC),
+            )
+        })
+        .collect();
+    resource_error(resource, ERROR_NONE, None, configs)
+}
+
+const BROKER_DOC: &str =
+    "Fixed by the Kafka gateway; it describes what the gateway does and cannot be altered.";
 
 fn config_entry(
     name: &str,
@@ -331,150 +443,126 @@ fn resource_error(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use iggy::prelude::{
-        HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, OptionValue,
-        ResourceOptions, TopicDetails, topic_option_keys,
-    };
     use kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
     use kafka_protocol::protocol::StrBytes;
 
-    use super::described_entries;
-    use crate::protocol::handlers::topic_config::{
-        CLEANUP_POLICY, RETENTION_MS, message_expiry_is_explicit, parse_retention_ms,
-    };
+    use iggy::prelude::{CleanupPolicy, IggyDuration, IggyExpiry};
 
-    fn topic_details(expiry: IggyExpiry, explicit: bool) -> TopicDetails {
-        let mut options = ResourceOptions::new();
-        let key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).expect("expiry key");
-        let value = HeaderValue::from(u64::from(expiry));
-        let option = if explicit {
-            OptionValue::explicit(value)
-        } else {
-            OptionValue::derived(value)
-        };
-        options.insert(key, option);
-        TopicDetails {
-            id: 1,
-            created_at: IggyTimestamp::default(),
-            name: "orders".to_string(),
-            size: IggyByteSize::default(),
-            messages_count: 0,
-            partitions_count: 1,
-            partitions: Vec::new(),
-            options,
+    use super::described_entries;
+    use crate::protocol::handlers::kafka_topic_configs::{
+        CLEANUP_POLICY, RETENTION_MS, TOPIC_CONFIGS, TopicConfigSnapshot,
+    };
+    use crate::protocol::handlers::topic_config::{CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC};
+
+    fn expiring(millis: u64) -> TopicConfigSnapshot {
+        TopicConfigSnapshot {
+            message_expiry: IggyExpiry::ExpireDuration(IggyDuration::from(millis * 1_000)),
+            message_expiry_explicit: true,
+            ..TopicConfigSnapshot::default()
         }
     }
 
-    fn entries(
-        details: &TopicDetails,
-        configuration_keys: Option<&[StrBytes]>,
-        include_documentation: bool,
-    ) -> (Vec<DescribeConfigsResourceResult>, bool) {
-        described_entries(
-            details.resolved_options().message_expiry,
-            message_expiry_is_explicit(&details.options),
-            configuration_keys,
-            include_documentation,
-        )
+    fn entry<'a>(
+        configs: &'a [DescribeConfigsResourceResult],
+        name: &str,
+    ) -> Option<&'a DescribeConfigsResourceResult> {
+        configs.iter().find(|config| config.name.as_str() == name)
     }
 
     fn value_of<'a>(configs: &'a [DescribeConfigsResourceResult], name: &str) -> Option<&'a str> {
-        configs
-            .iter()
-            .find(|config| config.name.as_str() == name)
-            .and_then(|config| config.value.as_ref().map(StrBytes::as_str))
+        entry(configs, name).and_then(|config| config.value.as_ref().map(StrBytes::as_str))
     }
 
     #[test]
-    fn default_describe_returns_retention_only() {
-        let expiry = parse_retention_ms("120000").expect("2 minutes in ms");
-        let details = topic_details(expiry, true);
-        let (configs, bad) = entries(&details, None, false);
+    fn default_describe_returns_every_kafka_topic_config_sorted() {
+        let (configs, bad) = described_entries(&expiring(120_000), None, false);
         assert!(!bad);
-        assert_eq!(
-            configs
-                .iter()
-                .map(|config| config.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![RETENTION_MS]
-        );
+        let names: Vec<&str> = configs.iter().map(|config| config.name.as_str()).collect();
+        let expected: Vec<&str> = TOPIC_CONFIGS.iter().map(|key| key.name).collect();
+        assert_eq!(names, expected);
         assert_eq!(value_of(&configs, RETENTION_MS), Some("120000"));
+        assert_eq!(
+            entry(&configs, RETENTION_MS).map(|config| config.config_source),
+            Some(CONFIG_SOURCE_TOPIC)
+        );
+        assert_eq!(value_of(&configs, CLEANUP_POLICY), Some("delete"));
+        assert_eq!(
+            entry(&configs, CLEANUP_POLICY).map(|config| config.config_source),
+            Some(CONFIG_SOURCE_DEFAULT)
+        );
+        assert!(configs.iter().all(|config| !config.read_only));
     }
 
     #[test]
-    fn cleanup_policy_is_omitted_even_when_asked_for() {
-        let details = topic_details(IggyExpiry::NeverExpire, false);
-        let only_cleanup = [StrBytes::from_static_str(CLEANUP_POLICY)];
-        let (configs, bad) = entries(&details, Some(&only_cleanup), true);
-        assert!(!bad);
-        assert_eq!(configs, [] as [DescribeConfigsResourceResult; 0]);
-
-        let both = [
-            StrBytes::from_static_str(CLEANUP_POLICY),
-            StrBytes::from_static_str(RETENTION_MS),
-        ];
-        let (configs, bad) = entries(&details, Some(&both), true);
-        assert!(!bad);
+    fn a_stored_policy_is_reported_as_set_on_the_topic() {
+        let snapshot = TopicConfigSnapshot {
+            cleanup_policy: Some(CleanupPolicy::Compact),
+            ..TopicConfigSnapshot::default()
+        };
+        let asked = [StrBytes::from_static_str(CLEANUP_POLICY)];
+        let (configs, _) = described_entries(&snapshot, Some(&asked), false);
         assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name.as_str(), RETENTION_MS);
+        assert_eq!(value_of(&configs, CLEANUP_POLICY), Some("compact"));
+        assert_eq!(configs[0].config_source, CONFIG_SOURCE_TOPIC);
     }
 
     #[test]
     fn synonyms_are_always_empty() {
-        let expiry = parse_retention_ms("120000").expect("ms");
-        let details = topic_details(expiry, true);
-        let (configs, _) = entries(&details, None, false);
+        let (configs, _) = described_entries(&expiring(120_000), None, false);
         assert!(configs.iter().all(|config| config.synonyms.is_empty()));
     }
 
     #[test]
     fn requested_unknown_names_are_omitted_and_known_keys_remain() {
-        let expiry = parse_retention_ms("1500").expect("ms");
-        let details = topic_details(expiry, true);
         let asked = [
             StrBytes::from_static_str(RETENTION_MS),
             StrBytes::from_static_str("no.such"),
             StrBytes::from_static_str("retention.minutes"),
             StrBytes::from_static_str("retention.hours"),
         ];
-        let (configs, bad) = entries(&details, Some(&asked), false);
+        let (configs, bad) = described_entries(&expiring(1_500), Some(&asked), false);
         assert!(!bad);
         assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name.as_str(), RETENTION_MS);
-        assert_eq!(
-            configs[0].value.as_ref().map(StrBytes::as_str),
-            Some("1500")
-        );
+        assert_eq!(value_of(&configs, RETENTION_MS), Some("1500"));
     }
 
     #[test]
     fn a_name_repeated_in_the_request_is_returned_once() {
-        let expiry = parse_retention_ms("1500").expect("ms");
-        let details = topic_details(expiry, true);
         let asked = [
             StrBytes::from_static_str(RETENTION_MS),
             StrBytes::from_static_str(RETENTION_MS),
         ];
-        let (configs, _) = entries(&details, Some(&asked), false);
+        let (configs, _) = described_entries(&expiring(1_500), Some(&asked), false);
         assert_eq!(configs.len(), 1);
     }
 
     #[test]
     fn never_expire_reports_negative_one() {
-        let (configs, bad) = entries(&topic_details(IggyExpiry::NeverExpire, true), None, false);
+        let (configs, bad) = described_entries(&TopicConfigSnapshot::default(), None, false);
         assert!(!bad);
         assert_eq!(value_of(&configs, RETENTION_MS), Some("-1"));
     }
 
     #[test]
+    fn a_sub_millisecond_expiry_fails_the_resource_but_keeps_the_entry() {
+        let snapshot = TopicConfigSnapshot {
+            message_expiry: IggyExpiry::ExpireDuration(IggyDuration::from(1_500_u64)),
+            message_expiry_explicit: true,
+            ..TopicConfigSnapshot::default()
+        };
+        let (configs, bad) = described_entries(&snapshot, None, false);
+        assert!(bad);
+        assert_eq!(
+            entry(&configs, RETENTION_MS).map(|config| config.value.is_none()),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn documentation_is_attached_only_when_asked() {
-        let expiry = parse_retention_ms("1500").expect("ms");
-        let details = topic_details(expiry, true);
-        let (configs, _) = entries(&details, None, true);
+        let (configs, _) = described_entries(&expiring(1_500), None, true);
         assert!(configs.iter().all(|config| config.documentation.is_some()));
-        let (configs, _) = entries(&details, None, false);
+        let (configs, _) = described_entries(&expiring(1_500), None, false);
         assert!(configs.iter().all(|config| config.documentation.is_none()));
     }
 }
