@@ -78,6 +78,9 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
 | `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
+| `IGGY_KAFKA_SASL_MECHANISMS` | `PLAIN` | SASL mechanisms the SASL listeners offer, comma-separated: `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`. Refused without a SASL listener. See [Authentication](#authentication-3549-4512) |
+| `IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS` | `0` (no limit) | Kafka's `connections.max.reauth.ms`: the longest a SASL session lasts before the client must re-authenticate on the same connection (KIP-368) |
+| `IGGY_KAFKA_OAUTH_*` | unset | OAUTHBEARER's issuer, audience and JWKS; the table is in [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md#oauthbearer). Refused unless `OAUTHBEARER` is enabled |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
@@ -380,11 +383,25 @@ Acting as the mapped user on the data plane is
 [#4518](https://github.com/apache/iggy/issues/4518); today the identity gates admission and
 answers `DescribeAcls`, as a SASL identity does.
 
-## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
+## Authentication ([#3549](https://github.com/apache/iggy/issues/3549), [#4512](https://github.com/apache/iggy/issues/4512))
 
 Off by default. With a `SASL_PLAINTEXT` or `SASL_SSL` listener (or `IGGY_KAFKA_SASL_ENABLED=true`
-in the single-listener form) the gateway requires SASL/PLAIN before it serves any other API on
-that listener, and it verifies the credentials by logging into Iggy with them.
+in the single-listener form) the gateway requires SASL before it serves any other API on that
+listener. `IGGY_KAFKA_SASL_MECHANISMS` chooses the mechanisms, `PLAIN` by default:
+
+| Mechanism | Verified against | Needs |
+| --- | --- | --- |
+| `PLAIN` | An Iggy login with the client's username and password | `IGGY_KAFKA_IGGY_ADDR` |
+| `SCRAM-SHA-256`, `SCRAM-SHA-512` | Salted keys the gateway keeps in Iggy topic `<default stream>.meta/scram`, set with `kafka-configs --alter --add-config 'SCRAM-SHA-512=[password=...]' --entity-type users` | The bridge; its user needs `read_users`, and `manage_users` on the principal that sets credentials |
+| `OAUTHBEARER` | A JWT checked against the identity provider's JWKS, issuer and audience required (`IGGY_KAFKA_OAUTH_*`) | The bridge; its user needs `read_users` |
+
+Every mechanism ends at an Iggy user: the connection is admitted only if the principal names an
+active one. `SaslAuthenticate` sends KIP-368's `session_lifetime_ms` (an OAUTHBEARER token's
+remaining life, capped by `IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS`), and clients re-authenticate on
+the same connection. [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) has the configuration
+table for OAUTHBEARER and every decision.
+
+With PLAIN, the gateway verifies the credentials by logging into Iggy with them.
 
 The username and password a Kafka client sends are an **Iggy** username and password. There is no
 mapping table and no credential store in the gateway: create an Iggy user for each Kafka principal
@@ -415,9 +432,9 @@ Four things to know before switching it on:
 
 - **PLAIN sends the password in the clear** unless the hop is encrypted: a `SASL_SSL` listener on
   the Kafka side, `IGGY_KAFKA_IGGY_TLS_ENABLED=true` on the Iggy side. A `SASL_PLAINTEXT` listener
-  is only safe on a trusted network, and the gateway says so at startup. SCRAM cannot be offered at
-  all, because Iggy stores one Argon2 hash per user and SCRAM needs PBKDF2-derived keys that cannot
-  come from it.
+  is only safe on a trusted network, and the gateway says so at startup. SCRAM and OAUTHBEARER put
+  no password on the wire; an OAUTHBEARER token is still a bearer credential, so use `SASL_SSL`
+  outside a trusted network for it too.
 - **Enabling it breaks every existing client at once.** The two SASL keys appear in the
   `ApiVersions` advertisement only while it is on, and unauthenticated clients are refused.
 - **Every connection costs a login**, meaning one password hash on an Iggy shard thread and one
