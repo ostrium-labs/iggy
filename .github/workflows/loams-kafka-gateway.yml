@@ -114,6 +114,14 @@ jobs:
       - name: Wire fixtures
         run: ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
 
+      - name: Free disk for the nightly client matrix
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          # RisingWave's image alone unpacks to about 7.6 GB; Flink and Connect add 2 GB more.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Pull client images
         shell: bash
         run: |
@@ -128,6 +136,13 @@ jobs:
             tag=$(grep -rhoP '^pub const REDPANDA_ORACLE_TAG: &str = "\K[^"]+' gateways/kafka/tests)
             timeout 600 docker pull -q "$tag"
             echo "KAFKA_ORACLE_REDPANDA=1" >> "$GITHUB_ENV"
+            # The client matrix's nightly clients (Vector, Fluent Bit, RisingWave, Flink,
+            # Connect with Debezium): `*_NIGHTLY` constants, never pulled on pull requests.
+            nightly=$(grep -rhoP '^pub const [A-Z0-9_]*_NIGHTLY: &str = "\K[^"]+' gateways/kafka/tests | sort -u)
+            for image in $nightly; do
+              timeout 900 docker pull -q "$image"
+            done
+            echo "KAFKA_CLIENT_MATRIX_FULL=1" >> "$GITHUB_ENV"
           fi
 
       - name: Test (gateway)
@@ -135,6 +150,7 @@ jobs:
           KAFKA_FIXTURES_REQUIRED: "1"
           KAFKA_E2E_REQUIRED: "1"
           KAFKA_ORACLE_REPORT: ${{ runner.temp }}/oracle-report.txt
+          KAFKA_CLIENT_MATRIX_DIR: ${{ runner.temp }}/client-matrix
         run: cargo nextest run --locked -p iggy-gateway-kafka --profile ci --no-fail-fast
 
       - name: Oracle report
@@ -149,6 +165,32 @@ jobs:
             if [[ -s "$report" ]]; then cat "$report"; else echo "(no report: the oracle suite did not finish)"; fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Client matrix
+        if: always()
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/client-matrix"
+          {
+            echo "### Client compatibility matrix (KW-2)"
+            echo
+            if compgen -G "$dir/*.md" > /dev/null; then
+              for file in "$dir"/smoke.md "$dir"/nightly-*.md; do
+                [[ -f "$file" ]] && { cat "$file"; echo; }
+              done
+            else
+              echo "(no matrix: the client matrix did not finish)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the client matrix
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-matrix
+          path: ${{ runner.temp }}/client-matrix
+          if-no-files-found: ignore
+          retention-days: 30
 
   required:
     name: Kafka gateway required
