@@ -102,6 +102,12 @@ pub struct PrincipalPermissions {
     pub manage_topics: bool,
     pub poll_messages: bool,
     pub send_messages: bool,
+    /// Iggy's `read_users` or `manage_users`: may describe other principals' credentials. Kafka's
+    /// `DESCRIBE` on the cluster for `DescribeUserScramCredentials`. Not rendered as a binding.
+    pub read_users: bool,
+    /// Iggy's `manage_users`: may change credentials, Kafka's `ALTER` on the cluster for
+    /// `AlterUserScramCredentials`. Not rendered as a binding.
+    pub manage_users: bool,
 }
 
 /// One rendered binding. Principal, host and permission type are constant for every binding this
@@ -342,6 +348,8 @@ mod tests {
             manage_topics: true,
             poll_messages: true,
             send_messages: true,
+            read_users: true,
+            manage_users: true,
         }
     }
 
