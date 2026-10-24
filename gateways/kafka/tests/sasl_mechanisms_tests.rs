@@ -158,6 +158,7 @@ impl Default for Setup {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn spawn(setup: Setup) -> SocketAddr {
     let validator = StubValidator {
         tokens: setup
