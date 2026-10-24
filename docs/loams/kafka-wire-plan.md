@@ -2,7 +2,7 @@
 
 Status: **plan, 2026-10-23.** Nothing in this document is built yet unless a
 task row says so. Transactions and exactly-once (KW-T, apache/iggy#4522) are
-**planned, not built**, and stay that way until the Loams owner says otherwise.
+**planned, not built**, and start only after KW-2, KW-3 and KW-13 are done (owner, 2026-10-24).
 
 Owner direction (2026-10-23): "work on kafka wire now, do all things except
 kafka transactions but plan it fully, do these in our fork." Loams' side of the
@@ -22,7 +22,7 @@ merged when `Kafka gateway required` is green (see [README.md](README.md)).
 6. [KW-T: transactions and exactly-once (planned, not built)](#6-kw-t-transactions-and-exactly-once-planned-not-built)
 7. [How Loams runs it](#7-how-loams-runs-it)
 8. [What can run in parallel](#8-what-can-run-in-parallel)
-9. [Open questions for the owner](#9-open-questions-for-the-owner)
+9. [Owner decisions and open questions](#9-owner-decisions-and-open-questions)
 
 ## 1. Where the gateway stands
 
@@ -210,7 +210,7 @@ breadth. Status is `Planned` unless noted.
 | KW-18 | Kafka-to-Iggy migration guide | #3550 | Planned | KW-5 | Assigned upstream; fork copy only |
 | KW-L1 | Fork images: `iggy-server` and `iggy-gateway-kafka` on GHCR | — | **Done** (one image, `ghcr.io/ostrium-labs/iggy`) | KW-0 | No |
 | KW-L2 | Loams compose profile `kafka` | — (Loams repo) | **Done** (ostrium-labs/loams#1148) | KW-L1 | No |
-| KW-T | Transactions and exactly-once | #4522 | **Planned, not built** | KW-3, KW-5, KW-6, KW-7 | Design discussion first |
+| KW-T | Transactions and exactly-once | #4522 | **Planned, not built**; starts after KW-2, KW-3 and KW-13 are done (owner, 2026-10-24) | KW-2, KW-3, KW-13, then KW-5, KW-6, KW-7 | Design discussion first |
 
 ### KW-1. Differential oracle harness
 
@@ -340,7 +340,7 @@ can land after them, silently (`docs/IDEMPOTENCE.md`).
    Java client and franz-go then bump their epoch (KIP-360) and continue.
    Producer ids stay unique across restarts as today (clock-seeded counter).
 
-Default chosen here (owner may overrule): rebuild from the log (part 3) rather
+**Approved (owner, 2026-10-24): rebuild from the log**, as built. Default chosen here: rebuild from the log (part 3) rather
 than "bump the epoch and answer 59 after every restart", because it also gives
 KW-5 its producer-state handover for free.
 
@@ -663,7 +663,8 @@ routing and the peer address is not passed to handlers), and commit metadata.
 Commit metadata cannot go in Iggy's `ExternalGroup` offset (a `u64`; changing
 it is the state-save path, which needs the owner's OK), so the default is a
 gateway-owned Iggy topic replayed into memory at startup, like Kafka's
-`__consumer_offsets`; that needs the owner's ruling before it is built.
+`__consumer_offsets`. **Approved (owner, 2026-10-24):** commit metadata is stored
+in that gateway-owned Iggy topic and reloaded at startup, with no server change.
 
 ### KW-13. KIP-848 consumer groups
 
@@ -926,15 +927,32 @@ segment code (KW-6 after KW-7, or one agent for both); E touches every
 handler's range table, so it rebases often. Keep to three building agents on
 the owner's machine (disk), and let fork CI do the full runs.
 
-## 9. Open questions for the owner
+## 9. Owner decisions and open questions
+
+### Approved (owner, 2026-10-24)
+
+The owner approved these with the recommended answers ("approve all with your
+recommendations").
+
+1. **KW-3 restart safety: rebuild producer state from the log**, as built (part
+   3). Not "bump the epoch and answer 59 after each restart".
+2. **KW-4: accept and echo** the topic configurations Iggy cannot honour, marked
+   in the topic's description as not honoured. They are not refused.
+3. **KW-6: compaction is built in the fork first.** The design note for
+   upstream discussion stays ready and is not posted (see the open question
+   below).
+4. **KW-12: offset-commit metadata** is stored in a gateway-owned Iggy topic that
+   the gateway replays into memory at startup, like Kafka's `__consumer_offsets`.
+   No server change, and `ExternalGroup`'s `u64` offset is untouched.
+5. **KW-T: transactions start after KW-2, KW-3 and KW-13 are done.** Until then
+   the gateway keeps refusing them as `SCOPE.md` "Transactions" describes.
+6. **KW-8: the computed topic ids are accepted**: a stable UUID per Iggy topic,
+   stored as a topic option at creation and minted once for existing topics on
+   first read.
+
+### Still open
 
 1. Upstream: may the fork's tasks be offered upstream as they finish (one PR
    per issue, after assignment), starting with KW-1/KW-2 (#4531) and KW-3
-   (#4513)? Default: no posting until you say so.
-2. KW-3 restart safety: rebuild producer state from the log (default), or bump
-   the epoch and answer 59 after each restart (simpler, at-least-once across a
-   restart)?
-3. KW-4: accept-and-echo configs Iggy cannot honour (default), or refuse them?
-4. KW-6: write the compaction design note for upstream discussion first, or
-   build it in the fork straight away? Default: fork first, note kept ready.
-5. KW-T: when to start building transactions, if at all.
+   (#4513)? Default: no posting until the owner says so. **Not approved on
+   2026-10-24; stays open.** This includes the KW-6 design note.
