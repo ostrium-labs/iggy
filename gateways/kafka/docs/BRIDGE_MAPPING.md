@@ -36,6 +36,7 @@ Produce, per record:
 | Kafka | Iggy |
 | ------- | ------ |
 | (nothing) | `kafka.v` user header, one byte, the mapping version |
+| producer id, epoch, first and last sequence of an idempotent batch (Ostrium fork, KW-3) | `kafka.p` user header on the batch's first record, and `kafka.v` 2 on that record |
 | record value | `payload` |
 | record key | `kafka.key` user header, `Raw` |
 | record header `name` | `kafka.h.<name>` user header, `Raw` |
@@ -217,9 +218,14 @@ timestamps, and a recomputed CRC32C.
 
 Two consequences worth stating before they surprise someone:
 
-- Idempotent-producer deduplication cannot be reconstructed from stored data later. If
-  [#3545](https://github.com/apache/iggy/issues/3545) ever grows past a stub, producer id,
-  epoch and sequence need their own tracking.
+- Idempotent-producer deduplication cannot be reconstructed from the records alone. In the
+  Ostrium fork (KW-3 part 3) the first record of each idempotent batch carries a `kafka.p`
+  header for that reason: 20 bytes, big-endian, a layout byte (1), producer id (`i64`), epoch
+  (`i16`), first and last sequence (`i32` each), and a flags byte (none set; bit 0 is kept for a
+  transactional batch, KW-T). That record says `kafka.v` 2, which is mapping version 1 plus this
+  header; every other record stays at 1, so a build that reads only version 1 still reads all of
+  them but the marked ones. Fetch reads 1 and 2 alike and never shows `kafka.p` as a Kafka header.
+  A gateway rebuilds producer state from these marks (`docs/IDEMPOTENCE.md`).
 - The bytes a consumer receives are not the bytes the producer sent, so anything comparing
   batches byte for byte across the gateway will differ.
 
