@@ -85,6 +85,12 @@ impl TestGateway {
         gateway
     }
 
+    /// Kills the gateway with SIGKILL, skipping its shutdown path the way a crash would.
+    pub fn crash(mut self) {
+        self.child.kill().expect("SIGKILL iggy-gateway-kafka");
+        let _ = self.child.wait();
+    }
+
     /// Bare TCP connect poll, same rationale as `TestServer::wait_ready`: a full Kafka client
     /// handshake would pay retry overhead on every failed attempt. A connect slightly ahead of
     /// the gateway's own accept loop can't happen here - `main.rs` connects the bridge before

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::future::BoxFuture;
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
@@ -115,11 +116,12 @@ enum Scenario {
     StandaloneCommit,
     InitProducerId,
     IdempotentProducer,
+    IdempotentRestart,
     DescribeConfigs,
 }
 
 impl Scenario {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -128,6 +130,7 @@ impl Scenario {
         Self::StandaloneCommit,
         Self::InitProducerId,
         Self::IdempotentProducer,
+        Self::IdempotentRestart,
         Self::DescribeConfigs,
     ];
 
@@ -141,6 +144,7 @@ impl Scenario {
             Self::StandaloneCommit => "standalone_commit",
             Self::InitProducerId => "init_producer_id",
             Self::IdempotentProducer => "idempotent_producer",
+            Self::IdempotentRestart => "idempotent_restart",
             Self::DescribeConfigs => "describe_configs",
         }
     }
@@ -157,11 +161,15 @@ impl Scenario {
             Self::StandaloneCommit => standalone_commit(cx, &mut client, &mut facts).await?,
             Self::InitProducerId => init_producer_id(cx, &mut client, &mut facts).await?,
             Self::IdempotentProducer => idempotent_producer(cx, &mut client, &mut facts).await?,
+            Self::IdempotentRestart => idempotent_restart(cx, &mut client, &mut facts).await?,
             Self::DescribeConfigs => describe_configs(cx, &mut client, &mut facts).await?,
         }
         Ok(facts)
     }
 }
+
+/// Restarts one target on its data: a container's broker, or the gateway process's state.
+type Restart = Arc<dyn Fn() -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 /// What a scenario knows about its run.
 struct Context {
@@ -169,6 +177,7 @@ struct Context {
     run: String,
     /// The gateway's advertised `(min, max)` per key, for the `ApiVersions` comparison.
     gateway_versions: BTreeMap<i16, (i16, i16)>,
+    restart: Option<Restart>,
 }
 
 impl Context {
@@ -1069,6 +1078,69 @@ async fn idempotent_producer(
     Ok(())
 }
 
+/// An idempotent producer's retries across a broker restart: Kafka rebuilds producer state from
+/// its log, and the gateway from the `kafka.p` marks in Iggy (KW-3 part 3).
+async fn idempotent_restart(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let restart = cx
+        .restart
+        .clone()
+        .ok_or_else(|| format!("no way to restart {}", cx.target.kind))?;
+    let name = cx.name("idempotent_restart", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let init_version = version(client, ApiKey::InitProducerId, 4)?;
+    let request = InitProducerIdRequest::default()
+        .with_transactional_id(None)
+        .with_transaction_timeout_ms(-1)
+        .with_producer_id(ProducerId(-1))
+        .with_producer_epoch(-1);
+    let mut init = client.send(&request, init_version).await?;
+    for _ in 0..60 {
+        if !coordinator_loading(init.error_code) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        init = client.send(&request, init_version).await?;
+    }
+    let (id, epoch) = (init.producer_id.0, init.producer_epoch);
+    let start = now_ms() - 60_000;
+    let first = sequenced(&RECORDS[..2], start, Some((id, epoch, 0)))?;
+    let (error, base) = produce(client, &name, 0, first.clone()).await?;
+    facts.set("first.error", error);
+    facts.set("first.base_offset", base);
+    let second = sequenced(&RECORDS[2..3], start, Some((id, epoch, 2)))?;
+    let (error, base) = produce(client, &name, 0, second.clone()).await?;
+    facts.set("second.error", error);
+    facts.set("second.base_offset", base);
+
+    // The answer to `second` is lost, and the broker restarts before the producer retries.
+    restart().await?;
+    *client = WireClient::connect(&cx.target.address).await?;
+    await_topic(client, &name).await?;
+
+    let (error, base) = produce(client, &name, 0, second).await?;
+    facts.set("retry_second.error", error);
+    facts.set("retry_second.base_offset", base);
+    let (error, base) = produce(client, &name, 0, first).await?;
+    facts.set("retry_first.error", error);
+    facts.set("retry_first.base_offset", base);
+    let gap = sequenced(&RECORDS[4..5], start, Some((id, epoch, 5)))?;
+    let (error, _) = produce(client, &name, 0, gap).await?;
+    facts.set("gap.error", error);
+    let next = sequenced(&RECORDS[3..4], start, Some((id, epoch, 3)))?;
+    let (error, base) = produce(client, &name, 0, next).await?;
+    facts.set("next.error", error);
+    facts.set("next.base_offset", base);
+    let (partition, records) = fetch(client, &name, 0).await?;
+    facts.set("fetch.high_watermark", partition.high_watermark);
+    facts.set("fetch.records", records.len());
+    Ok(())
+}
+
 async fn describe_configs(
     cx: &Context,
     client: &mut WireClient,
@@ -1125,21 +1197,41 @@ fn iggy_server_built() -> bool {
 /// The gateway, bridged to a spawned `iggy-server`, until dropped.
 struct Gateway {
     address: String,
-    _shutdown: broadcast::Sender<()>,
-    _server: iggy_server::TestServer,
+    running: std::sync::Mutex<Option<Running>>,
+    server: iggy_server::TestServer,
     _data_dir: tempfile::TempDir,
+}
+
+/// One run of the gateway: its shutdown signal and its task.
+struct Running {
+    shutdown: broadcast::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 async fn start_gateway() -> Gateway {
     let data_dir = tempfile::tempdir().expect("create the server data dir");
     let server = iggy_server::TestServer::spawn(data_dir.path()).await;
+    let listener = bind_listener("127.0.0.1:0").expect("bind an ephemeral port");
+    let address = listener.local_addr().expect("local address").to_string();
+    let running = run_gateway(&server, listener, &address).await;
+    Gateway {
+        address,
+        running: std::sync::Mutex::new(Some(running)),
+        server,
+        _data_dir: data_dir,
+    }
+}
+
+async fn run_gateway(
+    server: &iggy_server::TestServer,
+    listener: tokio::net::TcpListener,
+    address: &str,
+) -> Running {
     let bridge = IggyBridge::connect(server.test_config())
         .await
         .expect("the bridge connects to a ready server");
-    let listener = bind_listener("127.0.0.1:0").expect("bind an ephemeral port");
-    let address = listener.local_addr().expect("local address").to_string();
     let listener = BoundListener::new(
-        ListenerConfig::new(SecurityProtocol::Plaintext, address.clone()),
+        ListenerConfig::new(SecurityProtocol::Plaintext, address.to_string()),
         listener,
     );
     let mut config = GatewayConfig::default();
@@ -1147,18 +1239,96 @@ async fn start_gateway() -> Gateway {
     config.group.initial_rebalance_delay = Duration::ZERO;
     let gateway = KafkaGateway::new(config).with_bridge(Some(Arc::new(bridge)));
     let (shutdown, receiver) = broadcast::channel(1);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _ = gateway.run(vec![listener], receiver).await;
     });
-    Gateway {
-        address,
-        _shutdown: shutdown,
-        _server: server,
-        _data_dir: data_dir,
+    Running { shutdown, task }
+}
+
+impl Gateway {
+    /// Stops this gateway and starts a new one on the same address and Iggy server, with
+    /// nothing kept in memory, as after a process restart.
+    async fn restart(&self) -> Result<(), String> {
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| "gateway lock poisoned".to_string())?
+            .take();
+        if let Some(Running { shutdown, task }) = running {
+            let _ = shutdown.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+        }
+        let mut listener = None;
+        for _ in 0..100 {
+            match bind_listener(&self.address) {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let listener = listener.ok_or_else(|| format!("rebind {}", self.address))?;
+        let running = run_gateway(&self.server, listener, &self.address).await;
+        *self
+            .running
+            .lock()
+            .map_err(|_| "gateway lock poisoned".to_string())? = Some(running);
+        Ok(())
     }
 }
 
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.running.lock()
+            && let Some(running) = running.take()
+        {
+            let _ = running.shutdown.send(());
+            running.task.abort();
+        }
+    }
+}
+
+/// How each target restarts, for the scenarios that restart one.
+fn restarts(
+    gateway: &Arc<Gateway>,
+    kafka: Option<&Arc<KafkaOracle>>,
+    redpanda: Option<&Arc<RedpandaOracle>>,
+) -> BTreeMap<TargetKind, Restart> {
+    let mut restarts: BTreeMap<TargetKind, Restart> = BTreeMap::new();
+    let restarting = Arc::clone(gateway);
+    restarts.insert(
+        TargetKind::Gateway,
+        Arc::new(move || {
+            let gateway = Arc::clone(&restarting);
+            Box::pin(async move { gateway.restart().await })
+        }),
+    );
+    if let Some(kafka) = kafka {
+        let kafka = Arc::clone(kafka);
+        restarts.insert(
+            TargetKind::Kafka,
+            Arc::new(move || {
+                let kafka = Arc::clone(&kafka);
+                Box::pin(async move { kafka.restart().await })
+            }),
+        );
+    }
+    if let Some(redpanda) = redpanda {
+        let redpanda = Arc::clone(redpanda);
+        restarts.insert(
+            TargetKind::Redpanda,
+            Arc::new(move || {
+                let redpanda = Arc::clone(&redpanda);
+                Box::pin(async move { redpanda.restart().await })
+            }),
+        );
+    }
+    restarts
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
     if !iggy_server_built() {
         skip("iggy-server is not built; run `cargo build --bin iggy-server` first");
@@ -1186,7 +1356,9 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
         Err(Unavailable::Failed(reason)) => panic!("Redpanda oracle: {reason}"),
     }
 
-    let gateway = start_gateway().await;
+    let gateway = Arc::new(start_gateway().await);
+    let held = (held.0.map(Arc::new), held.1.map(Arc::new));
+    let restarts = restarts(&gateway, held.0.as_ref(), held.1.as_ref());
     let gateway_target = Target {
         kind: TargetKind::Gateway,
         address: gateway.address.clone(),
@@ -1207,6 +1379,7 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
             target: target.clone(),
             run: run.clone(),
             gateway_versions: gateway_versions.clone(),
+            restart: restarts.get(&target.kind).cloned(),
         };
         let ours = scenario
             .run(&context(&gateway_target))

@@ -39,6 +39,7 @@ mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
+mod producer_log;
 mod topics;
 
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
