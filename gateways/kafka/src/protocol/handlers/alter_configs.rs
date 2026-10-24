@@ -20,7 +20,6 @@
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::{IggyError, IggyExpiry};
 use kafka_protocol::messages::AlterConfigsRequest;
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::alter_configs_response::{
@@ -31,17 +30,18 @@ use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicLoad};
+use crate::bridge::{IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
-    API_KEY_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState, HandleOutcome, REQUEST_DEADLINE,
+    API_KEY_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
+    ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_alter_configs_shape;
+use crate::protocol::handlers::kafka_topic_configs::{plan_alter, requested_set};
 use crate::protocol::handlers::topic_config::{
-    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, name_reason,
-    plan_retention_update, topic_cap_and_duplicates, topic_cap_message,
+    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, fault_response,
+    name_reason, topic_cap_and_duplicates, topic_cap_message, write_configs,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -227,8 +227,8 @@ async fn alter_one(
     // Existence is checked before config keys. A missing topic is
     // UNKNOWN_TOPIC_OR_PARTITION even when a key would also be invalid.
     // A deadline that has already passed must not start the lockstep Iggy call.
-    match cache.lookup(bridge, name, deadline, "AlterConfigs").await {
-        TopicLoad::Found(_) => {}
+    let current = match cache.lookup(bridge, name, deadline, "AlterConfigs").await {
+        TopicLoad::Found(snapshot) => snapshot.clone(),
         TopicLoad::Missing => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None);
         }
@@ -239,34 +239,24 @@ async fn alter_one(
         TopicLoad::NotStarted | TopicLoad::TimedOut => {
             return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
         }
-    }
+    };
 
-    let expiry = match plan_retention_update(resource.configs.iter().map(|config| {
+    // Kafka's AlterConfigs replaces the topic's whole configuration: the request's set becomes
+    // the topic's set, and every configuration it leaves out returns to its default. An empty
+    // list is a reset to defaults.
+    let planned = requested_set(resource.configs.iter().map(|config| {
         (
             config.name.as_str(),
             config.value.as_ref().map(StrBytes::as_str),
         )
-    })) {
-        Ok(expiry) => expiry,
+    }))
+    .and_then(|set| plan_alter(&current, &set));
+    let write = match planned {
+        Ok(write) => write,
         Err(fault) => {
-            return resource_error(
-                resource,
-                ERROR_INVALID_CONFIG,
-                Some(StrBytes::from(fault.message())),
-            );
+            let (code, message) = fault_response(&fault);
+            return resource_error(resource, code, message);
         }
-    };
-    // Kafka's AlterConfigs replaces the whole set, so an empty list is a reset.
-    // This gateway patches named keys. Reporting success would hide that the
-    // previous expiry is still stored.
-    let Some(expiry) = expiry else {
-        return resource_error(
-            resource,
-            ERROR_INVALID_CONFIG,
-            Some(StrBytes::from_static_str(
-                "an empty configs list is rejected because this gateway patches named keys and does not replace the topic configuration",
-            )),
-        );
     };
 
     // `validate_only` already performed the existence read and the same key checks.
@@ -275,41 +265,8 @@ async fn alter_one(
         return resource_error(resource, ERROR_NONE, None);
     }
 
-    write_expiry(bridge, resource, expiry, deadline).await
-}
-
-async fn write_expiry(
-    bridge: &IggyBridge,
-    resource: &AlterConfigsResource,
-    expiry: IggyExpiry,
-    deadline: Instant,
-) -> AlterConfigsResourceResponse {
-    let name = resource.resource_name.as_str();
-    // Do not start the write once the deadline has passed, and do not wrap it in
-    // `timeout_at`. Dropping that future does not abort the SDK task, so
-    // `UpdateTopic` can commit after this handler has already answered
-    // REQUEST_TIMED_OUT. A short retention then deletes sealed segments. This is a
-    // policy choice about *this* handler's own deadline, independent of
-    // `update_kafka_topic_message_expiry` itself: that bridge call already wraps its
-    // SDK round trip in `with_request_timeout` (see `topics.rs`), so the write it
-    // starts is never unbounded - it can simply still be in flight when this
-    // handler's own, shorter deadline has already elapsed.
-    if Instant::now() >= deadline {
-        tracing::warn!(
-            resource = name,
-            "AlterConfigs deadline passed before update_topic; not starting the write"
-        );
-        return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
-    }
-    match bridge.update_kafka_topic_message_expiry(name, expiry).await {
-        Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
-            resource_error(resource, ERROR_NONE, None)
-        }
-        Err(error) => {
-            let (code, message) = bridge_failure(&error, "AlterConfigs", "altering");
-            resource_error(resource, code, message)
-        }
-    }
+    let (code, message) = write_configs(bridge, name, &write, deadline, "AlterConfigs").await;
+    resource_error(resource, code, message)
 }
 
 fn resource_error(
@@ -378,20 +335,5 @@ mod tests {
         let principal = principal(true, false);
         let responses = authorize(Some(&principal), &[resource("orders")]).expect("denied");
         assert_eq!(responses[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
-    }
-
-    #[tokio::test]
-    async fn given_a_passed_deadline_when_writing_should_answer_timed_out_without_calling_iggy() {
-        let bridge = IggyBridge::offline();
-        let response = write_expiry(
-            &bridge,
-            &resource("orders"),
-            IggyExpiry::NeverExpire,
-            Instant::now(),
-        )
-        .await;
-        // A write started on the offline bridge fails fast as NOT_LEADER_OR_FOLLOWER instead.
-        assert_eq!(response.error_code, ERROR_REQUEST_TIMED_OUT);
-        assert!(response.error_message.is_none());
     }
 }

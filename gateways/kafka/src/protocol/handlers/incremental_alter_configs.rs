@@ -20,13 +20,12 @@
 //! `kafka-configs --alter` on a topic has sent this key since Kafka 2.5. `AlterConfigs` (33)
 //! comes from Java `Admin.alterConfigs` before 4.0, which removed it, and from other clients'
 //! non-incremental alter calls such as librdkafka's `rd_kafka_AlterConfigs`. Each entry carries
-//! one operation on one key, where 33 carries a whole new set. Both end in the same write, `retention.ms` onto the topic's
-//! `message_expiry`, behind the same checks. See `docs/CONFIGS.md`.
+//! one operation on one key, where 33 carries a whole new set. Both end in the same write of the
+//! resulting configuration set onto the Iggy topic, behind the same checks. See `docs/CONFIGS.md`.
 
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::{IggyError, IggyExpiry};
 use kafka_protocol::messages::IncrementalAlterConfigsRequest;
 use kafka_protocol::messages::incremental_alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::incremental_alter_configs_response::{
@@ -37,17 +36,21 @@ use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::bridge::{BridgeError, IggyBridge, StreamTopicCache, TopicLoad};
+use crate::bridge::{IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
-    API_KEY_INCREMENTAL_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG,
-    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER,
-    ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, REQUEST_DEADLINE,
+    API_KEY_INCREMENTAL_ALTER_CONFIGS, ApiVersionRange, ERROR_INVALID_REQUEST,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
+    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    GatewayState, HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_incremental_alter_configs_shape;
+use crate::protocol::handlers::kafka_topic_configs::{
+    TopicConfigSnapshot, TopicWrite, apply_operation, plan_alter,
+};
 use crate::protocol::handlers::topic_config::{
-    ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure, incremental_ops,
-    name_reason, plan_incremental_update, topic_cap_and_duplicates, topic_cap_message,
+    ConfigFault, ConfigOp, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure,
+    fault_response, incremental_ops, name_reason, topic_cap_and_duplicates, topic_cap_message,
+    write_configs,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -265,8 +268,8 @@ async fn alter_one(
         }
     };
 
-    match cache.lookup(bridge, name, deadline, API_NAME).await {
-        TopicLoad::Found(_) => {}
+    let current = match cache.lookup(bridge, name, deadline, API_NAME).await {
+        TopicLoad::Found(snapshot) => snapshot.clone(),
         TopicLoad::Missing => {
             return resource_error(resource, ERROR_UNKNOWN_TOPIC_OR_PARTITION, None);
         }
@@ -277,56 +280,39 @@ async fn alter_one(
         TopicLoad::NotStarted | TopicLoad::TimedOut => {
             return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
         }
-    }
+    };
 
-    let expiry = match plan_incremental_update(&ops) {
-        Ok(expiry) => expiry,
+    let planned = plan_incremental(&current, &ops);
+    let write = match planned {
+        Ok(write) => write,
         Err(fault) => {
-            return resource_error(
-                resource,
-                ERROR_INVALID_CONFIG,
-                Some(StrBytes::from(fault.message())),
-            );
+            let (code, message) = fault_response(&fault);
+            return resource_error(resource, code, message);
         }
     };
     if validate_only {
         return resource_error(resource, ERROR_NONE, None);
     }
-    // Nothing named `retention.ms`, so there is nothing to store. Kafka answers an empty
-    // operation list, and a delete of an override that was never set, the same way.
-    let Some(expiry) = expiry else {
-        return resource_error(resource, ERROR_NONE, None);
-    };
-
-    write_expiry(bridge, resource, expiry, deadline).await
+    // An empty operation list, and a delete of an override that was never set, change nothing,
+    // and `write_configs` then calls nothing: Kafka answers both `NONE`.
+    let (code, message) = write_configs(bridge, name, &write, deadline, API_NAME).await;
+    resource_error(resource, code, message)
 }
 
-async fn write_expiry(
-    bridge: &IggyBridge,
-    resource: &AlterConfigsResource,
-    expiry: IggyExpiry,
-    deadline: Instant,
-) -> AlterConfigsResourceResponse {
-    let name = resource.resource_name.as_str();
-    // Not started past the deadline and not wrapped in `timeout_at`: dropping the future does not
-    // abort the SDK call. The bridge bounds its own round trip with `with_request_timeout`, so a
-    // write can still commit after this handler answered REQUEST_TIMED_OUT.
-    if Instant::now() >= deadline {
-        tracing::warn!(
-            resource = name,
-            "IncrementalAlterConfigs deadline passed before update_topic; not starting the write"
-        );
-        return resource_error(resource, ERROR_REQUEST_TIMED_OUT, None);
+/// The write that applies `ops`, in request order, to the topic's current configuration.
+fn plan_incremental(
+    current: &TopicConfigSnapshot,
+    ops: &[ConfigOp<'_>],
+) -> Result<TopicWrite, ConfigFault> {
+    let mut set = current.explicit().map_err(|()| {
+        ConfigFault::Unsupported(
+            "stored message expiry is not a whole number of milliseconds".to_string(),
+        )
+    })?;
+    for op in ops {
+        apply_operation(&mut set, op.name, op.operation, op.value)?;
     }
-    match bridge.update_kafka_topic_message_expiry(name, expiry).await {
-        Ok(()) | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
-            resource_error(resource, ERROR_NONE, None)
-        }
-        Err(error) => {
-            let (code, message) = bridge_failure(&error, API_NAME, "altering");
-            resource_error(resource, code, message)
-        }
-    }
+    plan_alter(current, &set)
 }
 
 fn resource_error(
@@ -395,20 +381,5 @@ mod tests {
         let principal = principal(true, false);
         let responses = authorize(Some(&principal), &[resource("orders")]).expect("denied");
         assert_eq!(responses[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
-    }
-
-    #[tokio::test]
-    async fn given_a_passed_deadline_when_writing_should_answer_timed_out_without_calling_iggy() {
-        let bridge = IggyBridge::offline();
-        let response = write_expiry(
-            &bridge,
-            &resource("orders"),
-            IggyExpiry::NeverExpire,
-            Instant::now(),
-        )
-        .await;
-        // A write started on the offline bridge fails fast as NOT_LEADER_OR_FOLLOWER instead.
-        assert_eq!(response.error_code, ERROR_REQUEST_TIMED_OUT);
-        assert!(response.error_message.is_none());
     }
 }

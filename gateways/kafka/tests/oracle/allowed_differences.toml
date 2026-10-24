@@ -21,13 +21,6 @@
 # entry goes. `oracles` limits an entry to some oracles; without it, it applies
 # to every oracle. `issue` is the apache/iggy issue that owns the gap.
 
-# CreateTopics refuses every topic configuration today.
-[[difference]]
-scenario = "topic_admin"
-fact = "create_with_retention_ms.error"
-issue = "apache/iggy#4508"
-reason = "CreateTopics answers INVALID_CONFIG (40) to any configuration"
-
 # No log start offset: Fetch reports it unknown.
 [[difference]]
 scenario = "produce_fetch"
@@ -105,27 +98,9 @@ fact = "transactional.error"
 issue = "apache/iggy#4522"
 reason = "InitProducerId with a transactional id answers UNSUPPORTED_VERSION (35)"
 
-# Topic configs: only retention.ms is reported, as never-expire by default.
+# Topic configs: an Iggy topic never expires by default.
 [[difference]]
 scenario = "describe_configs"
 fact = "retention.ms.value"
 issue = "apache/iggy#4508"
 reason = "an Iggy topic never expires by default; Kafka's default is 7 days"
-
-[[difference]]
-scenario = "describe_configs"
-fact = "cleanup.policy.value"
-issue = "apache/iggy#4508"
-reason = "cleanup.policy is left out until a policy is stored per topic"
-
-[[difference]]
-scenario = "describe_configs"
-fact = "cleanup.policy.source"
-issue = "apache/iggy#4508"
-reason = "cleanup.policy is left out until a policy is stored per topic"
-
-[[difference]]
-scenario = "describe_configs"
-fact = "cleanup.policy.read_only"
-issue = "apache/iggy#4508"
-reason = "cleanup.policy is left out until a policy is stored per topic"

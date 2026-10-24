@@ -28,6 +28,7 @@
 //! but not the reverse - the same reason every other wire-level test in this suite hand-builds
 //! request bytes and hand-decodes response bytes via `common/codec.rs`.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -63,6 +64,8 @@ struct TopicSpec<'a> {
     replication_factor: i16,
     assignments: &'a [i32],
     has_config: bool,
+    /// One config to send instead of `cleanup.policy=delete`.
+    config: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> TopicSpec<'a> {
@@ -73,6 +76,7 @@ impl<'a> TopicSpec<'a> {
             replication_factor: 1,
             assignments: &[],
             has_config: false,
+            config: None,
         }
     }
 }
@@ -94,10 +98,13 @@ fn build_request(topics: &[TopicSpec], validate_only: bool) -> Bytes {
             enc.write_empty_tagged_fields();
         }
 
-        if topic.has_config {
+        if let Some((name, value)) = topic
+            .config
+            .or(topic.has_config.then_some(("cleanup.policy", "delete")))
+        {
             enc.write_varint(2); // one config
-            enc.write_compact_nullable_string(Some("cleanup.policy"));
-            enc.write_compact_nullable_string(Some("delete"));
+            enc.write_compact_nullable_string(Some(name));
+            enc.write_compact_nullable_string(Some(value));
             enc.write_empty_tagged_fields();
         } else {
             enc.write_varint(1); // empty configs
@@ -130,21 +137,15 @@ fn decode_first_result(body: Bytes) -> (i16, i32) {
 /// Decodes every topic result in a v5 flexible `CreateTopics` response into `(name, error_code)`,
 /// in wire order.
 fn decode_all_results(body: Bytes) -> Vec<(Option<String>, i16)> {
-    let mut d = Decoder::new(body);
-    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
-    let topics_plus_one = d.read_varint().expect("topics array count");
-    let mut results = Vec::new();
-    for _ in 1..topics_plus_one {
-        let name = d.read_compact_nullable_string().expect("topic name");
-        let error_code = d.read_i16().expect("error_code");
-        let _error_message = d.read_compact_nullable_string().expect("error_message");
-        let _num_partitions = d.read_i32().expect("num_partitions");
-        let _replication_factor = d.read_i16().expect("replication_factor");
-        let _configs = d.read_varint().expect("configs array count");
-        let _tagged = d.read_varint().expect("topic tagged fields");
-        results.push((name, error_code));
-    }
-    results
+    use kafka_protocol::protocol::Decodable;
+    let mut body = body;
+    let response = kafka_protocol::messages::CreateTopicsResponse::decode(&mut body, 5)
+        .expect("decode CreateTopics v5");
+    response
+        .topics
+        .into_iter()
+        .map(|topic| (Some(topic.name.as_str().to_string()), topic.error_code))
+        .collect()
 }
 
 async fn send(state: &GatewayState, topics: &[TopicSpec<'_>], validate_only: bool) -> (i16, i32) {
@@ -288,13 +289,44 @@ async fn create_topics_zero_partitions_returns_invalid_partitions_and_creates_no
 
 #[tokio::test]
 #[serial]
-async fn create_topics_with_a_per_topic_config_returns_invalid_config_and_creates_nothing() {
+async fn create_topics_with_a_per_topic_config_stores_it() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
 
     let topic = TopicSpec {
         has_config: true,
+        ..TopicSpec::new("orders", 3)
+    };
+    let (error_code, partitions) = send(&state, &[topic], false).await;
+    assert_eq!(error_code, ERROR_NONE);
+    assert_eq!(partitions, 3);
+
+    let raw = raw_client(&server).await;
+    let stream = iggy::prelude::Identifier::named("kafka").expect("stream name");
+    let topic_id = iggy::prelude::Identifier::named("orders").expect("topic name");
+    let details = raw
+        .get_topic(&stream, &topic_id)
+        .await
+        .expect("get_topic call")
+        .expect("topic exists");
+    let key = iggy::prelude::HeaderKey::from_str(iggy::prelude::topic_option_keys::CLEANUP_POLICY)
+        .expect("catalog key");
+    let stored = details.options.get(&key).expect("cleanup_policy stored");
+    assert_eq!(stored.value.as_str().expect("string"), "delete");
+    assert!(stored.explicit);
+}
+
+/// An unknown config name is refused, as Kafka refuses it, and nothing is created.
+#[tokio::test]
+#[serial]
+async fn create_topics_with_an_unknown_config_returns_invalid_config_and_creates_nothing() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let topic = TopicSpec {
+        config: Some(("foo.bar", "1")),
         ..TopicSpec::new("orders", 3)
     };
     let (error_code, _) = send(&state, &[topic], false).await;
@@ -309,7 +341,7 @@ async fn create_topics_with_a_per_topic_config_returns_invalid_config_and_create
 /// against topics it doesn't know already exist, expecting `TOPIC_ALREADY_EXISTS` for ones that
 /// are - real Kafka's controller checks existence before it looks at configs. This bridge doesn't
 /// support per-topic configs at all, so if it checked configs first, Connect's already-existing
-/// topics would always answer `INVALID_CONFIG` instead, which Connect does not treat as
+/// topics would answer `INVALID_CONFIG` for any config it refuses, which Connect does not treat as
 /// "already there, fine" the way it treats `TOPIC_ALREADY_EXISTS`.
 #[tokio::test]
 #[serial]
