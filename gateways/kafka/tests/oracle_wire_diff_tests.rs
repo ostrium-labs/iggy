@@ -1602,6 +1602,7 @@ async fn incremental(
 }
 
 /// Every Kafka topic configuration through create, describe and both alters.
+#[allow(clippy::too_many_lines)] // one scenario, read top to bottom
 async fn topic_configs(
     cx: &Context,
     client: &mut WireClient,

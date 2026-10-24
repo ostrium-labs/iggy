@@ -291,21 +291,18 @@ fn described_entries(
         .iter()
         .filter(|key| selected(configuration_keys, key.name))
     {
-        let (value, source) = match snapshot.describe(key) {
-            Ok((value, explicit)) => (
-                Some(value),
-                if explicit {
-                    CONFIG_SOURCE_TOPIC
-                } else {
-                    CONFIG_SOURCE_DEFAULT
-                },
-            ),
-            // A stored duration that cannot be shown as retention.ms is still the topic's
-            // expiry, not the never-expire default.
-            Err(()) => {
-                unrepresentable = true;
-                (None, CONFIG_SOURCE_TOPIC)
-            }
+        // A stored duration that cannot be shown as retention.ms is still the topic's expiry,
+        // not the never-expire default.
+        let (value, source) = if let Ok((value, explicit)) = snapshot.describe(key) {
+            let source = if explicit {
+                CONFIG_SOURCE_TOPIC
+            } else {
+                CONFIG_SOURCE_DEFAULT
+            };
+            (Some(value), source)
+        } else {
+            unrepresentable = true;
+            (None, CONFIG_SOURCE_TOPIC)
         };
         configs.push(config_entry(
             key.name,
