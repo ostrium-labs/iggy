@@ -29,10 +29,11 @@ pub mod topic_map;
 
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits};
 pub use error::BridgeError;
+pub(crate) use iggy_bridge::CredentialChange;
 pub use iggy_bridge::{
     CLUSTER_ID_TOPIC, ClusterIdCall, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata,
     MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroups, ProduceTurn, Producer,
-    ScannedGroups, SendEnd, StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget,
-    cluster_id_stream,
+    SCRAM_TOPIC, ScannedGroups, ScramStore, SendEnd, StreamTopicCache, TopicCreationOutcome,
+    TopicLoad, TopicTarget, cluster_id_stream,
 };
 pub use topic_map::{TopicMapping, TopicOverride};

@@ -45,18 +45,31 @@ crc32c = { workspace = true }
 # whose decompressors materialize the whole stream before a budget can see it.
 flate2 = { workspace = true }
 futures = { workspace = true }
+# SCRAM server nonces and salts.
+getrandom = { workspace = true }
+# SCRAM-SHA-256/512 (RFC 5802): HMAC, the hashes and PBKDF2, from RustCrypto.
+hmac = "0.12.1"
 iggy = { workspace = true }
+# OAUTHBEARER: JWT signature and claim checks (RustCrypto backend, as the server uses).
+jsonwebtoken = { workspace = true }
 # The codec features stay on for the encoder, which the batch tests use to build fixtures.
 kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
+pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 lz4 = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true }
+# Fetches the identity provider's JWKS for OAUTHBEARER.
+reqwest = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10.9"
 snap = { workspace = true }
 socket2 = { workspace = true }
+# Constant-time comparison of SCRAM proofs.
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
@@ -75,9 +88,12 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 x509-parser = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
 zstd = { workspace = true }
 
 [dev-dependencies]
+# RSA keys for the test identity provider's RS256 tokens; rcgen cannot mint RSA on ring.
+aws-lc-rs = "1.18.2"
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
 # Certificates for the TLS listener tests, minted per test so nothing in the tree expires.
