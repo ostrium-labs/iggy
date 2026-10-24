@@ -84,7 +84,7 @@ test-group = "kafka_bridge"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests)'
+filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests) + binary_id(iggy-gateway-kafka::oracle_auth_diff_tests) + binary_id(iggy-gateway-kafka::sasl_clients_e2e_tests)'
 test-group = "kafka_client_e2e"
 
 # The client compatibility matrix (KW-2) runs real clients in containers against the gateway and
