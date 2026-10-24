@@ -52,7 +52,7 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
-    SaslMechanism, encode_sasl_authenticate_response, encode_sasl_handshake_response,
+    EnabledMechanisms, encode_sasl_authenticate_response, encode_sasl_handshake_response,
 };
 
 pub const API_KEY_PRODUCE: i16 = 0;
@@ -81,6 +81,8 @@ pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
 pub const API_KEY_DELETE_GROUPS: i16 = 42;
 pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 pub const API_KEY_OFFSET_DELETE: i16 = 47;
+pub const API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS: i16 = 50;
+pub const API_KEY_ALTER_USER_SCRAM_CREDENTIALS: i16 = 51;
 pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
@@ -504,6 +506,8 @@ pub struct ConnectionState {
     /// Whether `DescribeAcls` is advertised and answered: the listener names a principal, by
     /// SASL or by a verified client certificate.
     pub acls_enabled: bool,
+    /// Whether the SCRAM credential keys are advertised and answered.
+    pub scram_admin: bool,
     /// Partitions that answered -1 to this connection's Fetches, per Kafka topic.
     pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
     /// Offsets this connection's Fetches cannot place, per Kafka topic.
@@ -547,7 +551,15 @@ impl ConnectionState {
         Advertisement {
             sasl: self.sasl_enabled,
             acls: self.acls_enabled,
+            scram: self.scram_admin,
         }
+    }
+
+    /// Serves `DescribeUserScramCredentials` and `AlterUserScramCredentials` on this connection.
+    #[must_use]
+    pub const fn with_scram_admin(mut self, scram_admin: bool) -> Self {
+        self.scram_admin = scram_admin;
+        self
     }
 
     pub(crate) const fn id(&self) -> u64 {
@@ -795,25 +807,31 @@ pub fn decode_sasl_auth_bytes(api_version: i16, body: Bytes) -> Result<Bytes> {
     Ok(req.auth_bytes)
 }
 
-/// `SaslHandshake` answer. `close` marks the refusal paths, where the response is written and the
-/// connection then dropped.
+/// `SaslHandshake` answer, listing `mechanisms`. `close` marks the refusal paths, where the
+/// response is written and the connection then dropped.
 #[must_use]
-pub fn sasl_handshake_outcome(api_version: i16, error_code: i16, close: bool) -> HandleOutcome {
+pub fn sasl_handshake_outcome(
+    api_version: i16,
+    error_code: i16,
+    mechanisms: &EnabledMechanisms,
+    close: bool,
+) -> HandleOutcome {
     // The mechanism list is what a client prints to tell its operator what to configure, so an
     // unsupported-mechanism refusal carries it. `ILLEGAL_SASL_STATE` does not: the request was out
     // of order, not mis-configured, and a real broker answers that one with an empty list. It also
     // means a gateway with SASL switched off stops telling an unauthenticated scanner that it
     // could speak PLAIN.
-    let mechanisms: &[&str] = if error_code == ERROR_ILLEGAL_SASL_STATE {
-        &[]
+    let names = if error_code == ERROR_ILLEGAL_SASL_STATE {
+        Vec::new()
     } else {
-        SaslMechanism::advertised()
+        mechanisms.names()
     };
-    let encoded = encode_sasl_handshake_response(api_version, error_code, mechanisms);
+    let encoded = encode_sasl_handshake_response(api_version, error_code, &names);
     finish_sasl(encoded, close, "SaslHandshake")
 }
 
-/// `SaslAuthenticate` answer. `close` marks the refusal paths.
+/// `SaslAuthenticate` answer with no token and no session lifetime. `close` marks the refusal
+/// paths.
 #[must_use]
 pub fn sasl_authenticate_outcome(api_version: i16, error_code: i16, close: bool) -> HandleOutcome {
     // Only a credential rejection carries the generic message. An `ILLEGAL_SASL_STATE` also
@@ -821,7 +839,27 @@ pub fn sasl_authenticate_outcome(api_version: i16, error_code: i16, close: bool)
     // would send the operator looking at credentials that were never presented.
     let message =
         (error_code == ERROR_SASL_AUTHENTICATION_FAILED).then_some(SASL_AUTH_FAILED_MESSAGE);
-    let encoded = encode_sasl_authenticate_response(api_version, error_code, message);
+    sasl_authenticate_reply(api_version, error_code, message, Bytes::new(), 0, close)
+}
+
+/// `SaslAuthenticate` answer carrying the server's token and, on success, the session lifetime
+/// (KIP-368). `close` marks the refusal paths.
+#[must_use]
+pub fn sasl_authenticate_reply(
+    api_version: i16,
+    error_code: i16,
+    message: Option<&str>,
+    auth_bytes: Bytes,
+    session_lifetime_ms: i64,
+    close: bool,
+) -> HandleOutcome {
+    let encoded = encode_sasl_authenticate_response(
+        api_version,
+        error_code,
+        message,
+        auth_bytes,
+        session_lifetime_ms,
+    );
     finish_sasl(encoded, close, "SaslAuthenticate")
 }
 
@@ -840,6 +878,27 @@ fn finish_sasl(encoded: Result<Bytes>, close: bool, api_name: &str) -> HandleOut
 #[must_use]
 pub fn sasl_advertised_ranges() -> &'static [ApiVersionRange] {
     SASL_ADVERTISED_RANGES
+}
+
+/// The SCRAM credential keys, advertised only where SCRAM is on, the bridge keeps the
+/// credentials, and the listener names who asks. Absent from [`SUPPORTED_RANGES`] like the ACL
+/// keys: they answer about the authenticated principal's grants.
+static SCRAM_ADVERTISED_RANGES: &[ApiVersionRange] = &[
+    ApiVersionRange {
+        api_key: API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS,
+        min_version: 0,
+        max_version: 0,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_ALTER_USER_SCRAM_CREDENTIALS,
+        min_version: 0,
+        max_version: 0,
+    },
+];
+
+#[must_use]
+pub fn scram_advertised_ranges() -> &'static [ApiVersionRange] {
+    SCRAM_ADVERTISED_RANGES
 }
 
 /// The ACL keys, advertised only on a listener that names a principal.

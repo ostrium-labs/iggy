@@ -37,6 +37,7 @@ use tracing::{debug, warn};
 use crate::bridge::config::{DEFAULT_IGGY_ADDR, IggyTls};
 use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
+use crate::scram::{ScramCredential, ScramMechanism};
 
 /// Bound on one credential verification.
 ///
@@ -271,6 +272,22 @@ pub trait PrincipalResolver: Send + Sync + std::fmt::Debug {
     /// Returns [`AuthError::Rejected`] when no such active user exists and
     /// [`AuthError::Unavailable`] when Iggy cannot be asked.
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError>;
+}
+
+/// Where SCRAM credentials are looked up. The bridge implements it over the credential log it
+/// keeps in Iggy; the protocol tests use a map.
+#[async_trait]
+pub trait ScramCredentialSource: Send + Sync + std::fmt::Debug {
+    /// The credential for `username` under `mechanism`, or `None` when it has none.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Unavailable`] when the store cannot be read.
+    async fn scram_credential(
+        &self,
+        username: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<Option<ScramCredential>, AuthError>;
 }
 
 /// Verifies credentials by logging into a real Iggy server with them.
@@ -574,6 +591,8 @@ impl From<&Permissions> for PrincipalPermissions {
             manage_topics: manages,
             poll_messages: global.poll_messages || reads || manages,
             send_messages: global.send_messages || manages,
+            read_users: global.read_users || global.manage_users,
+            manage_users: global.manage_users,
         }
     }
 }

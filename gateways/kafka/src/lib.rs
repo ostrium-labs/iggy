@@ -24,9 +24,11 @@ pub mod env;
 pub mod error;
 pub mod group;
 pub mod listener;
+pub mod oauth;
 pub mod producer_state;
 pub mod protocol;
 pub mod records;
+pub mod scram;
 pub mod server;
 pub mod tls;
 

@@ -159,8 +159,9 @@ All API keys not listed above close the connection (see Governance model above) 
 | 17 | SaslHandshake | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 29 | DescribeAcls | Implemented on listeners that name a principal: the SASL ones, and `SSL` with client certificates; advertised only there ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 50, 51 | DescribeUserScramCredentials, AlterUserScramCredentials | Implemented (v0) where SCRAM is enabled, the bridge keeps the credentials and the listener names a principal; advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md#scram)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
-| 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 48 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
+| 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 48, 49, 52 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
@@ -531,13 +532,17 @@ InitProducerId and idempotent producers
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).
 
+- [x] SASL/SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER ([#4512](https://github.com/apache/iggy/issues/4512),
+      fork task KW-9), chosen with `IGGY_KAFKA_SASL_MECHANISMS`: SCRAM against salted keys the
+      gateway keeps in an Iggy topic, administered with `AlterUserScramCredentials` (51) and
+      `DescribeUserScramCredentials` (50); OAUTHBEARER against a JWKS with issuer and audience
+      required; KIP-368 `session_lifetime_ms` and re-authentication on the same connection
 - [x] SASL/PLAIN (17, 36), opt-in via `IGGY_KAFKA_SASL_ENABLED`, credentials verified against Iggy.
       Kept out of `SUPPORTED_RANGES` on purpose: the connection loop routes both keys through the
       SASL state machine before dispatch, so a gateway with the feature off advertises neither key
       and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
       connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
-      silently widen what an unauthenticated client may send. SCRAM is ruled out by Iggy's
-      credential storage, not deferred
+      silently widen what an unauthenticated client may send
 - [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
       bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
       (31) are not implemented and not advertised

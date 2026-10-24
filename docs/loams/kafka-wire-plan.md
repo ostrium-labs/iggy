@@ -198,8 +198,8 @@ breadth. Status is `Planned` unless noted.
 | KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | Planned | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
-| KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | Planned | KW-1 | Yes |
-| KW-10 | Per-principal authorization, ACL admin | #4518 | Planned | KW-9 | Yes (design first) |
+| KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (PR for lane F; see "As built") | KW-1 | Yes |
+| KW-10 | Per-principal authorization, ACL admin | #4518 | Planned (design notes below; not started) | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | Planned | KW-1 | Yes |
 | KW-12 | Configurable limits; member client id and host | #4530, #4511 | Planned | KW-0 | Yes |
 | KW-13 | KIP-848 consumer groups | #4523 | Planned | KW-8 | Yes |
@@ -569,6 +569,43 @@ with Kafka's unsecured-JWT validator and a JWKS validator, SCRAM through
 
 **Exit.** #4512's acceptance criteria pass for OAUTHBEARER and SCRAM.
 
+**As built (2026-10-24).** Upstream had nothing on #4512 (#3549, numinnex's PLAIN, is closed and
+landed; KW-9 builds on its state machine and `IggyAuthenticator` rather than replacing them).
+`IGGY_KAFKA_SASL_MECHANISMS` picks any of PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 and OAUTHBEARER.
+
+- `src/oauth.rs`: JWT validation with `jsonwebtoken` (RustCrypto backend, as the server uses),
+  JWKS from an https URL (http only on loopback or with `IGGY_KAFKA_OAUTH_JWKS_ALLOW_HTTP`) or a
+  file, cached, refreshed on an interval and on an unknown `kid` (at most every 10 s). Issuer and
+  audience required, `exp` checked, `nbf` honoured, configurable principal claim (`sub` by
+  default; `preferred_username` suits Zitadel). Algorithm-confusion defences: asymmetric
+  algorithms only (`HS*` refused at startup), key type and curve must match `alg`, `oct` and
+  encryption keys never loaded, token-embedded keys (`jwk`, `jku`) never consulted. A refused
+  token gets Kafka's RFC 7628 `{"status":"invalid_token"}` challenge, then 58.
+- `src/scram.rs` + `bridge/iggy_bridge/scram_store.rs`: SCRAM per RFC 5802/7677 with RustCrypto
+  `hmac`/`sha2`/`pbkdf2`, `subtle` for the proof comparison, `getrandom` nonces. Credentials (salt,
+  iterations, StoredKey, ServerKey; never the password) are a JSON log in Iggy topic
+  `<default stream>.meta/scram`, replayed by every gateway, read on its own client. Stricter than
+  Kafka: channel binding checked, `m=` and `tokenauth` refused, and an unknown user gets a decoy
+  salt and fails at the proof rather than at the first message (no user enumeration).
+- `DescribeUserScramCredentials` (50) and `AlterUserScramCredentials` (51) v0 with Kafka's
+  per-user errors (91, 92, 93, 33); gated on Iggy `read_users` / `manage_users` (31 otherwise).
+- KIP-368: `session_lifetime_ms` = token life capped by `IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS`;
+  re-authentication on the same connection (same mechanism, same principal, as Kafka); an expired
+  session is closed on its next request.
+- Every mechanism ends at an active Iggy user, looked up through the bridge (`read_users`).
+
+Tests: unit (parsers, SCRAM RFC 7677 vector, decoys, store replay, admin validation), socket
+tests with stub verifiers (`sasl_mechanisms_tests.rs`), validator tests against a minted RS256 /
+ES256 / EdDSA test issuer (`oauth_validator_tests.rs`: expired, foreign issuer, wrong audience,
+`alg: none`, HS256 confusion, foreign key, embedded key, rotation), real clients
+(`sasl_clients_e2e_tests.rs`: Java 3.9 tools incl. `kafka-configs` SCRAM admin and OAUTHBEARER via
+the token endpoint, kcat 1.7 SCRAM, confluent-kafka-python 2.16 with all mechanisms and a
+re-authentication run), and the oracle (`oracle_auth_diff_tests.rs`, Apache Kafka 4.3.1 with the
+same four mechanisms and Kafka's JWKS validator). Expected declared differences: the unknown-user
+SCRAM timing and the gateway's `manage_users` gate on Alter (Kafka runs without an authorizer).
+Not done: franz-go (waits for the KW-2 matrix harness), Redpanda as an auth oracle (needs an OIDC
+discovery document), GSSAPI and delegation tokens (on request).
+
 ### KW-10. Per-principal authorization and ACL admin
 
 **Why.** Loams namespaces must not read each other's topics; today every client
@@ -594,6 +631,21 @@ clients), every data-plane handler's authorization check,
 model is coarser.
 
 **Exit.** #4518's acceptance criteria pass.
+
+**Status and notes for whoever picks it up (2026-10-24, lane F stopped before starting it).**
+The plan's default (one Iggy session per principal) does not work for KW-9's principals: OAUTHBEARER,
+SCRAM and mTLS identities carry no Iggy credential, and AUTHENTICATION.md rules out keeping PLAIN
+passwords. The workable default is gateway-side enforcement of the principal's own Iggy
+`Permissions` (read through the bridge with `read_users`, ids resolved to stream and topic names,
+cached with a short TTL and invalidated by this gateway's own ACL writes), evaluated with exactly
+the rules in `core/metadata/src/permissioner/permissioner_rules/` (poll, append, get_topic,
+create_topic, manage_topic), the bridge's user as the ceiling. Kafka groups have no Iggy resource:
+derive group access from topic read access, and record that one tenant can disrupt another's group
+membership (not read its data) as an open question. CreateAcls/DeleteAcls map only the exact cases
+(TOPIC literal READ→poll, WRITE→send, ALL→manage_topic; DESCRIBE only alongside READ/WRITE; TOPIC
+`*`→default-stream permissions) and refuse the rest with a message; topics must exist (Iggy keys
+grants by id). Quotas (48, 49) stay on request. This needs an owner decision before building,
+since it replaces the plan's default.
 
 ### KW-11. Repeated header names and header order
 
@@ -906,3 +958,6 @@ the owner's machine (disk), and let fork CI do the full runs.
 4. KW-6: write the compaction design note for upstream discussion first, or
    build it in the fork straight away? Default: fork first, note kept ready.
 5. KW-T: when to start building transactions, if at all.
+6. KW-10: enforce each principal's Iggy permissions in the gateway (the bridge's user as the
+   ceiling), instead of the plan's one-Iggy-session-per-principal default, which cannot work for
+   OAUTHBEARER, SCRAM and certificate principals? See KW-10's status note.
