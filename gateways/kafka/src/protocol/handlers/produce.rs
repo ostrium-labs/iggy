@@ -165,6 +165,22 @@ pub async fn handle(
         );
     }
 
+    // Among several gateways, a partition's batches go to its leader only, so one gateway holds
+    // its producer state. A client with stale metadata is told to refresh it, and nothing of the
+    // request is written: Kafka clients send one request per leader, so this is a request that
+    // went to the wrong gateway, and its retry goes to the right one.
+    if !leads_every_partition(state, &request) {
+        tracing::debug!("Produce names a partition another gateway leads");
+        return if request.acks == ACKS_NONE {
+            HandleOutcome::Close
+        } else {
+            respond_or_close(
+                encode_uniform_response(api_version, &request, ERROR_NOT_LEADER_OR_FOLLOWER),
+                "Produce",
+            )
+        };
+    }
+
     // Before planning, not after: the client waits through decompression too.
     let deadline = Deadline::new(request.timeout_ms);
     // The turn before the memory: a request that waits behind its producer's stuck send then
@@ -209,6 +225,21 @@ pub async fn handle(
         };
     }
     respond_or_close(encode_written_response(api_version, responses), "Produce")
+}
+
+/// Whether this gateway leads every partition `request` writes to (`crate::membership`). A
+/// gateway that runs alone leads them all.
+fn leads_every_partition(state: &GatewayState, request: &ProduceRequest) -> bool {
+    if !state.membership.is_shared() {
+        return true;
+    }
+    let snapshot = state.membership.snapshot();
+    request.topic_data.iter().all(|topic| {
+        topic
+            .partition_data
+            .iter()
+            .all(|partition| snapshot.leads(topic.name.as_str(), partition.index))
+    })
 }
 
 /// No bridge: answer retriable so clients keep their data instead of trusting a discarded write.

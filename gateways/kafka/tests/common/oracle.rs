@@ -194,6 +194,16 @@ impl Container {
         Ok(Self { name })
     }
 
+    /// Stops the container the way an operator does, with SIGTERM and a grace period, so a broker
+    /// runs its controlled shutdown.
+    pub fn stop(&self) {
+        let _ = Command::new(container_cli())
+            .args(["stop", "-t", "30", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
     /// The container's recent output, for a failure message.
     #[must_use]
     pub fn logs_tail(&self) -> String {

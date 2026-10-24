@@ -106,10 +106,14 @@ pub async fn handle(
             ScannedGroups::Failed => {}
         }
     }
+    // Among several gateways each lists the groups it coordinates, and the admin client asks
+    // every broker.
+    let snapshot = state.membership.snapshot();
     let listings: Vec<GroupListing> = listings
         .into_iter()
         .filter(|group| {
-            selected(&request.states_filter, group.state)
+            snapshot.coordinates(group.group_id.as_str())
+                && selected(&request.states_filter, group.state)
                 && selected(&request.types_filter, CLASSIC_GROUP_TYPE)
         })
         .collect();

@@ -32,6 +32,7 @@ use iggy_gateway_kafka::env::parse_bool;
 use iggy_gateway_kafka::listener::{
     ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
 };
+use iggy_gateway_kafka::membership::MembershipConfig;
 use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
@@ -149,6 +150,9 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
     "IGGY_KAFKA_BRIDGE_ENABLED",
     "IGGY_KAFKA_INSTANCE_ID",
+    "IGGY_KAFKA_NODE_ID",
+    "IGGY_KAFKA_MEMBERSHIP_HEARTBEAT_MS",
+    "IGGY_KAFKA_MEMBERSHIP_LEASE_MS",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -325,6 +329,7 @@ fn load_config() -> Result<GatewayConfig, String> {
              Iggy cluster needs its own value, or they hand out colliding producer ids"
         );
     }
+    config.membership = load_membership(bridge_enabled()?)?;
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
     if config.auto_topic_creation.enabled {
         info!(
@@ -339,6 +344,50 @@ fn load_config() -> Result<GatewayConfig, String> {
     )?;
 
     Ok(config)
+}
+
+/// `IGGY_KAFKA_NODE_ID` and the membership timings, when this gateway shares a bootstrap list
+/// with others. The timings are refused without a node id, which is what turns membership on.
+fn load_membership(bridge_enabled: bool) -> Result<Option<MembershipConfig>, String> {
+    let heartbeat = env_var("IGGY_KAFKA_MEMBERSHIP_HEARTBEAT_MS");
+    let lease = env_var("IGGY_KAFKA_MEMBERSHIP_LEASE_MS");
+    let Some(raw) = env_var("IGGY_KAFKA_NODE_ID") else {
+        if heartbeat.is_some() || lease.is_some() {
+            return Err(
+                "IGGY_KAFKA_MEMBERSHIP_HEARTBEAT_MS and IGGY_KAFKA_MEMBERSHIP_LEASE_MS need \
+                 IGGY_KAFKA_NODE_ID, which puts this gateway among others"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    };
+    let node_id: i32 = raw
+        .parse()
+        .map_err(|e| format!("invalid IGGY_KAFKA_NODE_ID `{raw}`: {e}"))?;
+    if !bridge_enabled {
+        return Err(
+            "IGGY_KAFKA_NODE_ID needs IGGY_KAFKA_BRIDGE_ENABLED=true: gateways find each other \
+             through Iggy"
+                .to_string(),
+        );
+    }
+    let mut config = MembershipConfig::new(node_id);
+    if let Some(raw) = heartbeat {
+        config.heartbeat_interval =
+            Duration::from_millis(parse_positive("IGGY_KAFKA_MEMBERSHIP_HEARTBEAT_MS", &raw)?);
+    }
+    if let Some(raw) = lease {
+        config.lease =
+            Duration::from_millis(parse_positive("IGGY_KAFKA_MEMBERSHIP_LEASE_MS", &raw)?);
+    }
+    config.validate()?;
+    info!(
+        node_id,
+        heartbeat_ms = config.heartbeat_interval.as_millis(),
+        lease_ms = config.lease.as_millis(),
+        "this gateway shares its bootstrap list with the other gateways announced in Iggy"
+    );
+    Ok(Some(config))
 }
 
 /// The listeners, from `IGGY_KAFKA_LISTENERS` or from the single-listener variables.

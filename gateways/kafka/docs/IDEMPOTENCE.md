@@ -146,8 +146,10 @@ must first either persist a high-water mark and seed the counter above it, or bu
 
 `IGGY_KAFKA_INSTANCE_ID` defaults to 0 so a single gateway needs no configuration. Two gateways
 left on the default draw from the same 47-bit space and can hand out identical ids, on the first
-allocation if they start in the same millisecond. Nothing in the cluster detects that, so a gateway started without the
-variable logs a warning, and the running value is in the startup log line.
+allocation if they start in the same millisecond. A gateway started without the variable logs a
+warning, and the running value is in the startup log line. Gateways that set `IGGY_KAFKA_NODE_ID`
+announce their instance ids to each other, and each one warns when it hears another with its own
+([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#several-gateways-behind-one-bootstrap-list)).
 
 An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
 `kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no

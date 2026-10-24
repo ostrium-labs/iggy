@@ -17,7 +17,8 @@
 
 //! `DescribeCluster` (API key 60).
 //!
-//! Answers the cluster id and the one broker Metadata advertises on the same listener. Java
+//! Answers the cluster id and the brokers Metadata advertises on the same listener: this gateway
+//! alone, or every live gateway that shares its bootstrap list (`crate::membership`). Java
 //! `Admin.describeCluster` and Confluent REST Proxy ask this before Metadata.
 //!
 //! `cluster_authorized_operations` stays at the schema default, `i32::MIN`, even when the
@@ -60,8 +61,8 @@ const MISMATCHED_CONTROLLER_MESSAGE: &str = concat!(
     "but we wanted an endpoint of type CONTROLLER"
 );
 
-/// The node id this gateway advertises for itself, in Metadata and here alike.
-const SELF_NODE_ID: i32 = 1;
+/// The node id a gateway that runs alone advertises for itself, in Metadata and here alike.
+const SELF_NODE_ID: i32 = crate::membership::SINGLE_NODE_ID;
 
 #[expect(
     clippy::unused_async,
@@ -93,8 +94,22 @@ pub async fn handle(
             );
         }
     };
+    let snapshot = state.membership.snapshot();
+    let brokers = snapshot.brokers(connection.security_protocol(), &connection.broker);
+    let controller = snapshot.controller();
+    let controller = if brokers.iter().any(|(node_id, _)| *node_id == controller) {
+        controller
+    } else {
+        snapshot.node_id()
+    };
     respond_or_close(
-        encode_response(api_version, &request, &state.cluster_id, &connection.broker),
+        encode_brokers_response(
+            api_version,
+            &request,
+            &state.cluster_id,
+            &brokers,
+            controller,
+        ),
         "DescribeCluster",
     )
 }
@@ -107,6 +122,27 @@ pub fn encode_response(
     request: &DescribeClusterRequest,
     cluster_id: &ClusterId,
     broker: &BrokerAdvertise,
+) -> Result<Bytes> {
+    encode_brokers_response(
+        version,
+        request,
+        cluster_id,
+        &[(SELF_NODE_ID, broker.clone())],
+        SELF_NODE_ID,
+    )
+}
+
+/// [`encode_response`] for a gateway among others: every broker of `brokers`, and `controller`.
+///
+/// # Errors
+///
+/// Returns an error when `kafka_protocol` cannot encode the response at `version`.
+pub fn encode_brokers_response(
+    version: i16,
+    request: &DescribeClusterRequest,
+    cluster_id: &ClusterId,
+    brokers: &[(i32, BrokerAdvertise)],
+    controller: i32,
 ) -> Result<Bytes> {
     // Kafka's `AuthHelper.computeDescribeClusterResponse`, whose refusals leave the endpoint
     // type at its default. v0 has no endpoint type field, so it decodes as the broker default
@@ -128,15 +164,20 @@ pub fn encode_response(
             .with_error_message(Some(message));
         return encode_message(&response, version, 128);
     }
-    let broker_entry = DescribeClusterBroker::default()
-        .with_broker_id(BrokerId(SELF_NODE_ID))
-        .with_host(StrBytes::from_string(broker.host.clone()))
-        .with_port(broker.port);
+    let brokers = brokers
+        .iter()
+        .map(|(node_id, broker)| {
+            DescribeClusterBroker::default()
+                .with_broker_id(BrokerId(*node_id))
+                .with_host(StrBytes::from_string(broker.host.clone()))
+                .with_port(broker.port)
+        })
+        .collect();
     let response = DescribeClusterResponse::default()
         .with_endpoint_type(ENDPOINT_TYPE_BROKER)
         .with_cluster_id(StrBytes::from_string(cluster_id.to_string()))
-        .with_controller_id(BrokerId(SELF_NODE_ID))
-        .with_brokers(vec![broker_entry]);
+        .with_controller_id(BrokerId(controller))
+        .with_brokers(brokers);
     encode_message(&response, version, 128)
 }
 

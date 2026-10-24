@@ -10,7 +10,7 @@ live in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 
 | API key | Name | Versions | Notes |
 | --- | --- | --- | --- |
-| 10 | FindCoordinator | 0-4 | Always answers "this gateway", the same node the Metadata broker list advertises |
+| 10 | FindCoordinator | 0-4 | Answers the gateway that coordinates the group: this one when it runs alone, else the owner among the gateways sharing the bootstrap list ([below](#several-gateways-behind-one-bootstrap-list)) |
 | 11 | JoinGroup | 0-9 | Parks until the group's join barrier completes |
 | 12 | Heartbeat | 0-4 | Refreshes a session; `REBALANCE_IN_PROGRESS` is how a follower learns to rejoin |
 | 13 | LeaveGroup | 0-5 | Removes members; survivors' parked joins and syncs are released at once |
@@ -214,22 +214,74 @@ with the most first-preference votes; a tie is broken by the leader's own list o
 that tie by set iteration order, which is not deterministic - this one is, deliberately, so tests
 can pin it.
 
-## One gateway per bootstrap endpoint
+## Several gateways behind one bootstrap list
 
-Group membership is process memory. Two gateway instances fronting one Iggy cluster do **not**
-share it, and a client that can reach both ends up in two independent groups under one name:
+[#4515](https://github.com/apache/iggy/issues/4515). Gateways that front one Iggy cluster can share
+one bootstrap list. Each one is a Kafka broker with a node id of its own, set with
+`IGGY_KAFKA_NODE_ID`, and each group has exactly one coordinator among them. Without
+`IGGY_KAFKA_NODE_ID` a gateway runs alone, as node 1, and coordinates every group, as before.
 
-1. Each gateway advertises itself as the coordinator. A client that joined on gateway A and later
-   connects to B is told `UNKNOWN_MEMBER_ID` and rejoins on B with a fresh id.
-2. Each group's leader assigns **all** partitions to its own members, so every partition has two
-   consumers and every record is delivered twice.
-3. Both groups commit against the same Iggy key, so committed offsets flip between the two
-   groups' positions.
+**How they find each other.** Every gateway appends an announcement to the one-partition Iggy topic
+`<default stream>.meta/gateways` each heartbeat interval (`IGGY_KAFKA_MEMBERSHIP_HEARTBEAT_MS`,
+2 s by default) and reads what the others appended. An announcement names the node id, its
+advertised address for each listener protocol, and a random incarnation. Iggy stamps it with its
+append time, and every judgement is made on those stamps, not on a gateway's own clock:
 
-The rule that follows: one gateway per Kafka bootstrap endpoint, with
-`IGGY_KAFKA_ADVERTISED_HOST`/`_PORT` routing back to that same instance, and no load balancer in
-front of more than one gateway for consumers. Fixing this needs a shared coordinator (Iggy-backed
-group state, or gateway-to-gateway forwarding) and is out of scope here.
+- A gateway is live while its last announcement is at most one lease
+  (`IGGY_KAFKA_MEMBERSHIP_LEASE_MS`, 10 s by default) older than the newest announcement in the
+  topic. A gateway that shuts down says goodbye, and the others drop it at once. One that crashes
+  drops out when its lease runs out.
+- A live gateway is eligible to coordinate groups and lead partitions once its first announcement
+  is two heartbeat intervals older than the newest. So a gateway that starts takes nothing until
+  the others have heard of it. When no live gateway is eligible yet, all live ones are. A gateway
+  that restarts within its lease keeps its place.
+
+Two gateways that have read the same announcements agree on both sets. Announcements expire after an
+hour.
+
+**Who coordinates a group.** Rendezvous hashing of the group id over the eligible gateways.
+`FindCoordinator` on any gateway answers the coordinator at its address for the protocol of the
+asking connection. A gateway that joins or leaves moves only the groups it takes or gives up.
+
+**What a gateway that is not the coordinator answers.** `NOT_COORDINATOR` (16) to `JoinGroup`,
+`SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetDelete`, and per group to
+`DescribeGroups` and `DeleteGroups`. Clients find the coordinator again and rejoin there, with
+their committed offsets, which live in Iggy. A `JoinGroup` or `SyncGroup` parked on a gateway that
+stops coordinating the group is released with 16 at once, not at the end of its rebalance timeout.
+`ListGroups` lists only the groups the gateway coordinates, and the admin clients ask every broker.
+`OffsetFetch` is answered by every gateway, since it only reads Iggy.
+
+**Partitions.** Metadata lists every live gateway as a broker and names a leader for each partition,
+by the same hashing of the topic and partition. `Produce` to a partition another gateway leads
+answers `NOT_LEADER_OR_FOLLOWER` (6) and writes nothing, so the client refreshes Metadata and
+resends to the leader. That keeps the batches of one partition on one gateway's idempotent producer
+state ([`IDEMPOTENCE.md`](IDEMPOTENCE.md)). When leadership moves, the new leader has no state for
+the producer and accepts its next batch at any sequence, as after a restart. `Fetch` and
+`ListOffsets` are served by every gateway.
+
+**What operators set.**
+
+- `IGGY_KAFKA_NODE_ID`, unique per gateway (0 or more). Two gateways with one id split every group
+  they share; the gateway logs an error when it hears that.
+- `IGGY_KAFKA_INSTANCE_ID`, unique per gateway too, as before: it keeps producer ids apart.
+- Each gateway advertises its own reachable address (`IGGY_KAFKA_ADVERTISED_*`). A load balancer
+  may serve the bootstrap list, but each gateway must be reachable at the address it advertises,
+  since clients are sent to a particular one.
+- The same listener protocols on every gateway. A coordinator with no listener of the asking
+  connection's protocol answers `COORDINATOR_NOT_AVAILABLE` (15).
+- The bridge's Iggy user needs `send_messages` and `poll_messages` on the `<default stream>.meta`
+  stream, and `manage_topics` there unless an operator creates the `gateways` topic first.
+
+**Limits.**
+
+- Group state is still the coordinator's memory. When a group moves, its members rejoin, which is
+  one rebalance. Static members (KIP-345) rejoin with their instance ids.
+- During a change, gateways can disagree for up to one heartbeat interval, and a client can be told
+  16 or 6 by both the old and the new owner before it settles. Kafka clients retry both.
+- A gateway that cannot reach Iggy keeps its last view. One that never reached it serves as the only
+  gateway, as it cannot serve data either.
+- Iggy's append times come from the node that holds the gateways partition. If that moves to a node
+  whose clock runs ahead, the others can look expired for one heartbeat interval.
 
 Group state also does not survive a gateway restart. Clients recover on their own - a member id
 the coordinator does not know is answered with `UNKNOWN_MEMBER_ID`, which is what makes the Java
