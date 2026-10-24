@@ -192,7 +192,7 @@ breadth. Status is `Planned` unless noted.
 | KW-0 | Fork setup: `loams` branch, workflows, lean CI | — | **Done** (7aa0efbf4) | — | No |
 | KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | **Built** (this PR) | KW-0 | Yes |
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | Planned | KW-1 | Yes |
-| KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Part 1 built** (producer state); parts 2–3 planned | KW-1 | Yes |
+| KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Built** (parts 1–3); Java/franz-go e2e under injected timeouts open | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
@@ -376,6 +376,34 @@ epoch refused with 47), and the `idempotent_producer` oracle scenario, which mat
 fact for fact. Still open: part 2 (an unknown outcome is written again), part 3 (state is lost on
 restart), the Java producer e2e under injected timeouts, and KIP-360's epoch bump on
 InitProducerId with an existing id.
+
+**As built, part 2 (2026-10-24).** The SDK seams named above were built upstream in another
+shape: the SDK retains a mutation it got no answer for (`OperationUncertain(op)`, `LaneBlocked`,
+`Client::resolve_operation`), and a replay carries the same client and request id, which Iggy's
+`ClientTable` deduplicates. No SDK change was needed. The bridge used to read
+`OperationUncertain` as a refusal, so the retry was written after the SDK replayed the first send:
+two copies. Now such a batch is kept in doubt with its operation, a retry replays it
+(`IggyBridge::resolve_send`), the next batch replays it first and answers 45 if it never landed,
+and `LaneBlocked` answers 7. Tests: 5 unit tests, and a real-server test that holds the bridge's
+connection in a relay until the SDK gives up, lets the send land late, and checks the retry is not
+written again. Still open after part 2: a send whose request nothing keeps (slot-limit cut-off,
+replaced session, closed session) and a retry across a restart (part 3).
+
+**As built, part 3 (2026-10-24).** Rebuild from the log, the default above (the owner did not
+overrule it). The first record of each idempotent batch carries `kafka.p` (20 bytes: layout,
+producer id, epoch, first and last sequence, flags with bit 0 kept for KW-T) and `kafka.v` 2; all
+other records stay at version 1, and Fetch reads both. A gateway reads the marks in a partition's
+last 10,000 records before it checks that partition's first idempotent batch, and rebuilds each
+producer's epoch and last five batches; the same marks give a replayed send its offset and settle
+an unknown outcome before a rewrite. Ruling: a producer older than the window is accepted at any
+sequence, not answered 59, because Kafka 4.x does that (`ProducerAppendInfo.checkSequence`). Tests:
+unit tests for the marker and the restore; `producer_restart_real_bridge_tests.rs` SIGKILLs a
+gateway process between a batch landing and the retry; the `idempotent_restart` oracle scenario
+restarts Apache Kafka (and Redpanda nightly) and the gateway mid-sequence. Still at-least-once: an
+unknown-outcome batch whose request is gone and that is not in the scanned tail or lands after the
+scan, and a late landing from a dead gateway after the next one scanned (needs KW-5's fence).
+Still open: the Java producer and franz-go e2e under injected timeouts, KIP-360's epoch bump on
+InitProducerId with an existing id, and a configurable window (KW-12).
 
 ### KW-4. Topic configurations frameworks send
 
