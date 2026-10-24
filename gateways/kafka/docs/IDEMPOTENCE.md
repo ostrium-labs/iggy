@@ -268,19 +268,51 @@ SDK change is needed; the gateway had only to use it:
 connection to Iggy in a relay until the SDK gives up on a send, lets the send land late, and
 checks that the producer's retry is answered without a second copy.
 
-What this does not close yet:
+### Restart safety (part 3)
 
-- A send whose request nothing keeps any more leaves its batch unknown: one cut off at the slot
-  limit (its client is closed), one whose Iggy session was replaced before the replay (the SDK
-  drops retained operations then), and one whose Produce session closed (idle for
-  `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS`, 10 minutes by default, far past a producer's 2 minute
-  `delivery.timeout.ms`). Its retry is written again, so those cases stay at-least-once. Part 3
-  narrows them by looking the batch up in the log.
-- State lives in the gateway's memory. After a restart, or on another gateway, a producer has no
-  state and its next batch is accepted at any sequence, as Kafka accepts a producer whose state
-  expired. Part 3 rebuilds state from the log.
-- At most 100,000 producer-partition entries, forgotten after a day idle (Kafka's
-  `producer.id.expiration.ms`) or least recently used first when full.
+Kafka rebuilds its producer state from its log on start. The gateway does the same from Iggy:
+
+- The first record of every idempotent batch carries a `kafka.p` header with the batch's producer
+  id, epoch and first and last sequence, and says `kafka.v` 2 (`docs/BRIDGE_MAPPING.md`, "Batch-level
+  fields"). Fetch shows the record unchanged.
+- Before a gateway checks the first idempotent batch for a partition, it reads the marks in the
+  partition's last `DEFAULT_RECOVERY_RECORDS` (10,000) records and rebuilds each producer seen
+  there: its newest epoch and its last five batches with their offsets
+  (`ProducerStates::restore`, `IggyBridge::producer_marks`). Once per partition and gateway run.
+  If the scan fails, the batch answers as the bridge failed (retriable) and nothing is written:
+  checked against no state, a retry from before the restart would be written twice.
+- So after a restart or a crash, a retry of a batch that landed is answered with its original
+  offset, a gap is 45 and an older epoch 47, as before it. A producer whose last batches are
+  older than the window has no state and is accepted at any sequence, which is what Kafka does for
+  a producer whose state expired. The plan's "answer 59" for that case is not what Kafka 4.x does
+  (`ProducerAppendInfo.checkSequence` accepts it), so the gateway follows Kafka.
+- The marks also settle what the replay of part 2 leaves open: a replay that proves a batch landed
+  gets its offset from the log, and a batch whose outcome is unknown and whose request is gone
+  (`Landing::Unknown`, `Resolution::Lost`) is looked up there before it is written again.
+
+`producer_restart_real_bridge_tests.rs` kills a gateway process with SIGKILL after a batch landed
+and before the producer retries it, and checks that the next gateway answers the retry with the
+first offset, refuses a gap, and stores every record once. The oracle scenario
+`idempotent_restart` (`tests/oracle_wire_diff_tests.rs`) restarts Apache Kafka and the gateway in
+the middle of the same sequence and compares every answer.
+
+Compatible with transactions later (KW-T): epochs are kept per producer id and partition and a
+higher epoch replaces the state, which is what an external bump from a transaction coordinator
+needs; the marker keeps a flags byte for the transactional bit. Nothing here implements
+transactions, and InitProducerId keeps refusing a `transactional_id`.
+
+What stays at-least-once:
+
+- A batch whose outcome is unknown, whose request nothing keeps (cut off at the slot limit, its
+  session replaced, or its Produce session closed after 10 idle minutes), and which is not found
+  in the scanned tail: either it never landed, or it is older than the window, or it is still in
+  Iggy's pipeline and lands after the gateway looked. It is written again.
+- A batch that lands, from a gateway that then dies, after the next gateway already scanned the
+  partition: the same late-landing window, which only a fence on the old gateway's Iggy sessions
+  closes (KW-5's ownership model).
+- More than 100,000 producer-partition entries, or a producer idle for a day: forgotten, and then
+  accepted at any sequence, as on Kafka.
+- The window is a constant today; making it configurable belongs to KW-12 (configurable limits).
 
 ## Invariants this design rests on
 
@@ -303,11 +335,13 @@ branch load-bearing.
 
 ## What this does not give you
 
-A producer that holds an id believes its retries are deduplicated. They are not. A retry after a
-network timeout writes the record twice, and both copies reach the stream with their own offsets.
+Upstream, as written for #3545: a producer that holds an id believes its retries are
+deduplicated, and they are not. A retry after a network timeout writes the record twice, and
+both copies reach the stream with their own offsets. Iggy's own deduplication does not help,
+because it guards the other hop.
 
-Iggy's own deduplication does not help, because it guards the other hop. Delivery through the
-gateway is at-least-once until dedup lands, and at-least-once across a gateway restart after that.
+In the Ostrium fork, KW-3 parts 1 to 3 above close that, except for the narrow cases listed under
+"What stays at-least-once".
 
 The README states that limitation under "Delivery guarantees", so a user does not have to infer
 it from the presence of key 22.
