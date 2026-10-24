@@ -103,14 +103,14 @@ KW-2's matrix replaces each with a measured result.
 | Client | What it does on the wire | Works today | Blocked by |
 | --- | --- | --- | --- |
 | Java client 3.9 / 4.x | Idempotent producer by default (`acks=all`, 5 in flight); classic groups; Admin | Yes, at-least-once | KW-3 (duplicates and reordering on retry), KW-8 (4.x negotiates lower versions; fine), KW-13 (`group.protocol=consumer`) |
-| librdkafka 2.x (confluent-kafka-*, Vector, Fluent Bit, RisingWave) | Producer not idempotent by default; classic groups via subscribe; `assign` for RisingWave; watermark queries | Yes (kcat 1.7.1 is librdkafka 1.7 in today's suite; 2.x not tested) | KW-2 (test it), KW-3 if `enable.idempotence=true`, KW-13 for `group.protocol=consumer` |
-| franz-go | Idempotent by default; KIP-848 when the broker advertises it, else classic | Expected yes (not tested) | KW-2, KW-3 |
+| librdkafka 2.x (confluent-kafka-*, Vector, Fluent Bit, RisingWave) | Producer not idempotent by default; classic groups via subscribe; `assign` for RisingWave; watermark queries | Yes: confluent-kafka-python 2.16 passes the KW-2 smoke (produce, group consume, commit, resume) | KW-2 (test it), KW-3 if `enable.idempotence=true`, KW-13 for `group.protocol=consumer` |
+| franz-go | Idempotent by default; KIP-848 when the broker advertises it, else classic | Yes: franz-go 1.22.1 passes the KW-2 smoke | KW-2, KW-3 |
 | kcat | librdkafka 1.7 | Yes (in today's suite) | None |
-| Kafka Connect distributed + Debezium | Creates `config`, `offset`, `status` topics with `cleanup.policy=compact` and RF 3; reads them in full at start; Debezium schema history topic with `retention.ms`/`retention.bytes`; `connect` group protocol through JoinGroup/SyncGroup | Starts only on topics created by hand (verify) | KW-4 (configs), KW-6 (compaction, or the internal topics grow without bound), KW-3 (config topic producer is idempotent) |
-| Flink Kafka connector (KafkaSource / KafkaSink) | Admin `describeTopics`, `listOffsets` (earliest, latest, timestamp); `assign` + Fetch; commits offsets on checkpoint with no group membership; sink `AT_LEAST_ONCE` uses an idempotent producer; `EXACTLY_ONCE` uses transactions | `AT_LEAST_ONCE` expected yes (verify the standalone commit) | KW-2, KW-3, KW-7 (EARLIEST and data-loss checks), KW-T for `EXACTLY_ONCE` |
-| RisingWave source and sink | librdkafka; `assign` with offsets; watermark queries; sink with `upsert`/`debezium` formats, keys and tombstones | Expected yes (verify) | KW-2, KW-7 (EARLIEST) |
-| Vector `kafka` source and sink | librdkafka subscribe, async commits; sink producer | Expected yes (verify) | KW-2 |
-| Fluent Bit `in_kafka` / `out_kafka` | librdkafka | Expected yes (verify) | KW-2 |
+| Kafka Connect distributed + Debezium | Creates `config`, `offset`, `status` topics with `cleanup.policy=compact` and RF 3; reads them in full at start; Debezium schema history topic with `retention.ms`/`retention.bytes`; `connect` group protocol through JoinGroup/SyncGroup | No: the worker does not start on the gateway (KW-2 nightly; cause not diagnosed, see KW-4) | KW-4 (configs), KW-6 (compaction, or the internal topics grow without bound), KW-3 (config topic producer is idempotent) |
+| Flink Kafka connector (KafkaSource / KafkaSink) | Admin `describeTopics`, `listOffsets` (earliest, latest, timestamp); `assign` + Fetch; commits offsets on checkpoint with no group membership; sink `AT_LEAST_ONCE` uses an idempotent producer; `EXACTLY_ONCE` uses transactions | `AT_LEAST_ONCE` yes: a bounded copy job passes the KW-2 nightly; the commit on checkpoint is not covered yet | KW-2, KW-3, KW-7 (EARLIEST and data-loss checks), KW-T for `EXACTLY_ONCE` |
+| RisingWave source and sink | librdkafka; `assign` with offsets; watermark queries; sink with `upsert`/`debezium` formats, keys and tombstones | Yes for a JSON source, materialized view and append-only sink (KW-2 nightly); upsert sinks and tombstones not covered | KW-2, KW-7 (EARLIEST) |
+| Vector `kafka` source and sink | librdkafka subscribe, async commits; sink producer | Yes (KW-2 nightly: sink, source, commit, resume) | KW-2 |
+| Fluent Bit `in_kafka` / `out_kafka` | librdkafka | Yes (KW-2 nightly: sink, source, commit, resume) | KW-2 |
 | Kafka Streams (not a D74 target; Loams' users bring it) | Compacted changelogs, `message.timestamp.type`, DeleteRecords on repartition topics, large assignments | No: stops at first rebalance with a state store (#4508) | KW-4, KW-6, KW-7, KW-12 |
 
 Two production properties matter to every client and are not client features:
@@ -191,7 +191,7 @@ breadth. Status is `Planned` unless noted.
 | --- | --- | --- | --- | --- | --- |
 | KW-0 | Fork setup: `loams` branch, workflows, lean CI | — | **Done** (7aa0efbf4) | — | No |
 | KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | **Built** (this PR) | KW-0 | Yes |
-| KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | Planned | KW-1 | Yes |
+| KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | **Built** (smoke green locally; nightly first run pending in fork CI) | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Part 1 built** (producer state); parts 2–3 planned | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
@@ -305,6 +305,27 @@ those against Apache Kafka, except rows in `allowed_differences.toml`.
 **Exit.** Smoke green on PRs; the nightly job reports every client in §2 with a
 result and a linked blocker for each failure.
 
+**As built (2026-10-24).** `tests/client_matrix_tests.rs`, `tests/common/matrix.rs`
+and one probe or configuration per client under `tests/clients/` (contract and
+pins in its README, results in `MATRIX.md`). Every image is pinned by tag and
+digest; libraries come from PyPI, the Go proxy and Maven Central at pinned
+versions. A client's facts on the gateway are judged against Apache Kafka's
+with KW-1's judge and their own `tests/clients/allowed_differences.toml`
+(empty: no client difference is declared). Local results: all five smoke
+clients pass every step; Vector, Fluent Bit, RisingWave and Flink pass every
+nightly step. **Kafka Connect with Debezium does not start on the gateway**
+(it does on Kafka): the distributed worker stops with "Unable to initialize
+REST resources" after its herder fails. The root cause is not diagnosed; the
+suspect is the worker's internal-topic checks (`cleanup.policy=compact` on its
+config topic, #4508). It is declared in `tests/clients/allowed_differences.toml`
+against #4508 and recorded as a KW-4 item below; nothing was fixed in KW-2. CI time: the smoke test took about 2 minutes locally
+(Kafka start, Go build and pip install included) and runs in its own nextest
+group beside the other container suites; the nightly adds about 10 minutes
+plus about 10 GB of image pulls. Still open: the first nightly run in fork CI
+(it has not run yet, so its Docker handling of `tag@digest` references and the
+disk step are unproven), Flink's commit on checkpoint, librdkafka with
+`enable.idempotence=true`, and Kafka Streams and Schema Registry (with KW-4).
+
 ### KW-3. Idempotent producer: dedup, ordering, restart safety
 
 **Why.** The Java producer and franz-go are idempotent by default. Today a
@@ -413,6 +434,14 @@ not-enforced keys as declared differences.
 
 **Exit.** #4508's acceptance criteria for Connect, Schema Registry and Streams
 pass in the nightly matrix.
+
+**Found by KW-2 (2026-10-24).** Kafka Connect distributed (Debezium 3.6.2.Final
+image) never starts against the gateway; it starts against `apache/kafka:4.3.1`
+with the same settings. First step of this task: run
+`client_matrix_nightly_connect_debezium` with `KAFKA_CLIENT_MATRIX_FULL=1`
+(it prints the worker's last 400 log lines), find the first failing request,
+fix it, and remove the `client/connect-debezium` entries from
+`tests/clients/allowed_differences.toml`.
 
 ### KW-5. Several gateways behind one bootstrap
 
