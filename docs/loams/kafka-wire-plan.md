@@ -532,7 +532,8 @@ holds for readers, not on disk: Iggy deletes whole segments by count only, so
 freeing segments wholly below the watermark needs an Iggy command that trims
 to an offset (`TruncatePartition` is offset-precise inside the server). That
 is an owner decision (new client command), and the nightly Streams check
-waits for KW-2's matrix.
+waits for KW-2's matrix. Lane D's next task, KW-14 (DescribeLogDirs v1-4 from
+Iggy partition sizes), is not started.
 
 ### KW-8. Newer protocol versions and topic ids
 
