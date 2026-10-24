@@ -123,7 +123,7 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
