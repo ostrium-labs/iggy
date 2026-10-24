@@ -556,7 +556,7 @@ impl IggyBridge {
     /// doubt keeps what `calls` keep after that, and `held`, until a replay proves its outcome or
     /// the SDK forgets it. The SDK forgets a write once a replay proved it, or once a new session
     /// replaced the one that sent it, which can then no longer apply it. `held` goes first.
-    async fn commit_in_slot<F>(
+    pub(super) async fn commit_in_slot<F>(
         &self,
         slot: usize,
         calls: &OffsetCalls,
@@ -643,7 +643,7 @@ impl IggyBridge {
     /// deadline of `calls`. A read that the deadline cuts off leaves its client behind, so the
     /// next read on the slot does not wait behind it in the SDK. A read that has not started by
     /// the deadline never starts.
-    async fn read_in_slot<T, F>(
+    pub(super) async fn read_in_slot<T, F>(
         &self,
         slot: usize,
         calls: &OffsetCalls,
@@ -711,7 +711,7 @@ impl Lane {
 
 /// The slot of `partition` of `topic`, the same at every call. The partitions of a topic take the
 /// slots in turn, so a topic with one partition per slot uses every slot.
-fn slot_of(topic: &TopicTarget, partition: u32) -> usize {
+pub(super) fn slot_of(topic: &TopicTarget, partition: u32) -> usize {
     let mut hasher = DefaultHasher::new();
     (&topic.stream_id, &topic.topic_id).hash(&mut hasher);
     let first = usize::from(hasher.finish().to_le_bytes()[0]);
@@ -733,16 +733,20 @@ fn refused_all<T>(count: usize, error: &IggyError) -> Vec<Result<T, BridgeError>
 }
 
 /// The Iggy names of one Kafka group's offsets.
-struct OffsetNames {
+pub(super) struct OffsetNames {
     /// `kafka.cg.<group>`, the Iggy group that holds the offsets.
     group: String,
     /// The key of each offset: the external group kind of that group.
-    consumer: Consumer,
+    pub(super) consumer: Consumer,
 }
 
 impl OffsetNames {
     fn new(group: &str) -> Result<Self, IggyError> {
-        let name = format!("{OFFSET_GROUP_PREFIX}{group}");
+        Self::exact(format!("{OFFSET_GROUP_PREFIX}{group}"))
+    }
+
+    /// The names of offsets kept in the Iggy group `name` itself, which no Kafka group owns.
+    pub(super) fn exact(name: String) -> Result<Self, IggyError> {
         let id = Identifier::named(&name)?;
         Ok(Self {
             group: name,
@@ -1076,7 +1080,7 @@ fn kafka_group_of(name: &str) -> Option<String> {
 
 /// One commit on `client`. A store that finds no Iggy group creates it, passes its numeric id to
 /// `created`, and stores again.
-async fn commit_on(
+pub(super) async fn commit_on(
     client: &IggyClient,
     names: &OffsetNames,
     topic: &TopicTarget,

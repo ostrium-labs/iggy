@@ -29,6 +29,7 @@ pub mod api_versions;
 pub mod create_partitions;
 pub mod create_topics;
 pub mod delete_groups;
+pub mod delete_records;
 pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;
@@ -64,7 +65,7 @@ use crate::bridge::BridgeError;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
     API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
-    API_KEY_DELETE_GROUPS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CLUSTER,
+    API_KEY_DELETE_GROUPS, API_KEY_DELETE_RECORDS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CLUSTER,
     API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
     API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID,
     API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS,
@@ -127,6 +128,7 @@ pub async fn dispatch(
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
         API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
+        API_KEY_DELETE_RECORDS => delete_records::handle(state, principal, api_version, body).await,
         API_KEY_CREATE_PARTITIONS => {
             create_partitions::handle(state, principal, api_version, body).await
         }
