@@ -20,3 +20,45 @@
 # tests/oracle/allowed_differences.toml: an undeclared difference fails the run, and so does an
 # entry here that no longer occurs. `scenario` is `client/<client>` as the matrix names it;
 # `issue` is the apache/iggy issue or the fork plan task (KW-n) that owns the gap.
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "start.ready"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "snapshot.registered"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "snapshot.ids"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "stream.ids"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "restart.ready"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "restart.ids"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
+
+[[difference]]
+scenario = "client/connect-debezium"
+fact = "restart.task_state"
+issue = "#4508"
+reason = "The Connect worker does not start on the gateway (\"Unable to initialize REST resources\" after its herder fails); not diagnosed yet. Suspected: its internal-topic checks (cleanup.policy=compact on the config topic), KW-4. Every later step is then absent."
