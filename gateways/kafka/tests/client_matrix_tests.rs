@@ -1524,7 +1524,7 @@ async fn connect_scenario(target: Target, prefix: String) -> Result<Facts, Strin
         eprintln!(
             "Connect on {} never became ready:\n{}",
             target.kind,
-            connect.logs_tail(60)
+            connect.logs_tail(400)
         );
         return Ok(facts);
     }
