@@ -21,6 +21,11 @@
 # organisation's shared GitHub Actions concurrency.
 name: Loams Kafka gateway
 
+# Runners (Loams local CI, 2026-10-24): with the repository variable CI_RUNNER=local,
+# pushes to loams and pull requests into loams from branches in this repository (or by
+# organisation members) run on the Loams laptops ([self-hosted, loams-local]); pull
+# requests from anyone else's fork, and CI_RUNNER=github or unset, use GitHub-hosted
+# runners. Check names are unchanged. See ostrium-labs/loams docs/guides/local-ci.md.
 on:
   pull_request:
     branches: [loams]
@@ -45,7 +50,7 @@ env:
 jobs:
   changes:
     name: "Gateway: changes"
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (vars.CI_RUNNER == 'local' && ((github.event_name == 'push' && github.ref == 'refs/heads/loams') || (github.event_name == 'pull_request' && github.base_ref == 'loams' && (github.event.pull_request.head.repo.full_name == github.repository || github.event.pull_request.author_association == 'MEMBER' || github.event.pull_request.author_association == 'OWNER')))) && fromJSON('["self-hosted","loams-local"]') || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.diff.outputs.rust }}
@@ -79,7 +84,7 @@ jobs:
     name: "Gateway: lint and test"
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (vars.CI_RUNNER == 'local' && ((github.event_name == 'push' && github.ref == 'refs/heads/loams') || (github.event_name == 'pull_request' && github.base_ref == 'loams' && (github.event.pull_request.head.repo.full_name == github.repository || github.event.pull_request.author_association == 'MEMBER' || github.event.pull_request.author_association == 'OWNER')))) && fromJSON('["self-hosted","loams-local"]') || 'ubuntu-24.04' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
@@ -149,7 +154,7 @@ jobs:
     name: Kafka gateway required
     needs: [changes, gateway]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (vars.CI_RUNNER == 'local' && ((github.event_name == 'push' && github.ref == 'refs/heads/loams') || (github.event_name == 'pull_request' && github.base_ref == 'loams' && (github.event.pull_request.head.repo.full_name == github.repository || github.event.pull_request.author_association == 'MEMBER' || github.event.pull_request.author_association == 'OWNER')))) && fromJSON('["self-hosted","loams-local"]') || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - shell: bash
