@@ -158,8 +158,8 @@ Key new minimums:
 | 39 | **RenewDelegationToken** | 0 | 2 | v2 | 🟡 Optional Stub |
 | 40 | **ExpireDelegationToken** | 0 | 2 | v2 | 🟡 Optional Stub |
 | 41 | **DescribeDelegationToken** | 0 | 3 | v2 | 🟡 Optional Stub |
-| 50 | **DescribeUserScramCredentials** | 0 | 0 | v0 | 🟡 Optional Stub |
-| 51 | **AlterUserScramCredentials** | 0 | 0 | v0 | 🟡 Optional Stub |
+| 50 | **DescribeUserScramCredentials** | 0 | 0 | v0 | ✅ Served where SCRAM is on (KW-9) |
+| 51 | **AlterUserScramCredentials** | 0 | 0 | v0 | ✅ Served where SCRAM is on (KW-9) |
 
 ---
 
