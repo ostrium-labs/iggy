@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use iggy::prelude::{IggyMessage, IggyTimestamp, Partition, PollingStrategy};
+use iggy::prelude::{IggyMessage, Partition, PollingStrategy};
 use tokio::time::Instant;
 
 use super::IggyBridge;
@@ -27,47 +27,35 @@ use super::fetch::{FetchSlot, PartitionProbe};
 use crate::bridge::error::BridgeError;
 use crate::records::record_timestamp;
 
-/// Which record a `ListOffsets` lookup by time asks for.
+/// Which record a `ListOffsets` lookup reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordLookup {
-    /// The first record appended at or after this time, in Kafka milliseconds.
-    AppendedAtOrAfter(i64),
+    /// The first record Iggy still keeps, so the first one retention left.
+    First,
+    /// The record at this offset, or the first one after it that Iggy keeps.
+    At(u64),
     /// The last record, the latest Iggy appended. Its reported timestamp is the producer's when
     /// one was set, so on a `CreateTime` topic it need not be the largest one.
     Last,
 }
 
 /// A record a [`RecordLookup`] found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocatedRecord {
     pub offset: i64,
     /// As Fetch reports it: the producer timestamp when one was set, otherwise the append time.
+    /// What a lookup by time matches against, as a Kafka broker matches the record timestamp.
     pub timestamp: i64,
-    /// When Iggy appended it, in microseconds. What a lookup by time matches against.
-    pub appended_at: u64,
-}
-
-impl LocatedRecord {
-    /// Whether Iggy appended this record before `millis`, so a lookup by that time cannot match
-    /// it.
-    pub fn appended_before(&self, millis: i64) -> bool {
-        self.appended_at < kafka_millis_to_micros(millis)
-    }
 }
 
 impl From<&IggyMessage> for LocatedRecord {
     fn from(message: &IggyMessage) -> Self {
         let offset = i64::try_from(message.header.offset).unwrap_or(i64::MAX);
-        let appended_at = message.header.timestamp;
         // A message the gateway cannot map still has a server time, and the offset is what the
         // client seeks to; Fetch reports the mapping failure when it reaches the record.
         let timestamp = record_timestamp(message)
-            .unwrap_or_else(|_| i64::try_from(appended_at / 1000).unwrap_or(-1));
-        Self {
-            offset,
-            timestamp,
-            appended_at,
-        }
+            .unwrap_or_else(|_| i64::try_from(message.header.timestamp / 1000).unwrap_or(-1));
+        Self { offset, timestamp }
     }
 }
 
@@ -137,9 +125,8 @@ impl IggyBridge {
     /// fault or before the partition seeds its commit point, so it proves no miss alone. `None` if
     /// no answer comes by `deadline`.
     ///
-    /// Iggy matches a time against the broker append time of each batch, so a record is found by
-    /// when Iggy stored it, not by the producer timestamp a Kafka broker searches on a
-    /// `CreateTime` topic. The timestamp reported back is the one Fetch shows.
+    /// A lookup by time is a search over [`RecordLookup::At`] reads in the handler, on the
+    /// timestamp Fetch shows, since Iggy's own time lookup matches its append time instead.
     pub(crate) async fn locate_record(
         self: &Arc<Self>,
         slot: FetchSlot,
@@ -149,9 +136,8 @@ impl IggyBridge {
         deadline: Instant,
     ) -> Option<(Result<Option<LocatedRecord>, BridgeError>, FetchSlot)> {
         let strategy = match lookup {
-            RecordLookup::AppendedAtOrAfter(millis) => {
-                PollingStrategy::timestamp(IggyTimestamp::from(kafka_millis_to_micros(millis)))
-            }
+            RecordLookup::First => PollingStrategy::first(),
+            RecordLookup::At(offset) => PollingStrategy::offset(offset),
             RecordLookup::Last => PollingStrategy::last(),
         };
         let (polled, slot) = self
@@ -187,12 +173,6 @@ impl IggyBridge {
             );
         watermark
     }
-}
-
-/// A time before the epoch matches from the first record, as it does on a Kafka broker, and one
-/// past what Iggy's microseconds can hold matches nothing.
-fn kafka_millis_to_micros(millis: i64) -> u64 {
-    u64::try_from(millis).unwrap_or(0).saturating_mul(1000)
 }
 
 /// One past the last committed offset of `partition`, or 0 when it is empty.

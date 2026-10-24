@@ -34,6 +34,9 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use kafka_protocol::messages::delete_records_request::{
+    DeleteRecordsPartition, DeleteRecordsTopic,
+};
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
 use kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol;
@@ -47,9 +50,9 @@ use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment;
 use kafka_protocol::messages::{
-    ApiKey, BrokerId, CreateTopicsRequest, DescribeConfigsRequest, FetchRequest,
-    FindCoordinatorRequest, GroupId, HeartbeatRequest, InitProducerIdRequest, JoinGroupRequest,
-    LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
+    ApiKey, BrokerId, CreateTopicsRequest, DeleteRecordsRequest, DescribeConfigsRequest,
+    FetchRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest, InitProducerIdRequest,
+    JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest, MetadataRequest, OffsetCommitRequest,
     OffsetFetchRequest, ProduceRequest, ProducerId, SyncGroupRequest, TopicName, TransactionalId,
 };
 use kafka_protocol::protocol::StrBytes;
@@ -111,6 +114,7 @@ enum Scenario {
     TopicAdmin,
     ProduceFetch,
     ListOffsets,
+    DeleteRecords,
     ClassicGroup,
     StandaloneCommit,
     InitProducerId,
@@ -119,11 +123,12 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
         Self::ListOffsets,
+        Self::DeleteRecords,
         Self::ClassicGroup,
         Self::StandaloneCommit,
         Self::InitProducerId,
@@ -137,6 +142,7 @@ impl Scenario {
             Self::TopicAdmin => "topic_admin",
             Self::ProduceFetch => "produce_fetch",
             Self::ListOffsets => "list_offsets",
+            Self::DeleteRecords => "delete_records",
             Self::ClassicGroup => "classic_group",
             Self::StandaloneCommit => "standalone_commit",
             Self::InitProducerId => "init_producer_id",
@@ -153,6 +159,7 @@ impl Scenario {
             Self::TopicAdmin => topic_admin(cx, &mut client, &mut facts).await?,
             Self::ProduceFetch => produce_fetch(cx, &mut client, &mut facts).await?,
             Self::ListOffsets => list_offsets(cx, &mut client, &mut facts).await?,
+            Self::DeleteRecords => delete_records(cx, &mut client, &mut facts).await?,
             Self::ClassicGroup => classic_group(cx, &mut client, &mut facts).await?,
             Self::StandaloneCommit => standalone_commit(cx, &mut client, &mut facts).await?,
             Self::InitProducerId => init_producer_id(cx, &mut client, &mut facts).await?,
@@ -588,6 +595,94 @@ async fn list_offsets(
         let delta = if found < 0 { found } else { found - start };
         facts.set(format!("{label}.timestamp_delta"), delta);
     }
+    Ok(())
+}
+
+/// `(error, low_watermark)` of one `DeleteRecords` on `partition`.
+async fn delete_records_to(
+    client: &mut WireClient,
+    name: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<(i16, i64), String> {
+    let request = DeleteRecordsRequest::default()
+        .with_timeout_ms(TIMEOUT_MS)
+        .with_topics(vec![
+            DeleteRecordsTopic::default()
+                .with_name(topic(name))
+                .with_partitions(vec![
+                    DeleteRecordsPartition::default()
+                        .with_partition_index(partition)
+                        .with_offset(offset),
+                ]),
+        ]);
+    let version = version(client, ApiKey::DeleteRecords, 2)?;
+    for attempt in 0.. {
+        let response = client.send(&request, version).await?;
+        let answer = response
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .ok_or_else(|| "DeleteRecords answered no partition".to_string())?;
+        if !matches!(answer.error_code, 5 | 6) || attempt == 40 {
+            return Ok((answer.error_code, answer.low_watermark));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    unreachable!("the loop returns")
+}
+
+/// `DeleteRecords`, then what `ListOffsets` and Fetch see of the new start (apache/iggy#4525).
+async fn delete_records(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let name = cx.name("delete_records", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let start = now_ms() - 60_000;
+    produce(client, &name, 0, batch(&RECORDS, start)?).await?;
+
+    let (error, low) = delete_records_to(client, &name, 0, 2).await?;
+    facts.set("delete_to_2.error", error);
+    facts.set("delete_to_2.low_watermark", low);
+    let (error, earliest, _) = list_offset(client, &name, -2).await?;
+    facts.set("earliest_after.error", error);
+    facts.set("earliest_after.offset", earliest);
+    let (error, at_time, _) = list_offset(client, &name, start).await?;
+    facts.set("first_by_time_after.error", error);
+    facts.set("first_by_time_after.offset", at_time);
+    let (below, _) = fetch(client, &name, 0).await?;
+    facts.set("fetch_below_start.error", below.error_code);
+    let (at_start, records) = fetch(client, &name, 2).await?;
+    facts.set("fetch_at_start.error", at_start.error_code);
+    facts.set("fetch_at_start.log_start_offset", at_start.log_start_offset);
+    facts.set(
+        "fetch_at_start.first_offset",
+        records.first().map_or(-1, |record| record.offset),
+    );
+
+    let (error, low) = delete_records_to(client, &name, 0, 1).await?;
+    facts.set("delete_below_start.error", error);
+    facts.set("delete_below_start.low_watermark", low);
+    let (error, low) = delete_records_to(client, &name, 0, 100).await?;
+    facts.set("delete_past_end.error", error);
+    facts.set("delete_past_end.low_watermark", low);
+    let (error, _) = delete_records_to(client, &name, PARTITIONS + 6, 0).await?;
+    facts.set("delete_missing_partition.error", error);
+    let (error, low) = delete_records_to(client, &name, 0, -1).await?;
+    facts.set("delete_to_end.error", error);
+    facts.set("delete_to_end.low_watermark", low);
+    let (error, earliest, _) = list_offset(client, &name, -2).await?;
+    facts.set("earliest_after_all.error", error);
+    facts.set("earliest_after_all.offset", earliest);
+    let (error, latest, _) = list_offset(client, &name, -1).await?;
+    facts.set("latest_after_all.error", error);
+    facts.set("latest_after_all.offset", latest);
+    let (error, at_time, _) = list_offset(client, &name, start).await?;
+    facts.set("by_time_after_all.error", error);
+    facts.set("by_time_after_all.offset", at_time);
     Ok(())
 }
 

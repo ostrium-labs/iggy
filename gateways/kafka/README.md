@@ -520,11 +520,11 @@ records, in request order. One uncompressed batch per partition.
 | ----- | ------- |
 | Partition, offset | As sent. Both systems count from 0. |
 | Iggy replica | The one on the node each bridge client is on. Every client signs in at the metadata leader, and a view change or a refused call can move it. So in a cluster, a probe and a poll can read nodes that are not at the same offset. |
-| Offset below the oldest kept one | Reads from the oldest kept one. If none is kept, no records until the next write, because a cluster replica that lost records after a crash reads the same. Kafka answers `1` here, so `auto.offset.reset=none` gets no error. |
+| Offset below the log start offset | `1`, as Kafka: below the `DeleteRecords` watermark, or below the oldest record retention kept. If retention kept none, no records until the next write, because a cluster replica that lost records after a crash reads the same. See [`docs/SCOPE.md`](docs/SCOPE.md#deleterecords-and-the-log-start-offset-4525). |
 | Recreated topic | Iggy starts each partition at offset 0 again, and Fetch cannot see it. Seek consumers to 0 after you recreate a topic. Otherwise writes past a consumer's old offset make it skip the records below. |
 | `high_watermark` | One past the last committed offset. |
 | `last_stable_offset` | Same as `high_watermark`. No transactions. |
-| `log_start_offset` | Always `-1`. |
+| `log_start_offset` | The `DeleteRecords` watermark, or the first offset retention kept by Iggy's message count if higher. `-1` when neither is known. |
 | Sessions | None opened. `session_id` is always `0`, so every request is a full one. |
 | `max_wait_ms` | Honored, max 18 s. |
 | `min_bytes` | Honored, as Kafka does: the request waits until the records read reach it. New bytes are estimated from Iggy's average message size. |

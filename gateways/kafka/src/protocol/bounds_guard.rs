@@ -741,6 +741,54 @@ pub fn validate_delete_topics_shape(
     Ok(())
 }
 
+/// Mirrors the field order `DeleteRecordsRequest::decode` walks.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_delete_records_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 2;
+
+    let topics_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..topics_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let partitions_count = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..partitions_count {
+            let _partition = c.read_i32()?;
+            let _offset = c.read_i64()?;
+            if flexible {
+                c.tagged_fields()?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    let _timeout_ms = c.read_i32()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `CreatePartitionsRequest::decode` walks.
 ///
 /// Each topic's `assignments` array is nullable (a client that names no replicas sends null),
