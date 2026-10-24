@@ -18,9 +18,10 @@
 use super::codec::{OptionValueCodec, invalid};
 use super::key::OptionKey;
 use super::{
-    DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
+    CleanupPolicy, DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY,
+    DEFAULT_MESSAGES_REQUIRED_TO_SAVE, DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE,
+    DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, Durability, KafkaTopicConfigs,
+    MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
     MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE,
     OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions, erase_options,
 };
@@ -67,7 +68,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 19] = [
+pub static CATALOG: [OptionDescriptor; 21] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -370,6 +371,38 @@ pub static CATALOG: [OptionDescriptor; 19] = [
         description: || {
             "Sorted comma-separated names of stored keys a node must understand before \
              serving the resource"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::CleanupPolicy,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::Const(|| CleanupPolicy::default().encode()),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "Kafka-style cleanup policy: delete, compact or compact,delete; defaults to \
+             delete. Stored and reported, not applied: the server does not compact yet, and \
+             expiry still follows message_expiry and max_topic_size"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::KafkaConfigs,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::Const(|| KafkaTopicConfigs::new().encode()),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "Kafka topic configurations the Kafka gateway accepted and Iggy does not apply, as \
+             name=value lines sorted by name, or - for none; at most 255 bytes. Stored and \
+             returned, never interpreted by the server"
                 .to_owned()
         },
     },
@@ -782,6 +815,8 @@ pub fn canonical_value(
         OptionKey::PartitionResizePolicy => PartitionResizePolicy::decode(key, entry)?.encode()?,
         OptionKey::MessagesRequiredToSave => u32::decode(key, entry)?.encode()?,
         OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
+        OptionKey::CleanupPolicy => CleanupPolicy::decode(key, entry)?.encode()?,
+        OptionKey::KafkaConfigs => KafkaTopicConfigs::decode(key, entry)?.encode()?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
@@ -1143,6 +1178,8 @@ mod tests {
                 topic_option_keys::PREALLOCATE_SEGMENTS,
                 OptionKey::PreallocateSegments,
             ),
+            (topic_option_keys::CLEANUP_POLICY, OptionKey::CleanupPolicy),
+            (topic_option_keys::KAFKA_CONFIGS, OptionKey::KafkaConfigs),
         ] {
             assert_eq!(constant, key.to_string());
         }
@@ -1151,7 +1188,12 @@ mod tests {
             .collect();
         assert_eq!(
             resettable,
-            [OptionKey::MessageExpiry, OptionKey::MaxTopicSize]
+            [
+                OptionKey::MessageExpiry,
+                OptionKey::MaxTopicSize,
+                OptionKey::CleanupPolicy,
+                OptionKey::KafkaConfigs,
+            ]
         );
     }
 

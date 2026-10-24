@@ -58,6 +58,8 @@ pub enum OptionKey {
     EncryptionKeyFingerprint,
     EncryptionKekFingerprint,
     CriticalKeys,
+    CleanupPolicy,
+    KafkaConfigs,
 }
 
 impl From<OptionKey> for HeaderKey {

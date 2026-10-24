@@ -204,7 +204,7 @@ breadth. Status is `Planned` unless noted.
 | KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | **Built** (this PR) | KW-0 | Yes |
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | **Built** (smoke green locally; nightly first run pending in fork CI) | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Built** (parts 1–3); Java/franz-go e2e under injected timeouts open | KW-1 | Yes |
-| KW-4 | Topic configurations frameworks send | #4508 | Planned | KW-1 | Only if krishvishal has not landed it |
+| KW-4 | Topic configurations frameworks send | #4508 | **Built** (wire, bridge, oracle diff); framework exit criteria wait on the KW-2 nightly matrix | KW-1 | Only if krishvishal has not landed it |
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
@@ -494,6 +494,24 @@ with the same settings. First step of this task: run
 (it prints the worker's last 400 log lines), find the first failing request,
 fix it, and remove the `client/connect-debezium` entries from
 `tests/clients/allowed_differences.toml`.
+
+**Status (built).** No newer upstream work existed at task start (#4534 and
+#4572 were already on `loams`). Built on them: two topic options in the catalog,
+`cleanup_policy` and `kafka_configs` (each resettable, with a default, so no
+wire change); every Kafka 4.x topic configuration accepted on CreateTopics and
+both alter APIs, validated and normalised as Kafka does; `AlterConfigs` now
+replaces the set as Kafka does; a BROKER resource answers a fixed set; any
+replication factor ≥ 1 is accepted and reported as 1. Honoured:
+`cleanup.policy` (stored; without `delete` the topic never expires until KW-6),
+`retention.ms`, `retention.bytes` (× partitions), `segment.bytes` (at create).
+Echoed (stored, reported, not enforced): the other 29; the list is in
+`gateways/kafka/docs/CONFIGS.md`. The oracle scenario `topic_configs` compares
+all 33 keys' names, types and defaults, the Connect, Streams and Debezium sets,
+normalisation, incremental SET/DELETE/APPEND and the broker resource against
+Apache Kafka 4.3.1. Left: the nightly Connect/Schema Registry/Streams runs
+(KW-2), `retention.bytes` re-applied after CreatePartitions, and the foreign
+SDKs' typed surfaces for the two new option keys (their fixture copies were
+regenerated; their contract tests need the new keys).
 
 ### KW-5. Several gateways behind one bootstrap
 
