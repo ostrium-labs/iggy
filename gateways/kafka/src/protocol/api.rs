@@ -45,8 +45,8 @@ use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
     alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_groups,
-    delete_topics, describe_cluster, describe_configs, describe_groups, dispatch, fetch,
-    find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
+    delete_records, delete_topics, describe_cluster, describe_configs, describe_groups, dispatch,
+    fetch, find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
     leave_group, list_groups, list_offsets, metadata, offset_commit, offset_delete, offset_fetch,
     produce, respond_or_close, sync_group,
 };
@@ -72,6 +72,7 @@ pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
 pub const API_KEY_DELETE_TOPICS: i16 = 20;
+pub const API_KEY_DELETE_RECORDS: i16 = 21;
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
@@ -316,6 +317,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     api_versions::RANGE,
     create_topics::RANGE,
     delete_topics::RANGE,
+    delete_records::RANGE,
     create_partitions::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
@@ -878,6 +880,7 @@ pub fn encode_error_for_key(
         API_KEY_FETCH => fetch::encode_error_response(api_version, error_code),
         API_KEY_LIST_OFFSETS => list_offsets::encode_error_response(api_version, error_code),
         API_KEY_CREATE_TOPICS => create_topics::encode_error_response(api_version, error_code),
+        API_KEY_DELETE_RECORDS => delete_records::encode_error_response(api_version, error_code),
         API_KEY_DESCRIBE_CONFIGS => {
             describe_configs::encode_error_response(api_version, error_code)
         }

@@ -37,6 +37,7 @@ mod cluster_id;
 mod fetch;
 mod group_index;
 mod group_offsets;
+mod log_start;
 mod offsets;
 mod produce;
 mod topics;
@@ -48,6 +49,8 @@ use group_index::GroupIndex;
 pub use group_index::{OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
+pub use log_start::LOG_START_GROUP;
+use log_start::LogStarts;
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{ProduceTurn, Producer, SendEnd};
@@ -170,6 +173,8 @@ pub struct IggyBridge {
     group_index: GroupIndex,
     /// The client of the scan that finds those groups, so no offset call waits behind it.
     scan_client: LazyClient,
+    /// The `DeleteRecords` watermarks read lately. See `log_start.rs`.
+    log_starts: LogStarts,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -215,6 +220,7 @@ impl IggyBridge {
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
             scan_client: LazyClient::default(),
+            log_starts: LogStarts::default(),
         })
     }
 
@@ -404,6 +410,7 @@ impl IggyBridge {
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
+            log_starts: LogStarts::default(),
         }
     }
 }

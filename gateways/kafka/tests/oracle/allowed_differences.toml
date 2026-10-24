@@ -28,13 +28,6 @@ fact = "create_with_retention_ms.error"
 issue = "apache/iggy#4508"
 reason = "CreateTopics answers INVALID_CONFIG (40) to any configuration"
 
-# No log start offset: Fetch reports it unknown.
-[[difference]]
-scenario = "produce_fetch"
-fact = "fetch.log_start_offset"
-issue = "apache/iggy#4525"
-reason = "Iggy exposes no log start offset, so Fetch sends -1"
-
 # Headers come back sorted by name, not in send order.
 [[difference]]
 scenario = "produce_fetch"
@@ -48,31 +41,6 @@ scenario = "produce_fetch"
 fact = "fetch_beyond_end.error"
 issue = "apache/iggy#3536"
 reason = "README Fetch error mapping: OFFSET_OUT_OF_RANGE only after 30 s of NOT_LEADER_OR_FOLLOWER, so a lagging node is not mistaken for data loss"
-
-# Documented: lookups by time search Iggy's append time, not the producer timestamp.
-[[difference]]
-scenario = "list_offsets"
-fact = "at_third_record.offset"
-issue = "apache/iggy#4516"
-reason = "BRIDGE_MAPPING.md: Iggy searches by the time it appended each batch; the records here carry producer timestamps a minute in the past"
-
-[[difference]]
-scenario = "list_offsets"
-fact = "at_third_record.timestamp_delta"
-issue = "apache/iggy#4516"
-reason = "follows from the append-time search"
-
-[[difference]]
-scenario = "list_offsets"
-fact = "between_records.offset"
-issue = "apache/iggy#4516"
-reason = "follows from the append-time search"
-
-[[difference]]
-scenario = "list_offsets"
-fact = "between_records.timestamp_delta"
-issue = "apache/iggy#4516"
-reason = "follows from the append-time search"
 
 # Documented: the commit metadata string is dropped.
 [[difference]]

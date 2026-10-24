@@ -59,7 +59,8 @@ leaves it behind.
 - A replayed write that Iggy already applied (`RequestAlreadyApplied`) counts as done.
 - A failure sent as `UNKNOWN_SERVER_ERROR` (-1) is logged at `error!`: once per OffsetCommit
   request, and once per group in OffsetFetch.
-- Committed offset below the oldest kept message: Fetch reads from the first kept message.
+- Committed offset below the log start offset: Fetch answers `OFFSET_OUT_OF_RANGE` (1), and the
+  consumer resets by `auto.offset.reset`, as on Kafka.
 
 ## Calls
 
