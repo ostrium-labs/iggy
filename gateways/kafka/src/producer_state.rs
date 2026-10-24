@@ -29,17 +29,29 @@
 //! - An epoch below the producer's is `INVALID_PRODUCER_EPOCH` (47). A higher epoch starts over
 //!   and must begin at sequence 0.
 //! - A producer with no state here is accepted at any sequence, as Kafka accepts one whose state
-//!   expired (KIP-360). After a gateway restart that is at-least-once, the same as before.
+//!   expired (KIP-360).
+//!
+//! State is rebuilt from the log: each idempotent batch carries a `kafka.p` marker on its first
+//! record, and before this gateway first checks a batch for a partition it reads the marks in the
+//! partition's tail ([`ProducerStates::restore`]), as Kafka rebuilds its producer state from its
+//! log on start. So a retry that spans a gateway restart is answered as one that does not.
 //!
 //! The produce path writes the batches of one producer one at a time (its turn on its Iggy
 //! session), so a check and the send that follows it never race another batch of that producer.
-//! A send whose outcome is unknown, because the connection to Iggy broke during it or it was cut
-//! off, leaves its batch [`Landing::Unknown`]: a retry of it is written again rather than refused,
-//! so delivery stays at-least-once in that case only.
+//!
+//! A send that Iggy never answered leaves its batch [`Landing::InDoubt`]: the SDK keeps the
+//! request, and a retry of the batch replays it ([`Verdict::Resolve`]) instead of writing it
+//! again, so Iggy's own deduplication decides. A send whose request nothing keeps (the connection
+//! was cut off at the slot limit, or the session was replaced) leaves it [`Landing::Unknown`]: a
+//! retry of it is written again rather than refused, so delivery stays at-least-once in that
+//! case only, unless the batch is found in the log ([`Verdict::Find`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::bridge::InDoubt;
+use crate::records::ProducerMark;
 
 /// Batches kept per producer and partition. Kafka keeps five, one per request a producer may have
 /// in flight (`max.in.flight.requests.per.connection` is at most 5 with idempotence).
@@ -51,18 +63,26 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 /// How long an idle entry is kept: Kafka's `producer.id.expiration.ms` default, one day.
 pub const DEFAULT_EXPIRY: Duration = Duration::from_hours(24);
 
+/// Records at a partition's tail read to rebuild its producers' state and to find a batch.
+///
+/// A producer whose last batches are older than this is not known, and is accepted at any
+/// sequence. The plan's `producer_state_recovery_records`; configurable with KW-12.
+pub const DEFAULT_RECOVERY_RECORDS: u32 = 10_000;
+
 /// Where a batch's write stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landing {
     /// Its send runs.
     Pending,
     /// It landed. `None` when Iggy named no offset.
     Landed(Option<u64>),
-    /// The send ended without saying whether it landed.
+    /// The send ended without an answer, and the SDK keeps its request for a replay.
+    InDoubt(InDoubt),
+    /// The send ended without saying whether it landed, and nothing keeps its request.
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Batch {
     first: i32,
     last: i32,
@@ -77,7 +97,7 @@ struct Entry {
 }
 
 /// What to do with a batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Write it. Call [`ProducerStates::begin`] before the send and [`ProducerStates::finish`]
     /// with its outcome.
@@ -90,6 +110,15 @@ pub enum Verdict {
     InvalidEpoch,
     /// A retry of a batch whose send still runs. Answer retriable `REQUEST_TIMED_OUT` (7).
     InFlight,
+    /// A retry of a batch whose send ended without a known outcome and without a request to
+    /// replay. Look for it in the log ([`ProducerStates::found`]); write it if it is not there.
+    Find,
+    /// A retry of a batch whose send Iggy never answered. Replay that send
+    /// (`IggyBridge::resolve_send`) and record what it proved with [`ProducerStates::resolved`].
+    Resolve(InDoubt),
+    /// The next batch after one whose send Iggy never answered. Replay that send first: this
+    /// batch follows it if it landed, and is out of sequence (45) if it was refused.
+    ResolveFirst(InDoubt),
 }
 
 /// One idempotent batch: its producer, epoch and sequence range.
@@ -137,6 +166,9 @@ pub struct ProducerStates {
     entries: Mutex<HashMap<BatchKey, Entry>>,
     max_entries: usize,
     expiry: Duration,
+    /// The partitions, by Kafka topic and index, whose state this gateway rebuilt from the log.
+    restored: Mutex<HashSet<(String, i32)>>,
+    recovery_records: u32,
 }
 
 impl Default for ProducerStates {
@@ -152,7 +184,108 @@ impl ProducerStates {
             entries: Mutex::default(),
             max_entries: max_entries.max(1),
             expiry,
+            restored: Mutex::default(),
+            recovery_records: DEFAULT_RECOVERY_RECORDS,
         }
+    }
+
+    /// The records at a partition's tail read to rebuild state and to find a batch.
+    #[must_use]
+    pub const fn recovery_records(&self) -> u32 {
+        self.recovery_records
+    }
+
+    /// Whether the state of `partition` of `topic` still has to be rebuilt from the log.
+    #[must_use]
+    pub fn needs_restore(&self, topic: &str, partition: i32) -> bool {
+        !self
+            .restored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(topic.to_string(), partition))
+    }
+
+    /// Rebuilds the state of `partition` of `topic` from `marks`, the producer marks at its tail
+    /// with their offsets, oldest first: per producer, its newest epoch and the last
+    /// [`CACHED_BATCHES`] batches of that epoch. A producer that already has state here keeps it:
+    /// what this gateway saw is newer than the log it read.
+    pub fn restore(&self, topic: &str, partition: i32, marks: &[(u64, ProducerMark)]) {
+        let mut rebuilt: HashMap<i64, (i16, VecDeque<Batch>)> = HashMap::new();
+        for (offset, mark) in marks {
+            let (epoch, batches) = rebuilt
+                .entry(mark.producer_id)
+                .or_insert_with(|| (mark.epoch, VecDeque::with_capacity(CACHED_BATCHES)));
+            if mark.epoch < *epoch {
+                continue;
+            }
+            if mark.epoch > *epoch {
+                *epoch = mark.epoch;
+                batches.clear();
+            }
+            // A batch written twice (an unknown outcome retried) keeps its newest copy.
+            batches.retain(|batch| {
+                !(batch.first == mark.first_sequence && batch.last == mark.last_sequence)
+            });
+            if batches.len() == CACHED_BATCHES {
+                batches.pop_front();
+            }
+            batches.push_back(Batch {
+                first: mark.first_sequence,
+                last: mark.last_sequence,
+                landing: Landing::Landed(Some(*offset)),
+            });
+        }
+        let now = Instant::now();
+        let mut entries = self.lock();
+        for (producer_id, (epoch, batches)) in rebuilt {
+            let key = BatchKey {
+                producer_id,
+                topic: topic.to_string(),
+                partition,
+            };
+            if entries.contains_key(&key) {
+                continue;
+            }
+            if entries.len() >= self.max_entries {
+                evict(&mut entries, now, self.expiry);
+            }
+            entries.insert(
+                key,
+                Entry {
+                    epoch,
+                    batches,
+                    used: now,
+                },
+            );
+        }
+        drop(entries);
+        self.restored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((topic.to_string(), partition));
+    }
+
+    /// Records that the batch `first..=last` of `key` at `epoch`, whose outcome was not known, was
+    /// found in the log at `offset`.
+    pub fn found(&self, key: &BatchKey, epoch: i16, first: i32, last: i32, offset: u64) {
+        let mut entries = self.lock();
+        let batch = entries
+            .get_mut(key)
+            .filter(|entry| entry.epoch == epoch)
+            .and_then(|entry| {
+                entry.batches.iter_mut().find(|batch| {
+                    batch.first == first
+                        && batch.last == last
+                        && matches!(
+                            batch.landing,
+                            Landing::Unknown | Landing::InDoubt(_) | Landing::Landed(None)
+                        )
+                })
+            });
+        if let Some(batch) = batch {
+            batch.landing = Landing::Landed(Some(offset));
+        }
+        drop(entries);
     }
 
     /// The verdict on a batch of `key` at `epoch` with sequences `first..=last`.
@@ -177,6 +310,32 @@ impl ProducerStates {
     /// checked against the batch before it.
     pub fn finish(&self, key: &BatchKey, epoch: i16, first: i32, landing: Option<Landing>) {
         finish_in(&mut self.lock(), key, epoch, first, landing);
+    }
+
+    /// Records what the replay of a batch in doubt proved: `Some(landing)` replaces its
+    /// [`Landing::InDoubt`], and `None` (it was refused, so nothing was written) forgets it.
+    ///
+    /// Only the batch that `in_doubt` was for: a batch sent again since is left alone.
+    pub fn resolved(&self, key: &BatchKey, in_doubt: &InDoubt, landing: Option<Landing>) {
+        let mut entries = self.lock();
+        let Some(entry) = entries.get_mut(key) else {
+            return;
+        };
+        let Some(position) = entry
+            .batches
+            .iter()
+            .position(|batch| matches!(&batch.landing, Landing::InDoubt(held) if held == in_doubt))
+        else {
+            return;
+        };
+        if let Some(landing) = landing {
+            entry.batches[position].landing = landing;
+            return;
+        }
+        entry.batches.remove(position);
+        if entry.batches.is_empty() {
+            entries.remove(key);
+        }
     }
 
     /// Entries held, for tests and metrics.
@@ -217,16 +376,22 @@ fn verdict(entry: Option<&Entry>, epoch: i16, first: i32, last: i32) -> Verdict 
         .iter()
         .find(|batch| batch.first == first && batch.last == last)
     {
-        return match batch.landing {
-            Landing::Landed(offset) => Verdict::Duplicate(offset),
+        return match &batch.landing {
+            Landing::Landed(offset) => Verdict::Duplicate(*offset),
             Landing::Pending => Verdict::InFlight,
-            // Whether it landed is unknown: write it again rather than refuse a batch that may
-            // not exist. At-least-once, as before producer state.
-            Landing::Unknown => Verdict::Append,
+            Landing::InDoubt(in_doubt) => Verdict::Resolve(in_doubt.clone()),
+            // Whether it landed is unknown: look in the log, and write it again rather than
+            // refuse a batch that may not exist.
+            Landing::Unknown => Verdict::Find,
         };
     }
     match entry.batches.back() {
         Some(newest) if !in_sequence(newest.last, first) => Verdict::OutOfOrder,
+        // A send in doubt keeps its lane in Iggy's SDK, so it is always the newest batch.
+        Some(Batch {
+            landing: Landing::InDoubt(in_doubt),
+            ..
+        }) => Verdict::ResolveFirst(in_doubt.clone()),
         _ => Verdict::Append,
     }
 }
@@ -420,12 +585,116 @@ mod tests {
     }
 
     #[test]
-    fn given_an_unknown_outcome_when_retried_should_write_it_again() {
+    fn given_an_unknown_outcome_when_retried_should_look_for_it_in_the_log() {
         let states = ProducerStates::default();
         states.begin(&key(0), 0, 0, 1);
         states.finish(&key(0), 0, 0, Some(Landing::Unknown));
-        assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Append);
+        assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Find);
         assert_eq!(states.check(&key(0), 0, 2, 2), Verdict::Append);
+        states.found(&key(0), 0, 0, 1, 7);
+        assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Duplicate(Some(7)));
+    }
+
+    fn marked(producer_id: i64, epoch: i16, first: i32, last: i32) -> ProducerMark {
+        ProducerMark {
+            producer_id,
+            epoch,
+            first_sequence: first,
+            last_sequence: last,
+        }
+    }
+
+    #[test]
+    fn given_marks_in_the_log_when_restored_should_rebuild_each_producer() {
+        let states = ProducerStates::default();
+        assert!(states.needs_restore("orders", 0));
+        let marks = [
+            (0, marked(7, 0, 0, 1)),
+            (2, marked(8, 0, 0, 0)),
+            (3, marked(7, 0, 2, 2)),
+            (4, marked(9, 1, 0, 0)),
+            (5, marked(9, 2, 0, 0)),
+        ];
+        states.restore("orders", 0, &marks);
+        assert!(!states.needs_restore("orders", 0));
+        assert!(states.needs_restore("orders", 1));
+        assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Duplicate(Some(0)));
+        assert_eq!(states.check(&key(0), 0, 2, 2), Verdict::Duplicate(Some(3)));
+        assert_eq!(states.check(&key(0), 0, 4, 4), Verdict::OutOfOrder);
+        assert_eq!(states.check(&key(0), 0, 3, 3), Verdict::Append);
+        let nine = BatchKey {
+            producer_id: 9,
+            ..key(0)
+        };
+        assert_eq!(states.check(&nine, 1, 1, 1), Verdict::InvalidEpoch);
+        assert_eq!(states.check(&nine, 2, 0, 0), Verdict::Duplicate(Some(5)));
+    }
+
+    #[test]
+    fn given_more_marks_than_the_cache_when_restored_should_keep_the_newest() {
+        let states = ProducerStates::default();
+        let marks: Vec<(u64, ProducerMark)> = (0..8)
+            .map(|index| (u64::try_from(index).unwrap(), marked(7, 0, index, index)))
+            .collect();
+        states.restore("orders", 0, &marks);
+        assert_eq!(states.check(&key(0), 0, 7, 7), Verdict::Duplicate(Some(7)));
+        assert_eq!(states.check(&key(0), 0, 3, 3), Verdict::Duplicate(Some(3)));
+        assert_eq!(states.check(&key(0), 0, 2, 2), Verdict::OutOfOrder);
+    }
+
+    #[test]
+    fn given_state_seen_here_when_restored_should_keep_it() {
+        let states = ProducerStates::default();
+        land(&states, 0, 0, 0, 40);
+        states.restore("orders", 0, &[(1, marked(7, 0, 0, 0))]);
+        assert_eq!(states.check(&key(0), 0, 0, 0), Verdict::Duplicate(Some(40)));
+    }
+
+    fn in_doubt(states: &ProducerStates, first: i32, last: i32, operation: u64) -> InDoubt {
+        let in_doubt = InDoubt::detached(operation);
+        states.begin(&key(0), 0, first, last);
+        states.finish(&key(0), 0, first, Some(Landing::InDoubt(in_doubt.clone())));
+        in_doubt
+    }
+
+    #[test]
+    fn given_a_send_in_doubt_when_its_batch_is_retried_should_replay_it() {
+        let states = ProducerStates::default();
+        land(&states, 0, 0, 0, 1);
+        let held = in_doubt(&states, 1, 2, 9);
+        assert_eq!(states.check(&key(0), 0, 1, 2), Verdict::Resolve(held));
+        assert_eq!(
+            states.check(&key(0), 0, 3, 3),
+            Verdict::ResolveFirst(InDoubt::detached(9)),
+            "the batch after it waits for what the one in doubt did"
+        );
+    }
+
+    #[test]
+    fn given_a_replay_that_landed_when_retried_again_should_answer_a_duplicate() {
+        let states = ProducerStates::default();
+        let held = in_doubt(&states, 0, 1, 9);
+        states.resolved(&key(0), &held, Some(Landing::Landed(None)));
+        assert_eq!(states.check(&key(0), 0, 0, 1), Verdict::Duplicate(None));
+    }
+
+    #[test]
+    fn given_a_replay_that_was_refused_should_accept_the_batch_again() {
+        let states = ProducerStates::default();
+        land(&states, 0, 0, 0, 1);
+        let held = in_doubt(&states, 1, 1, 9);
+        states.resolved(&key(0), &held, None);
+        assert_eq!(states.check(&key(0), 0, 1, 1), Verdict::Append);
+        assert_eq!(states.check(&key(0), 0, 2, 2), Verdict::OutOfOrder);
+    }
+
+    #[test]
+    fn given_a_batch_sent_again_since_when_an_old_replay_ends_should_keep_the_new_send() {
+        let states = ProducerStates::default();
+        let held = in_doubt(&states, 0, 0, 9);
+        states.begin(&key(0), 0, 0, 0);
+        states.resolved(&key(0), &held, Some(Landing::Landed(Some(4))));
+        assert_eq!(states.check(&key(0), 0, 0, 0), Verdict::InFlight);
     }
 
     #[test]

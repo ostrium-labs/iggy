@@ -39,6 +39,7 @@ mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
+mod producer_log;
 mod topics;
 
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
@@ -50,7 +51,7 @@ use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
-pub use produce::{ProduceTurn, Producer, SendEnd};
+pub use produce::{InDoubt, ProduceTurn, Producer, Resolution, SendEnd};
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad,

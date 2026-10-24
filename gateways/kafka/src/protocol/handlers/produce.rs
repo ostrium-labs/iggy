@@ -29,7 +29,9 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, ProduceTurn, Producer, SendEnd, TopicTarget};
+use crate::bridge::{
+    BridgeError, IggyBridge, InDoubt, ProduceTurn, Producer, Resolution, SendEnd, TopicTarget,
+};
 use crate::error::Result;
 use crate::producer_state::{BatchKey, Landing, ProducerStates, Verdict, idempotence};
 use crate::protocol::api::{
@@ -50,6 +52,7 @@ use crate::records::{
     Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
     is_compressed, producer_id, record_slots, to_iggy,
 };
+use crate::records::{ProducerMark, mark_producer};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_PRODUCE,
@@ -149,7 +152,7 @@ pub async fn handle(
         };
     }
 
-    let Some(bridge) = state.bridge.as_deref() else {
+    let Some(bridge) = state.bridge.as_ref() else {
         return stub_outcome(api_version, &request);
     };
 
@@ -372,7 +375,7 @@ impl From<RecordCodecError> for Refusal {
 /// that outlives the deadline keeps `held`, and the partitions after it answer 7.
 #[allow(clippy::too_many_arguments)]
 async fn write_request(
-    bridge: &IggyBridge,
+    bridge: &Arc<IggyBridge>,
     held: Held,
     board: &ProbeBoard,
     states: &Arc<ProducerStates>,
@@ -557,9 +560,10 @@ struct Write<'a> {
 
 /// Writes one partition, first checking an idempotent batch against its producer's state: a retry
 /// of a batch that landed is answered with its offset and not written, a batch out of sequence is
-/// refused with 45, and one from an older epoch with 47. See `producer_state.rs`.
+/// refused with 45, and one from an older epoch with 47. A retry of a batch whose send Iggy never
+/// answered replays that send rather than writing the batch again. See `producer_state.rs`.
 async fn write_checked(
-    bridge: &IggyBridge,
+    bridge: &Arc<IggyBridge>,
     held: Held,
     states: &Arc<ProducerStates>,
     idempotent: Option<(BatchKey, (i64, i16, i32, i32))>,
@@ -568,10 +572,21 @@ async fn write_checked(
     let Some((key, (_, epoch, first, last))) = idempotent else {
         return send_by(bridge, held, write, |_| {}).await;
     };
-    match states.check(&key, epoch, first, last) {
+    let batch = Batch {
+        key,
+        epoch,
+        first,
+        last,
+    };
+    if states.needs_restore(&batch.key.topic, batch.key.partition)
+        && let Err(code) = restore(bridge, states, &batch.key, &write).await
+    {
+        return (Err(code), Some(held));
+    }
+    match states.check(&batch.key, epoch, first, last) {
         Verdict::Duplicate(base_offset) => {
             tracing::debug!(
-                producer_id = key.producer_id,
+                producer_id = batch.key.producer_id,
                 kafka_topic = write.kafka_topic,
                 first,
                 "answered a retried idempotent batch from producer state"
@@ -581,20 +596,189 @@ async fn write_checked(
         Verdict::OutOfOrder => (Err(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER), Some(held)),
         Verdict::InvalidEpoch => (Err(ERROR_INVALID_PRODUCER_EPOCH), Some(held)),
         Verdict::InFlight => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
-        Verdict::Append => {
-            states.begin(&key, epoch, first, last);
-            let states = Arc::clone(states);
-            send_by(bridge, held, write, move |end| {
-                let landing = match end {
-                    SendEnd::Landed(offset) => Some(Landing::Landed(offset)),
-                    SendEnd::Unknown => Some(Landing::Unknown),
-                    SendEnd::NotSent | SendEnd::Refused => None,
-                };
-                states.finish(&key, epoch, first, landing);
-            })
-            .await
+        Verdict::Append => append(bridge, held, states, batch, write).await,
+        Verdict::Find => match find(bridge, states, &batch, &write).await {
+            Ok(Some(offset)) => (Ok(Some(offset)), Some(held)),
+            Ok(None) => append(bridge, held, states, batch, write).await,
+            Err(code) => (Err(code), Some(held)),
+        },
+        Verdict::Resolve(in_doubt) => {
+            match resolve(bridge, &held, states, &batch.key, &in_doubt, write.deadline).await {
+                Resolution::Landed => {
+                    tracing::debug!(
+                        producer_id = batch.key.producer_id,
+                        kafka_topic = write.kafka_topic,
+                        first,
+                        "a replay proved that a retried idempotent batch had landed"
+                    );
+                    // Iggy's answer to a replay names no offset; the log does.
+                    let offset = find(bridge, states, &batch, &write).await.ok().flatten();
+                    (Ok(offset), Some(held))
+                }
+                Resolution::StillInDoubt => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
+                Resolution::Refused => append(bridge, held, states, batch, write).await,
+                Resolution::Lost => match find(bridge, states, &batch, &write).await {
+                    Ok(Some(offset)) => (Ok(Some(offset)), Some(held)),
+                    Ok(None) => append(bridge, held, states, batch, write).await,
+                    Err(code) => (Err(code), Some(held)),
+                },
+            }
+        }
+        Verdict::ResolveFirst(in_doubt) => {
+            match resolve(bridge, &held, states, &batch.key, &in_doubt, write.deadline).await {
+                Resolution::Landed | Resolution::Lost => {
+                    append(bridge, held, states, batch, write).await
+                }
+                // The batch before it is not in Iggy, so this one would leave a gap.
+                Resolution::Refused => (Err(ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER), Some(held)),
+                Resolution::StillInDoubt => (Err(ERROR_REQUEST_TIMED_OUT), Some(held)),
+            }
         }
     }
+}
+
+/// One idempotent batch: its producer and partition, epoch, and sequences.
+struct Batch {
+    key: BatchKey,
+    epoch: i16,
+    first: i32,
+    last: i32,
+}
+
+impl Batch {
+    const fn mark(&self) -> ProducerMark {
+        ProducerMark {
+            producer_id: self.key.producer_id,
+            epoch: self.epoch,
+            first_sequence: self.first,
+            last_sequence: self.last,
+        }
+    }
+}
+
+/// Rebuilds the producer state of the batch's partition from the marks at its tail, once per
+/// partition and gateway run. A scan that fails writes nothing and answers as the bridge failed
+/// (retriable, or 3 for a partition the topic lacks): checked against no state, a retry from
+/// before a restart would be written twice.
+async fn restore(
+    bridge: &Arc<IggyBridge>,
+    states: &ProducerStates,
+    key: &BatchKey,
+    write: &Write<'_>,
+) -> std::result::Result<(), i16> {
+    let marks = bridge
+        .producer_marks(
+            write.kafka_topic,
+            write.partition_id,
+            states.recovery_records(),
+            write.deadline.at,
+        )
+        .await
+        .map_err(|error| {
+            tracing::debug!(
+                %error,
+                kafka_topic = write.kafka_topic,
+                partition = key.partition,
+                "could not rebuild producer state from the log yet"
+            );
+            refusal_code(write.kafka_topic, &error)
+        })?;
+    tracing::debug!(
+        kafka_topic = write.kafka_topic,
+        partition = key.partition,
+        marks = marks.len(),
+        "rebuilt producer state from the log"
+    );
+    states.restore(&key.topic, key.partition, &marks);
+    Ok(())
+}
+
+/// Looks a batch whose outcome is not known up in the log. `Ok(Some(offset))`: it landed there,
+/// and is not written again. `Ok(None)`: it is not in the scanned tail. A scan that fails answers
+/// as the bridge failed.
+async fn find(
+    bridge: &Arc<IggyBridge>,
+    states: &ProducerStates,
+    batch: &Batch,
+    write: &Write<'_>,
+) -> std::result::Result<Option<u64>, i16> {
+    let found = bridge
+        .find_batch(
+            write.kafka_topic,
+            write.partition_id,
+            batch.mark(),
+            states.recovery_records(),
+            write.deadline.at,
+        )
+        .await
+        .map_err(|error| refusal_code(write.kafka_topic, &error))?;
+    if let Some(offset) = found {
+        states.found(&batch.key, batch.epoch, batch.first, batch.last, offset);
+    }
+    Ok(found)
+}
+
+/// Replays the send in doubt `in_doubt` and records what it proved. A request nothing keeps any
+/// more leaves the batch's outcome unknown, and its retry is written again: at-least-once.
+async fn resolve(
+    bridge: &Arc<IggyBridge>,
+    (turn, _): &Held,
+    states: &ProducerStates,
+    key: &BatchKey,
+    in_doubt: &InDoubt,
+    deadline: Deadline,
+) -> Resolution {
+    let resolution = bridge.resolve_send(turn, in_doubt, deadline.at).await;
+    let landing = match resolution {
+        // Iggy's answer to a replay names no offset.
+        Resolution::Landed => Some(Landing::Landed(None)),
+        Resolution::Refused => None,
+        Resolution::Lost => {
+            tracing::debug!(
+                producer_id = key.producer_id,
+                "the request of a send in doubt is gone, so its batch is written again"
+            );
+            Some(Landing::Unknown)
+        }
+        Resolution::StillInDoubt => return resolution,
+    };
+    states.resolved(key, in_doubt, landing);
+    resolution
+}
+
+/// Sends an idempotent batch, marked with its producer, recording in its producer's state how the
+/// send ended.
+async fn append(
+    bridge: &Arc<IggyBridge>,
+    held: Held,
+    states: &Arc<ProducerStates>,
+    batch: Batch,
+    mut write: Write<'_>,
+) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
+    // The mark on the first record is what a restarted gateway rebuilds this state from.
+    if let Some(first) = write.messages.first_mut()
+        && let Err(error) = mark_producer(first, batch.mark())
+    {
+        tracing::debug!(%error, "sent an idempotent batch without its producer mark");
+    }
+    let Batch {
+        key,
+        epoch,
+        first,
+        last,
+    } = batch;
+    states.begin(&key, epoch, first, last);
+    let states = Arc::clone(states);
+    send_by(bridge, held, write, move |end| {
+        let landing = match end {
+            SendEnd::Landed(offset) => Some(Landing::Landed(offset)),
+            SendEnd::InDoubt(in_doubt) => Some(Landing::InDoubt(in_doubt)),
+            SendEnd::Unknown => Some(Landing::Unknown),
+            SendEnd::NotSent | SendEnd::Refused => None,
+        };
+        states.finish(&key, epoch, first, landing);
+    })
+    .await
 }
 
 /// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
@@ -602,7 +786,7 @@ async fn write_checked(
 ///
 /// 7 means nothing was written, or the send may still land and a retry duplicate it.
 async fn send_by(
-    bridge: &IggyBridge,
+    bridge: &Arc<IggyBridge>,
     (turn, admission): Held,
     write: Write<'_>,
     observe: impl FnOnce(SendEnd) + Send + 'static,

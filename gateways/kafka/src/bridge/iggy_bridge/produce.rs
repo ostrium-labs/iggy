@@ -22,11 +22,11 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use futures::future::join_all;
-use iggy::prelude::{IggyClient, IggyError, IggyMessage, MessageClient, Partitioning};
+use iggy::prelude::{Client, IggyClient, IggyError, IggyMessage, MessageClient, Partitioning};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
@@ -365,6 +365,39 @@ impl IggyBridge {
         self.produce_pool.forget(&Producer::Connection(connection));
     }
 
+    /// Replays the send in doubt `in_doubt` on the session of `turn`, until it has an outcome or
+    /// `deadline` passes.
+    ///
+    /// The replay is the frame the first send froze, with its client and request id, so Iggy
+    /// applies it at most once: a first send that landed is answered as a duplicate. Only the
+    /// producer's own client still holds the frame, so a session that closed or was replaced
+    /// since answers [`Resolution::Lost`].
+    pub async fn resolve_send(
+        &self,
+        turn: &ProduceTurn,
+        in_doubt: &InDoubt,
+        deadline: Instant,
+    ) -> Resolution {
+        let Some(client) = turn.seat.session.client.held().await else {
+            return Resolution::Lost;
+        };
+        let same = in_doubt
+            .client
+            .upgrade()
+            .is_some_and(|holder| Arc::ptr_eq(&holder, &client));
+        if !same {
+            return Resolution::Lost;
+        }
+        let resolve = client.resolve_operation(in_doubt.operation, deadline.into_std());
+        match timeout_at(deadline, resolve).await {
+            Ok(Ok(())) => Resolution::Landed,
+            Ok(Err(IggyError::OperationNotRetained(_))) => Resolution::Lost,
+            Ok(Err(IggyError::OperationUncertain(_))) | Err(_) => Resolution::StillInDoubt,
+            // A proved outcome: the replay committed as a refusal, so nothing was written.
+            Ok(Err(_)) => Resolution::Refused,
+        }
+    }
+
     /// Appends `messages` to `partition` of `target` on the session of `turn`, and returns the
     /// base offset. Hands `turn` and `kept` back with it.
     ///
@@ -446,13 +479,22 @@ impl IggyBridge {
                             .await
                         {
                             Err(IggyError::LaneBlocked(operation)) => {
-                                resolve_blocker(&client, operation, recovery_deadline).await?;
+                                // An earlier send in doubt blocks the lane. Its replay comes first,
+                                // so this one cannot land ahead of it. Still in doubt, it blocks
+                                // this send, which then sent nothing.
+                                if resolve_blocker(&client, operation, recovery_deadline)
+                                    .await
+                                    .is_err()
+                                {
+                                    return Err(IggyError::LaneBlocked(operation));
+                                }
                             }
                             result => return result,
                         }
                     }
                 }
             };
+            let in_doubt_on = Arc::downgrade(&client);
             let (result, kept) = within_slot_limit(&session, &client, kept, send).await;
             observe.end(match &result {
                 Ok(response) => SendEnd::Landed(
@@ -462,6 +504,14 @@ impl IggyBridge {
                         .find(|confirmation| confirmation.partition_id == partition)
                         .map(|confirmation| confirmation.base_offset),
                 ),
+                // The SDK keeps the frame, so a replay of it is the same Iggy request.
+                Err(BridgeError::Iggy(IggyError::OperationUncertain(operation))) => {
+                    SendEnd::InDoubt(InDoubt {
+                        operation: *operation,
+                        client: in_doubt_on,
+                    })
+                }
+                Err(BridgeError::Iggy(IggyError::LaneBlocked(_))) => SendEnd::NotSent,
                 Err(BridgeError::Iggy(_)) => SendEnd::Refused,
                 Err(_) => SendEnd::Unknown,
             });
@@ -484,7 +534,7 @@ impl IggyBridge {
 }
 
 /// How a Produce send ended, as far as Iggy said.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendEnd {
     /// It never started: nothing was written.
     NotSent,
@@ -492,8 +542,63 @@ pub enum SendEnd {
     Landed(Option<u64>),
     /// Iggy refused it: nothing was written.
     Refused,
-    /// The connection broke or the send was cut off: it may have landed.
+    /// The SDK gave up on it without an answer and keeps its request, so
+    /// [`IggyBridge::resolve_send`] can replay it as the same Iggy request.
+    InDoubt(InDoubt),
+    /// The connection broke or the send was cut off, and nothing keeps its request: it may have
+    /// landed.
     Unknown,
+}
+
+/// A send whose outcome Iggy never told: its operation, retained by the SDK on the producer's
+/// client.
+///
+/// Iggy deduplicates by client and request id (`core/consensus/src/client_table.rs`). A replay of
+/// the retained frame carries both unchanged, so it lands at most once whatever the first send
+/// did, and its answer is the outcome.
+#[derive(Debug, Clone)]
+pub struct InDoubt {
+    operation: u64,
+    client: Weak<IggyClient>,
+}
+
+impl InDoubt {
+    /// The SDK's id for the retained request.
+    #[must_use]
+    pub const fn operation(&self) -> u64 {
+        self.operation
+    }
+
+    /// One held by no client, for tests of what keeps it.
+    #[cfg(test)]
+    pub(crate) const fn detached(operation: u64) -> Self {
+        Self {
+            operation,
+            client: Weak::new(),
+        }
+    }
+}
+
+impl PartialEq for InDoubt {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation && Weak::ptr_eq(&self.client, &other.client)
+    }
+}
+
+impl Eq for InDoubt {}
+
+/// What a replay of a send in doubt proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// It landed, once.
+    Landed,
+    /// Iggy refused it: nothing was written, and the batch can be sent again.
+    Refused,
+    /// The replay got no answer either. The request stays retained.
+    StillInDoubt,
+    /// Nothing keeps the request any more: its client closed or its session was replaced. The
+    /// outcome is unknown.
+    Lost,
 }
 
 /// Calls its callback once. Dropped uncalled, as when the runtime drops a running send, it

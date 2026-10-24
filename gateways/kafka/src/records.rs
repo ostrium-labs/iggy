@@ -44,6 +44,12 @@ pub const VERSION_HEADER: &str = "kafka.v";
 /// Storage mapping version this build writes and reads.
 pub const MAPPING_VERSION: u8 = 1;
 
+mod producer_mark;
+
+pub use producer_mark::{
+    PRODUCER_HEADER, PRODUCER_MAPPING_VERSION, ProducerMark, mark as mark_producer, mark_of,
+};
+
 /// Iggy header carrying the Kafka record key.
 pub const KEY_HEADER: &str = "kafka.key";
 /// Iggy header naming which of null or empty a placeholder payload stands for.
@@ -116,7 +122,7 @@ pub enum RecordCodecError {
     TimestampOutOfRange(i64),
     #[error("{0} bytes of stored user headers did not parse")]
     UserHeadersUnreadable(u32),
-    #[error("stored mapping version {0} is not {MAPPING_VERSION}")]
+    #[error("stored mapping version {0} is not {MAPPING_VERSION} or {PRODUCER_MAPPING_VERSION}")]
     MappingVersion(u8),
     #[error("value marker {0:?} is neither null nor empty")]
     ValueMarker(Bytes),
@@ -315,7 +321,8 @@ fn stored_timestamp(
     let Some(version) = stored.get(&VERSION_KEY) else {
         return Ok(timestamp_out(message));
     };
-    if version.as_bytes() != [MAPPING_VERSION] {
+    // Version 2 is version 1 plus the `kafka.p` marker, which no Kafka field reads.
+    if version.as_bytes() != [MAPPING_VERSION] && version.as_bytes() != [PRODUCER_MAPPING_VERSION] {
         let version = version.as_bytes().first().copied().unwrap_or_default();
         return Err(RecordCodecError::MappingVersion(version));
     }
@@ -1549,10 +1556,10 @@ mod tests {
 
     #[test]
     fn given_an_unknown_mapping_version_when_read_should_fail() {
-        let message = message_with(b"v", &[(VERSION_HEADER, &[MAPPING_VERSION + 1])]);
+        let message = message_with(b"v", &[(VERSION_HEADER, &[PRODUCER_MAPPING_VERSION + 1])]);
         assert!(matches!(
             from_iggy(&message, 0),
-            Err(RecordCodecError::MappingVersion(2))
+            Err(RecordCodecError::MappingVersion(3))
         ));
     }
 
@@ -1737,7 +1744,7 @@ mod tests {
             message_with(b"v", &[("trace", b"abc")]),
             foreign_with_ts,
             gateway_message(b"v", &[(TIMESTAMP_HEADER, b"epoch")]),
-            message_with(b"v", &[(VERSION_HEADER, &[MAPPING_VERSION + 1])]),
+            message_with(b"v", &[(VERSION_HEADER, &[PRODUCER_MAPPING_VERSION + 1])]),
             unreadable,
         ];
         for (index, message) in messages.iter_mut().enumerate() {

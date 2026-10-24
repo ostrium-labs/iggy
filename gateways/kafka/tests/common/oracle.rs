@@ -194,6 +194,24 @@ impl Container {
         Ok(Self { name })
     }
 
+    /// Restarts the container: its broker stops, as on a shutdown, and starts on the same data
+    /// and ports.
+    pub fn restart(&self) -> Result<(), String> {
+        let output = Command::new(container_cli())
+            .args(["restart", "--time", "30", &self.name])
+            .output()
+            .map_err(|error| format!("restart {}: {error}", self.name))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "restart {}: {}",
+                self.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
     /// The container's recent output, for a failure message.
     #[must_use]
     pub fn logs_tail(&self) -> String {
@@ -252,10 +270,16 @@ async fn wait_for_broker(address: &str, container: &Container) -> Result<(), Str
 /// Apache Kafka, `KRaft` combined mode, one node, on loopback.
 pub struct KafkaOracle {
     pub target: Target,
-    _container: Container,
+    container: Container,
 }
 
 impl KafkaOracle {
+    /// Restarts the broker on its data, and waits until it serves again.
+    pub async fn restart(&self) -> Result<(), String> {
+        self.container.restart()?;
+        wait_for_broker(&self.target.address, &self.container).await
+    }
+
     pub async fn start() -> Result<Self, Unavailable> {
         image_ready(KAFKA_ORACLE_IMAGE).map_err(Unavailable::Skipped)?;
         let port = free_port();
@@ -313,7 +337,7 @@ impl KafkaOracle {
                 kind: TargetKind::Kafka,
                 address,
             },
-            _container: container,
+            container,
         })
     }
 }
@@ -321,10 +345,16 @@ impl KafkaOracle {
 /// Redpanda in dev-container mode, one shard, on loopback.
 pub struct RedpandaOracle {
     pub target: Target,
-    _container: Container,
+    container: Container,
 }
 
 impl RedpandaOracle {
+    /// Restarts the broker on its data, and waits until it serves again.
+    pub async fn restart(&self) -> Result<(), String> {
+        self.container.restart()?;
+        wait_for_broker(&self.target.address, &self.container).await
+    }
+
     pub async fn start() -> Result<Self, Unavailable> {
         if !env_flag("KAFKA_ORACLE_REDPANDA") {
             return Err(Unavailable::Skipped(
@@ -377,7 +407,7 @@ impl RedpandaOracle {
                 kind: TargetKind::Redpanda,
                 address,
             },
-            _container: container,
+            container,
         })
     }
 }

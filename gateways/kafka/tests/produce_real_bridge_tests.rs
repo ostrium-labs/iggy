@@ -50,9 +50,12 @@ use iggy_gateway_kafka::records::{KEY_HEADER, MAPPING_VERSION, VERSION_HEADER, f
 mod codec;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
+#[path = "common/relay.rs"]
+mod relay;
 
 use codec::{Decoder, Encoder};
 use iggy_server::{TestServer, raw_client};
+use relay::PausingRelay;
 
 /// The stream every unmapped Kafka topic resolves to, per `TopicMapping`'s default rule.
 const STREAM: &str = "kafka";
@@ -965,6 +968,103 @@ async fn given_an_older_epoch_when_handled_should_refuse_it() {
         vec![(0, ERROR_INVALID_PRODUCER_EPOCH, -1)]
     );
     assert_eq!(stored(&server, 0, 10).await.len(), 1);
+}
+
+/// Past the 30 s after which the SDK gives up on a call. A send that Iggy has not answered by
+/// then ends in doubt: it can still land.
+const PAST_SDK_DEADLINE: Duration = Duration::from_secs(31);
+
+/// Sends `entries` with a 1 s `timeout_ms`, as a producer's retry would, and returns the answer.
+async fn produce_within_a_second(state: &GatewayState, entries: &[Entry]) -> (i16, i64) {
+    let body = encode_timed_request(3, -1, 1_000, TOPIC, entries);
+    let response = handle_request_bounded(state, API_KEY_PRODUCE, 3, body)
+        .await
+        .expect_response("acks=-1 is answered");
+    let [(_, code, offset)] = partition_results(3, response)[..] else {
+        panic!("one partition answered");
+    };
+    (code, offset)
+}
+
+/// The idempotent producer retries a batch whose send to Iggy got no answer: the SDK gave up on
+/// it in doubt, and it landed later. The retry must replay that same Iggy request, which Iggy
+/// deduplicates, not write the batch a second time (KW-3 part 2, #4513).
+#[tokio::test]
+#[serial]
+async fn given_a_send_in_doubt_that_landed_late_when_retried_should_store_it_once() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let relay = PausingRelay::start(server.test_config().address).await;
+    let mut config = server.test_config();
+    config.address.clone_from(&relay.address);
+    IggyBridge::connect(server.test_config())
+        .await
+        .expect("seed bridge")
+        .ensure_stream_and_topic(TOPIC, 1)
+        .await
+        .expect("seed the topic");
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects through the relay");
+    let state = GatewayState::new(
+        Some(Arc::new(bridge)),
+        MAX_FRAME_SIZE,
+        0,
+        GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+    );
+    let producer_id = issued_producer_id(&state).await;
+
+    let first = [(0, sequenced_batch(producer_id, 0, 0, &[b"a"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &first).await,
+        vec![(0, ERROR_NONE, 0)],
+        "the producer's session is open"
+    );
+
+    relay.hold_all();
+    let second = [(0, sequenced_batch(producer_id, 0, 1, &[b"b", b"c"]))];
+    assert_eq!(
+        produce_within_a_second(&state, &second).await,
+        (ERROR_REQUEST_TIMED_OUT, -1),
+        "Iggy does not answer, so the request times out"
+    );
+    tokio::time::sleep(PAST_SDK_DEADLINE).await;
+    // The held send reaches Iggy now, after the SDK gave up on it.
+    relay.release_all();
+
+    let give_up = tokio::time::Instant::now() + STEP;
+    let answer = loop {
+        let answer = produce_within_a_second(&state, &second).await;
+        if answer.0 != ERROR_REQUEST_TIMED_OUT || tokio::time::Instant::now() >= give_up {
+            break answer;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        answer.0, ERROR_NONE,
+        "the replay proves that the batch landed"
+    );
+    let values: Vec<Bytes> = stored(&server, 0, 10)
+        .await
+        .into_iter()
+        .map(|message| message.payload)
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c")
+        ],
+        "the batch in doubt is written once"
+    );
+
+    let third = [(0, sequenced_batch(producer_id, 0, 3, &[b"d"]))];
+    assert_eq!(
+        produce(&state, 3, -1, TOPIC, &third).await,
+        vec![(0, ERROR_NONE, 3)],
+        "the next batch follows it"
+    );
 }
 
 /// A batch of `values` from `producer_id` at `epoch`, its first record at `sequence`.
