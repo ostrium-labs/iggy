@@ -26,6 +26,8 @@
 
 pub mod alter_configs;
 pub mod api_versions;
+pub mod consumer_group_describe;
+pub mod consumer_group_heartbeat;
 pub mod create_partitions;
 pub mod create_topics;
 pub mod delete_groups;
@@ -63,7 +65,8 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CONSUMER_GROUP_DESCRIBE,
+    API_KEY_CONSUMER_GROUP_HEARTBEAT, API_KEY_CREATE_PARTITIONS, API_KEY_CREATE_TOPICS,
     API_KEY_DELETE_GROUPS, API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CLUSTER,
     API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
     API_KEY_HEARTBEAT, API_KEY_INCREMENTAL_ALTER_CONFIGS, API_KEY_INIT_PRODUCER_ID,
@@ -156,6 +159,12 @@ pub async fn dispatch(
             offset_delete::handle(state, connection, principal, api_version, body).await
         }
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
+        API_KEY_CONSUMER_GROUP_HEARTBEAT => {
+            consumer_group_heartbeat::handle(state, api_version, body).await
+        }
+        API_KEY_CONSUMER_GROUP_DESCRIBE => {
+            consumer_group_describe::handle(state, api_version, body).await
+        }
         _ => HandleOutcome::Close,
     }
 }

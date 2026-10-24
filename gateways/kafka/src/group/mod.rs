@@ -26,9 +26,12 @@
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
 //! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
 
+mod consumer_coordinator;
+pub mod consumer_protocol;
 mod offset_work;
 mod state;
 
+pub use consumer_coordinator::ConsumerGroupSnapshot;
 pub use offset_work::{RunningCommit, RunningDeletion};
 pub use state::{MAX_GROUP_ID_BYTES, is_valid_group_id};
 
@@ -48,7 +51,8 @@ use tokio_util::sync::CancellationToken;
 use crate::group::offset_work::OffsetWork;
 use crate::group::state::{GroupState, Step};
 use crate::protocol::api::{
-    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_NONE,
+    ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
 };
 
 /// `DescribeGroups` / `ListGroups` state string for a group with no joined members.
@@ -391,7 +395,14 @@ pub struct GroupListing {
     pub group_id: StrBytes,
     pub protocol_type: StrBytes,
     pub state: &'static str,
+    /// `ListGroups` v5 `group_type`: `classic`, or `consumer` for a KIP-848 group.
+    pub group_type: &'static str,
 }
+
+/// `ListGroups` v5 `group_type` of a classic group.
+pub const CLASSIC_GROUP_TYPE: &str = "classic";
+/// `ListGroups` v5 `group_type` of a KIP-848 consumer group.
+pub const CONSUMER_GROUP_TYPE: &str = "consumer";
 
 impl GroupListing {
     /// A group with no members here that holds offsets in Iggy. Kafka keeps a group whose
@@ -402,6 +413,7 @@ impl GroupListing {
             group_id,
             protocol_type: StrBytes::from_static_str(OFFSETS_ONLY_PROTOCOL_TYPE),
             state: GROUP_STATE_EMPTY,
+            group_type: CLASSIC_GROUP_TYPE,
         }
     }
 }
@@ -546,6 +558,8 @@ impl From<&HeartbeatRequest> for GroupMember {
 pub struct GroupCoordinator {
     config: GroupCoordinatorConfig,
     groups: Mutex<HashMap<StrBytes, GroupState>>,
+    /// KIP-848 consumer groups. Locked after `groups` when both are held.
+    consumer: Mutex<HashMap<StrBytes, consumer_protocol::ConsumerGroup>>,
     /// The commits and the offset deletions that run for each group. Changed under `groups`, so
     /// a check of a group and its deletion's start are one step.
     offset_work: Arc<OffsetWork>,
@@ -560,6 +574,7 @@ impl GroupCoordinator {
         Self {
             config,
             groups: Mutex::new(HashMap::new()),
+            consumer: Mutex::new(HashMap::new()),
             offset_work: Arc::new(OffsetWork::new()),
             shutdown,
         }
@@ -571,6 +586,10 @@ impl GroupCoordinator {
     /// which clients retry. A member that joined then could subscribe to a topic whose offsets
     /// the deletion removes, and commit offsets that it wipes.
     pub async fn join(&self, request: &JoinRequest) -> JoinResult {
+        // A live KIP-848 group keeps its id, as in Kafka with online migration off.
+        if self.consumer_group_blocks_join(&request.group_id).await {
+            return JoinResult::error(ERROR_INCONSISTENT_GROUP_PROTOCOL, request.member_id.clone());
+        }
         let mut parked: Option<StrBytes> = None;
         loop {
             let outcome = {
@@ -704,7 +723,14 @@ impl GroupCoordinator {
     /// the group's offsets runs, which clients retry.
     pub async fn validate_commit(&self, request: &CommitRequest) -> Result<RunningCommit, i16> {
         let mut groups = self.groups.lock().await;
-        match state::commit_step(&mut groups, request, Instant::now()) {
+        let consumer = self
+            .consumer_commit(&request.group_id, &request.member_id, request.generation_id)
+            .await;
+        let checked = match consumer {
+            Some(code) => code,
+            None => state::commit_step(&mut groups, request, Instant::now()),
+        };
+        match checked {
             ERROR_NONE => self
                 .offset_work
                 .begin_commit(&request.group_id)
@@ -723,10 +749,14 @@ impl GroupCoordinator {
     ) -> (Vec<GroupRemoval>, RunningDeletion) {
         let mut groups = self.groups.lock().await;
         let now = Instant::now();
-        let removals: Vec<GroupRemoval> = group_ids
-            .iter()
-            .map(|group_id| state::group_removal(&mut groups, group_id, now))
-            .collect();
+        let mut removals: Vec<GroupRemoval> = Vec::with_capacity(group_ids.len());
+        for group_id in group_ids {
+            let removal = match self.consumer_removal(group_id).await {
+                Some(GroupRemoval::Live) => GroupRemoval::Live,
+                _ => state::group_removal(&mut groups, group_id, now),
+            };
+            removals.push(removal);
+        }
         let deleted = group_ids
             .iter()
             .zip(&removals)
@@ -752,7 +782,10 @@ impl GroupCoordinator {
     /// returned value drops. Keep it until no Iggy call of the deletion can land. Never parks.
     pub async fn offset_deletion(&self, group_id: &StrBytes) -> (OffsetDeletion, RunningDeletion) {
         let mut groups = self.groups.lock().await;
-        let allowed = state::offset_deletion(&mut groups, group_id, Instant::now());
+        let allowed = match self.consumer_offset_deletion(group_id).await {
+            Some(allowed) => allowed,
+            None => state::offset_deletion(&mut groups, group_id, Instant::now()),
+        };
         let deletion = self.offset_work.begin_deletion([group_id]);
         drop(groups);
         (allowed, deletion)
@@ -785,8 +818,23 @@ impl GroupCoordinator {
     /// effect of reading. Groups whose sessions and pending ids are already past `now` are left
     /// out, which is the same membership `DescribeGroups` would see after it did tick.
     pub async fn list_groups(&self) -> Vec<GroupListing> {
-        let groups = self.groups.lock().await;
-        state::list_groups(&groups, Instant::now())
+        let mut listed = {
+            let groups = self.groups.lock().await;
+            state::list_groups(&groups, Instant::now())
+        };
+        listed.extend(
+            self.list_consumer_groups()
+                .await
+                .into_iter()
+                .map(|snapshot| GroupListing {
+                    group_id: snapshot.group_id,
+                    protocol_type: StrBytes::from_static_str(CONSUMER_PROTOCOL_TYPE),
+                    state: snapshot.state.name(),
+                    group_type: CONSUMER_GROUP_TYPE,
+                }),
+        );
+        listed.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+        listed
     }
 
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.

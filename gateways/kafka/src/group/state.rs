@@ -1625,6 +1625,7 @@ pub fn list_groups(groups: &Groups, now: Instant) -> Vec<GroupListing> {
             group_id: group_id.clone(),
             protocol_type: group.protocol_type.clone(),
             state: group.reported_state(),
+            group_type: super::CLASSIC_GROUP_TYPE,
         })
         .collect();
     listed.sort_by(|left, right| left.group_id.cmp(&right.group_id));

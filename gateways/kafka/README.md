@@ -289,7 +289,9 @@ Limits:
 
 - One gateway per bootstrap endpoint. Group membership is gateway memory
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
-- Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
+- KIP-848 (`group.protocol=consumer`) and classic groups both work, but one group id is one kind
+  at a time: a live group does not convert between them member by member
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#the-consumer-protocol-kip-848)).
 - Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
 - If `--delete` fails with `GroupAuthorizationException` although the principal holds a global

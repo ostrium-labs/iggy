@@ -393,6 +393,58 @@ send it (see [Static membership](#static-membership)), so a static consumer that
 costs the survivors up to `session.timeout.ms` before they rebalance, as in Kafka. One that
 restarts within that time takes its partitions back with no rebalance.
 
-`ConsumerGroupHeartbeat` (68), the KIP-848 protocol, is not implemented and a client cannot fall
-back from it. It is opt-in: a Kafka 4.0 client still defaults to `group.protocol=classic`, which reaches
-these keys.
+A client on `group.protocol=consumer` uses the KIP-848 protocol instead; see
+[The consumer protocol (KIP-848)](#the-consumer-protocol-kip-848).
+
+## The consumer protocol (KIP-848)
+
+`ConsumerGroupHeartbeat` (68) v0-1 and `ConsumerGroupDescribe` (69) v0-1, in
+`src/group/consumer_protocol.rs` (the state machine) and `src/group/consumer_coordinator.rs`
+(its place next to the classic groups). A Java 4 consumer with `group.protocol=consumer` and
+librdkafka 2.12+ with the same setting use it; franz-go uses it whenever the broker advertises it.
+
+The coordinator assigns, as Kafka's does:
+
+- **Assignors.** `uniform` (the default: balanced to within one partition, sticky, any mix of
+  subscriptions) and `range` (per topic, contiguous ranges in member id order, so co-partitioned
+  topics line up). A member names one with `group.remote.assignor`; the group uses the one most
+  members name. Any other name answers `UNSUPPORTED_ASSIGNOR` (112). Kafka's `uniform` balances
+  the same way but may pick other partitions, so tests compare counts and ownership, not layouts.
+- **Epochs.** The group epoch goes up when a member joins, leaves or is fenced, when a
+  subscription changes, and when a subscribed topic appears, goes or gains partitions. The target
+  assignment is then recomputed. Each member's epoch catches up one heartbeat at a time: it first
+  revokes what it loses (keeping its epoch), then moves to the target epoch and receives what no
+  other member still holds. A partition never has two owners.
+- **Fencing.** An epoch above the member's, or below it other than the previous epoch of a member
+  that lost a response, answers `FENCED_MEMBER_EPOCH` (110); the member drops its partitions and
+  joins again. A member that does not heartbeat for 45 s (`group.consumer.session.timeout.ms`), or
+  does not revoke within its `rebalance.timeout.ms`, is removed.
+- **Static members.** A member that leaves with epoch -2 keeps its assignment for its session; the
+  same `group.instance.id` joining again takes it over at the same epoch, with no rebalance. An
+  instance id held by a live member answers `UNRELEASED_INSTANCE_ID` (111).
+- **Regex subscriptions** (v1, `SubscribedTopicRegex`) match whole topic names, as Kafka's RE2J
+  `matches` does; an invalid one answers `INVALID_REGULAR_EXPRESSION` (128). A regex makes each
+  heartbeat list every topic.
+- **Offsets.** `OffsetCommit` from a member must carry its current epoch, else
+  `STALE_MEMBER_EPOCH` (113); epoch -1 with no member id commits only into an empty group. Offsets
+  stay in Iggy, so a group keeps them across protocols.
+- Assignments name topics by [topic id](SCOPE.md#topic-ids). Each heartbeat resolves the group's
+  subscribed topics from Iggy (one `get_topics` per stream, or every topic for a regex); if Iggy
+  does not answer within 3 s the group keeps the topics it saw last.
+
+One group id is one kind of group at a time, as in Kafka with
+`group.consumer.migration.policy=disabled`: a consumer heartbeat for a classic group with members
+answers `GROUP_ID_NOT_FOUND` (69), and a `JoinGroup` for a consumer group with members answers
+`INCONSISTENT_GROUP_PROTOCOL` (23). An empty group of either kind gives way, so a group moves
+between protocols by stopping its consumers and starting them on the other protocol; its offsets
+come along. Kafka's default, `bidirectional`, also converts a live group one member at a time;
+the gateway does not (planned, KW-13 part 2).
+
+`ListGroups` v5 reports consumer groups with type `consumer` and states `Empty`, `Assigning`,
+`Reconciling` or `Stable`. `DescribeGroups` does not describe them; `kafka-consumer-groups.sh
+--describe` uses `ConsumerGroupDescribe`. `DeleteGroups` refuses a consumer group with members
+(`NON_EMPTY_GROUP`), and `OffsetDelete` keeps the offsets of the topics its members subscribe to.
+
+Not built: online migration between protocols, rack-aware assignment, the member client id and
+host in `ConsumerGroupDescribe` (they come with KW-12's header plumbing), and KIP-1071 Streams
+groups.

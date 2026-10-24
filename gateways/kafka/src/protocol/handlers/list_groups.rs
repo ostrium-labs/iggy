@@ -39,7 +39,7 @@ use kafka_protocol::protocol::StrBytes;
 
 use crate::bridge::{OffsetGroups, ScannedGroups};
 use crate::error::Result;
-use crate::group::{GROUP_STATE_EMPTY, GroupListing};
+use crate::group::{CLASSIC_GROUP_TYPE, GROUP_STATE_EMPTY, GroupListing};
 use crate::protocol::api::{
     API_KEY_LIST_GROUPS, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
     ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
@@ -58,8 +58,6 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 5,
 };
 
-/// `ListGroups` v5 `group_type` for the classic protocol this coordinator runs.
-const CLASSIC_GROUP_TYPE: &str = "classic";
 
 pub async fn handle(
     state: &GatewayState,
@@ -110,7 +108,7 @@ pub async fn handle(
         .into_iter()
         .filter(|group| {
             selected(&request.states_filter, group.state)
-                && selected(&request.types_filter, CLASSIC_GROUP_TYPE)
+                && selected(&request.types_filter, group.group_type)
         })
         .collect();
     // `protocol_type` is echoed for every group. The shape guard never sees that list, so a
@@ -212,7 +210,7 @@ fn listed_group_len(version: i16, group: &GroupListing) -> usize {
         total += kafka_string_len(true, group.state.len());
     }
     if version >= 5 {
-        total += kafka_string_len(true, CLASSIC_GROUP_TYPE.len());
+        total += kafka_string_len(true, group.group_type.len());
     }
     if flexible {
         total += 1;
@@ -225,7 +223,7 @@ fn listed_group(group: GroupListing) -> ListedGroup {
         .with_group_id(GroupId(group.group_id))
         .with_protocol_type(group.protocol_type)
         .with_group_state(StrBytes::from_static_str(group.state))
-        .with_group_type(StrBytes::from_static_str(CLASSIC_GROUP_TYPE))
+        .with_group_type(StrBytes::from_static_str(group.group_type))
 }
 
 /// # Errors

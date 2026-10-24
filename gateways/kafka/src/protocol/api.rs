@@ -44,7 +44,8 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_groups,
+    alter_configs, api_versions, consumer_group_describe, consumer_group_heartbeat,
+    create_partitions, create_topics, decode_guarded, delete_groups,
     delete_topics, describe_cluster, describe_configs, describe_groups, dispatch, fetch,
     find_coordinator, heartbeat, incremental_alter_configs, init_producer_id, join_group,
     leave_group, list_groups, list_offsets, metadata, offset_commit, offset_delete, offset_fetch,
@@ -83,6 +84,8 @@ pub const API_KEY_DELETE_GROUPS: i16 = 42;
 pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 pub const API_KEY_OFFSET_DELETE: i16 = 47;
 pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
+pub const API_KEY_CONSUMER_GROUP_HEARTBEAT: i16 = 68;
+pub const API_KEY_CONSUMER_GROUP_DESCRIBE: i16 = 69;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -227,6 +230,17 @@ pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
 pub const ERROR_MISMATCHED_ENDPOINT_TYPE: i16 = ResponseError::MismatchedEndpointType.code();
 /// `DescribeCluster` v1+ named an endpoint type Kafka does not define.
 pub const ERROR_UNSUPPORTED_ENDPOINT_TYPE: i16 = ResponseError::UnsupportedEndpointType.code();
+/// KIP-848: the member's epoch is not one the coordinator accepts. The member gives up its
+/// partitions and joins again.
+pub const ERROR_FENCED_MEMBER_EPOCH: i16 = ResponseError::FencedMemberEpoch.code();
+/// KIP-848: another live member holds the static instance id.
+pub const ERROR_UNRELEASED_INSTANCE_ID: i16 = ResponseError::UnreleasedInstanceId.code();
+/// KIP-848: the member asked for a server assignor the coordinator does not have.
+pub const ERROR_UNSUPPORTED_ASSIGNOR: i16 = ResponseError::UnsupportedAssignor.code();
+/// KIP-848: an `OffsetCommit` named a member epoch other than the member's current one.
+pub const ERROR_STALE_MEMBER_EPOCH: i16 = ResponseError::StaleMemberEpoch.code();
+/// KIP-848: the subscription regex does not compile.
+pub const ERROR_INVALID_REGULAR_EXPRESSION: i16 = ResponseError::InvalidRegularExpression.code();
 /// A request named a topic by an id (KIP-516) that no topic has, or no longer has.
 pub const ERROR_UNKNOWN_TOPIC_ID: i16 = ResponseError::UnknownTopicId.code();
 
@@ -334,6 +348,8 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     delete_groups::RANGE,
     offset_delete::RANGE,
     describe_cluster::RANGE,
+    consumer_group_heartbeat::RANGE,
+    consumer_group_describe::RANGE,
 ];
 
 #[must_use]
