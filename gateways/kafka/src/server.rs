@@ -18,7 +18,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::RequestHeader;
@@ -37,27 +37,34 @@ use tracing_subscriber::filter::LevelFilter;
 
 use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
+    ScramCredentialSource,
 };
 use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{ListenerConfig, SecurityProtocol};
+use crate::oauth::{TokenError, TokenValidator};
 use crate::protocol::api::{
-    API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
-    ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
-    ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter, decode_sasl_auth_bytes,
-    decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
-    respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
+    API_KEY_ALTER_USER_SCRAM_CREDENTIALS, API_KEY_DESCRIBE_ACLS,
+    API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE,
+    BrokerAdvertise, ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION,
+    GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter,
+    decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key,
+    handle_connection_request, respond_describe_acls_error, sasl_authenticate_outcome,
+    sasl_authenticate_reply, sasl_handshake_outcome,
 };
 use crate::protocol::auto_topic_creation::{self, AutoTopicCreationConfig};
 use crate::protocol::handlers::api_versions::Advertisement;
+use crate::protocol::handlers::scram_credentials;
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
-    SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain,
+    EnabledMechanisms, OAUTHBEARER_SEPARATOR, SASL_AUTHENTICATE_MAX_VERSION,
+    SASL_HANDSHAKE_VERSION, SaslAction, SaslMechanism, SaslState, parse_oauthbearer, parse_plain,
 };
+use crate::scram::{DecoySecret, ScramMechanism, ScramServer, parse_client_first};
 use crate::tls::{IdentityError, TlsConfig, TlsState};
 
 const READ_CHUNK: usize = 65536;
@@ -165,6 +172,11 @@ pub struct GatewayConfig {
     /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
     /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
     pub auto_topic_creation: AutoTopicCreationConfig,
+    /// Kafka's `connections.max.reauth.ms` (`IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS`): the longest
+    /// an authenticated SASL session lasts before the client must re-authenticate on the same
+    /// connection (KIP-368). `None`, the default, sets no limit beyond a credential's own
+    /// expiry, which an OAUTHBEARER token always has.
+    pub connections_max_reauth: Option<Duration>,
 }
 
 impl Default for GatewayConfig {
@@ -186,6 +198,7 @@ impl Default for GatewayConfig {
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
             auto_topic_creation: AutoTopicCreationConfig::default(),
+            connections_max_reauth: None,
         }
     }
 }
@@ -313,6 +326,11 @@ pub fn bind_listeners(config: &GatewayConfig) -> Result<Vec<BoundListener>> {
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
+    token_validator: Option<Arc<dyn TokenValidator>>,
+    scram: Option<Arc<dyn ScramCredentialSource>>,
+    /// The mechanisms SASL listeners offer. `None` derives them from what is configured: PLAIN
+    /// with an authenticator, OAUTHBEARER with a token validator.
+    mechanisms: Option<EnabledMechanisms>,
     bridge: Option<Arc<IggyBridge>>,
     principal_resolver: Option<Arc<dyn PrincipalResolver>>,
     cluster_id: Option<ClusterId>,
@@ -320,7 +338,12 @@ pub struct KafkaGateway {
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
 struct SharedAuth {
+    mechanisms: EnabledMechanisms,
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
+    token_validator: Option<Arc<dyn TokenValidator>>,
+    scram: Option<Arc<dyn ScramCredentialSource>>,
+    /// Decoy salts for SCRAM logins of unknown users, stable for the process.
+    scram_decoys: DecoySecret,
     /// Looks up the Iggy user a client certificate names. The bridge, unless a test swaps one in.
     resolver: Option<Arc<dyn PrincipalResolver>>,
     slots: Semaphore,
@@ -332,12 +355,19 @@ struct SharedAuth {
 
 impl SharedAuth {
     fn new(
+        mechanisms: EnabledMechanisms,
         authenticator: Option<Arc<dyn SaslAuthenticator>>,
+        token_validator: Option<Arc<dyn TokenValidator>>,
+        scram: Option<Arc<dyn ScramCredentialSource>>,
         resolver: Option<Arc<dyn PrincipalResolver>>,
         max_concurrent: usize,
     ) -> Self {
         Self {
+            mechanisms,
             authenticator,
+            token_validator,
+            scram,
+            scram_decoys: DecoySecret::default(),
             resolver,
             slots: Semaphore::new(max_concurrent),
             lookup_slots: Semaphore::new(max_concurrent),
@@ -357,6 +387,9 @@ struct Listener {
     /// [`AuthenticatedPrincipal::anonymous`]. True on every listener without SASL once any
     /// listener of the gateway names principals, so the permission gates hold there too.
     anonymous_without_principal: bool,
+    /// Whether the SCRAM credential keys are served here: SCRAM is on, the bridge keeps the
+    /// credentials, and this listener names principals.
+    scram_admin: bool,
 }
 
 impl Listener {
@@ -366,12 +399,14 @@ impl Listener {
             self.protocol.uses_sasl(),
             self.acls_enabled,
         )
+        .with_scram_admin(self.scram_admin)
     }
 
     const fn advertisement(&self) -> Advertisement {
         Advertisement {
             sasl: self.protocol.uses_sasl(),
             acls: self.acls_enabled,
+            scram: self.scram_admin,
         }
     }
 }
@@ -382,6 +417,9 @@ impl KafkaGateway {
         Self {
             config: Arc::new(config),
             authenticator: None,
+            token_validator: None,
+            scram: None,
+            mechanisms: None,
             bridge: None,
             principal_resolver: None,
             cluster_id: None,
@@ -419,6 +457,53 @@ impl KafkaGateway {
     pub fn with_authenticator(mut self, authenticator: Arc<dyn SaslAuthenticator>) -> Self {
         self.authenticator = Some(authenticator);
         self
+    }
+
+    /// Supplies the validator OAUTHBEARER tokens are checked against.
+    ///
+    /// The principal a token names is then looked up as an Iggy user, through the bridge or
+    /// [`Self::with_principal_resolver`], so one of those is required too.
+    #[must_use]
+    pub fn with_token_validator(mut self, validator: Arc<dyn TokenValidator>) -> Self {
+        self.token_validator = Some(validator);
+        self
+    }
+
+    /// Supplies the store SCRAM-SHA-256 and SCRAM-SHA-512 credentials are looked up in.
+    ///
+    /// Like OAUTHBEARER, a SCRAM login's user is then looked up as an Iggy user, through the
+    /// bridge or [`Self::with_principal_resolver`].
+    #[must_use]
+    pub fn with_scram_credentials(mut self, scram: Arc<dyn ScramCredentialSource>) -> Self {
+        self.scram = Some(scram);
+        self
+    }
+
+    /// Sets the mechanisms SASL listeners offer, instead of deriving them from what is
+    /// configured. [`Self::run`] refuses a mechanism with nothing behind it, and something
+    /// configured that no offered mechanism uses.
+    #[must_use]
+    pub fn with_sasl_mechanisms(mut self, mechanisms: EnabledMechanisms) -> Self {
+        self.mechanisms = Some(mechanisms);
+        self
+    }
+
+    /// The mechanisms SASL listeners offer: the explicit list, or one per configured backend.
+    fn enabled_mechanisms(&self) -> EnabledMechanisms {
+        self.mechanisms.clone().unwrap_or_else(|| {
+            EnabledMechanisms::new(
+                [
+                    self.authenticator.as_ref().map(|_| SaslMechanism::Plain),
+                    self.scram.as_ref().map(|_| SaslMechanism::ScramSha256),
+                    self.scram.as_ref().map(|_| SaslMechanism::ScramSha512),
+                    self.token_validator
+                        .as_ref()
+                        .map(|_| SaslMechanism::OAuthBearer),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+        })
     }
 
     /// Supplies the lookup that turns a client certificate's mapped name into an Iggy user.
@@ -468,6 +553,7 @@ impl KafkaGateway {
         let any_names_principals = listeners
             .iter()
             .any(|listener| names_principals(listener.config.protocol));
+        let scram_admin = self.bridge.is_some() && self.enabled_mechanisms().any_scram();
 
         let mut bound = Vec::with_capacity(listeners.len());
         for BoundListener { config, socket } in listeners {
@@ -488,6 +574,7 @@ impl KafkaGateway {
                     broker,
                     acls_enabled: names_principals(protocol),
                     anonymous_without_principal: any_names_principals && !protocol.uses_sasl(),
+                    scram_admin: scram_admin && names_principals(protocol),
                 }),
                 socket,
             ));
@@ -501,7 +588,10 @@ impl KafkaGateway {
         let cluster_id = self.cluster_id().await?;
         let state = Arc::new(self.shared_state(cluster_id, &cancel)?);
         let shared_auth = Arc::new(SharedAuth::new(
+            self.enabled_mechanisms(),
             self.authenticator.clone(),
+            self.token_validator.clone(),
+            self.scram.clone(),
             resolver,
             self.config.max_concurrent_authentications,
         ));
@@ -590,12 +680,15 @@ impl KafkaGateway {
         Ok(bridge.load_cluster_id().await?)
     }
 
-    /// Refuses to start when the SASL listeners and the configured authenticator disagree.
+    /// Refuses to start when the SASL listeners, the mechanisms they offer and the configured
+    /// verifiers disagree.
     fn check_sasl_wiring(&self, listeners: &[BoundListener]) -> Result<()> {
         let sasl_enabled = listeners
             .iter()
             .any(|listener| listener.config.protocol.uses_sasl());
-        if !sasl_enabled && self.authenticator.is_some() {
+        let configured =
+            self.authenticator.is_some() || self.token_validator.is_some() || self.scram.is_some();
+        if !sasl_enabled && configured {
             // The mirror of the guard below, and the quieter mistake: a verifier attached while no
             // listener runs SASL means every connection is served unauthenticated, with nothing
             // in the log to say so. Refusing to start is the only way that failure is visible.
@@ -606,11 +699,54 @@ impl KafkaGateway {
                     .into(),
             ));
         }
-        if sasl_enabled && self.authenticator.is_none() {
+        if !sasl_enabled {
+            return Ok(());
+        }
+        let mechanisms = self.enabled_mechanisms();
+        if mechanisms.is_empty() || !configured {
             return Err(KafkaProtocolError::InvalidConfig(
                 "a listener runs SASL but no authenticator is configured; every client on it \
                  would be rejected. Set IGGY_KAFKA_IGGY_ADDR to the Iggy server that credentials \
                  are verified against, or drop the SASL listener"
+                    .into(),
+            ));
+        }
+        let backed = |mechanism: SaslMechanism| match mechanism {
+            SaslMechanism::Plain => self.authenticator.is_some(),
+            SaslMechanism::OAuthBearer => self.token_validator.is_some(),
+            SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => self.scram.is_some(),
+        };
+        if let Some(missing) = mechanisms.iter().find(|mechanism| !backed(*mechanism)) {
+            return Err(KafkaProtocolError::InvalidConfig(format!(
+                "SASL mechanism {missing} is enabled but nothing is configured to verify it"
+            )));
+        }
+        if self.authenticator.is_some() && !mechanisms.contains(SaslMechanism::Plain) {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "a PLAIN authenticator is configured but PLAIN is not an enabled mechanism".into(),
+            ));
+        }
+        if self.token_validator.is_some() && !mechanisms.contains(SaslMechanism::OAuthBearer) {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "a token validator is configured but OAUTHBEARER is not an enabled mechanism"
+                    .into(),
+            ));
+        }
+        if self.scram.is_some() && !mechanisms.any_scram() {
+            return Err(KafkaProtocolError::InvalidConfig(
+                "a SCRAM credential store is configured but no SCRAM mechanism is enabled".into(),
+            ));
+        }
+        if (mechanisms.contains(SaslMechanism::OAuthBearer) || mechanisms.any_scram())
+            && self.principal_resolver.is_none()
+            && self.bridge.is_none()
+        {
+            // A token or a SCRAM login names a principal, and only an Iggy session can say
+            // whether that user exists. Admitting the name unchecked would let any token the
+            // issuer signed claim any account.
+            return Err(KafkaProtocolError::InvalidConfig(
+                "OAUTHBEARER and SCRAM map a principal to an Iggy user, which needs the bridge to \
+                 look it up; set IGGY_KAFKA_BRIDGE_ENABLED=true"
                     .into(),
             ));
         }
@@ -849,7 +985,11 @@ struct ConnectionContext<'a> {
     listener: &'a Listener,
     state: &'a GatewayState,
     connection: &'a ConnectionState,
+    mechanisms: &'a EnabledMechanisms,
     authenticator: Option<&'a dyn SaslAuthenticator>,
+    token_validator: Option<&'a dyn TokenValidator>,
+    scram: Option<&'a dyn ScramCredentialSource>,
+    scram_decoys: &'a DecoySecret,
     resolver: Option<&'a dyn PrincipalResolver>,
     auth_slots: &'a Semaphore,
     lookup_slots: &'a Semaphore,
@@ -862,14 +1002,34 @@ struct ConnectionContext<'a> {
 ///
 /// Split out of [`handle_connection`] so the loop stays about framing and this stays about the
 /// SASL state machine.
+#[allow(clippy::too_many_lines)]
 async fn route_frame(
     ctx: &ConnectionContext<'_>,
     sasl_state: &mut SaslState,
+    session: &mut SaslSession,
     principal: &mut Option<AuthenticatedPrincipal>,
     req: &RequestHeader,
     body: Bytes,
 ) -> HandleOutcome {
     let peer = ctx.peer;
+
+    // KIP-368. A session with a lifetime re-authenticates by sending a new handshake on the same
+    // connection; one without a lifetime gets the `ILLEGAL_SASL_STATE` a real broker answers.
+    // Once the lifetime has passed, nothing but that handshake is served.
+    if sasl_state.is_authenticated() && session.expires_at.is_some() {
+        if req.request_api_key == API_KEY_SASL_HANDSHAKE
+            && req.request_api_version == SASL_HANDSHAKE_VERSION
+        {
+            return begin_reauthentication(ctx, sasl_state, session, principal.as_ref(), req, body);
+        }
+        if session
+            .expires_at
+            .is_some_and(|expires_at| Instant::now() >= expires_at)
+        {
+            debug!(%peer, "SASL session expired without re-authenticating; closing");
+            return HandleOutcome::Close;
+        }
+    }
 
     // The mechanism name lives in the handshake body, and the state machine needs it to decide.
     // Decoding it here keeps `classify` free of wire concerns; a body that will not decode yields
@@ -895,6 +1055,29 @@ async fn route_frame(
             if ctx.listener.acls_enabled && req.request_api_key == API_KEY_DESCRIBE_ACLS =>
         {
             describe_acls(ctx, principal.as_ref(), req.request_api_version, body)
+        }
+        SaslAction::Dispatch
+            if ctx.listener.scram_admin
+                && matches!(
+                    req.request_api_key,
+                    API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS | API_KEY_ALTER_USER_SCRAM_CREDENTIALS
+                ) =>
+        {
+            let Some(bridge) = ctx.state.bridge.as_deref() else {
+                return HandleOutcome::Close;
+            };
+            if req.request_api_key == API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS {
+                scram_credentials::describe(
+                    bridge,
+                    principal.as_ref(),
+                    req.request_api_version,
+                    body,
+                )
+                .await
+            } else {
+                scram_credentials::alter(bridge, principal.as_ref(), req.request_api_version, body)
+                    .await
+            }
         }
         SaslAction::Dispatch => {
             handle_connection_request(
@@ -925,14 +1108,15 @@ async fn route_frame(
             )
             .await
         }
-        SaslAction::AcceptHandshake(mechanism) => {
+        SaslAction::AcceptHandshake(mechanism) if ctx.mechanisms.contains(mechanism) => {
             debug!(%peer, %mechanism, "SASL mechanism negotiated");
             *sasl_state = SaslState::AwaitToken(mechanism);
-            sasl_handshake_outcome(req.request_api_version, ERROR_NONE, false)
+            sasl_handshake_outcome(req.request_api_version, ERROR_NONE, ctx.mechanisms, false)
         }
-        SaslAction::RejectMechanism => sasl_handshake_outcome(
+        SaslAction::AcceptHandshake(_) | SaslAction::RejectMechanism => sasl_handshake_outcome(
             req.request_api_version,
             ERROR_UNSUPPORTED_SASL_MECHANISM,
+            ctx.mechanisms,
             true,
         ),
         // v0 is the one refusable handshake version that still has an encodable response shape,
@@ -940,7 +1124,12 @@ async fn route_frame(
         // version the client asked for, and a body shaped for a different one would be misparsed.
         SaslAction::RejectHandshakeVersion => {
             if req.request_api_version < SASL_HANDSHAKE_VERSION {
-                sasl_handshake_outcome(req.request_api_version, ERROR_UNSUPPORTED_VERSION, true)
+                sasl_handshake_outcome(
+                    req.request_api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                    ctx.mechanisms,
+                    true,
+                )
             } else {
                 HandleOutcome::Close
             }
@@ -954,14 +1143,29 @@ async fn route_frame(
             HandleOutcome::Close
         }
         SaslAction::Authenticate => {
-            let (outcome, verified) = authenticate_token(ctx, req.request_api_version, body).await;
-            // Only a plain `Respond` is success: every refusal path answers with
-            // `RespondThenClose`, so the state advances on exactly the accepting branch.
-            if matches!(outcome, HandleOutcome::Respond(_)) {
-                *sasl_state = SaslState::Authenticated;
-                *principal = verified;
+            let SaslState::AwaitToken(mechanism) = *sasl_state else {
+                // Unreachable: `classify` answers `Authenticate` only in `AwaitToken`.
+                return HandleOutcome::Close;
+            };
+            let version = req.request_api_version;
+            match authenticate_token(ctx, session, mechanism, version, body).await {
+                AuthStep::Continue(outcome) | AuthStep::Fail(outcome) => outcome,
+                AuthStep::Done {
+                    principal: verified,
+                    auth_bytes,
+                    credential_expiry,
+                } => finish_authentication(
+                    ctx,
+                    sasl_state,
+                    session,
+                    principal,
+                    mechanism,
+                    version,
+                    verified,
+                    auth_bytes,
+                    credential_expiry,
+                ),
             }
-            outcome
         }
         SaslAction::IllegalState | SaslAction::IllegalStateKeepOpen => {
             debug!(
@@ -1004,6 +1208,7 @@ where
 /// listener that verifies certificates. It is resolved against Iggy before the first frame, and
 /// a name that resolves to no user closes the connection, so a certificate from the trusted CA
 /// never admits a client as an account that does not exist.
+#[allow(clippy::too_many_lines)]
 async fn serve_frames<S>(
     mut stream: S,
     connection: Connection,
@@ -1036,7 +1241,11 @@ where
         listener: &listener,
         state: &state,
         connection: connection_state,
+        mechanisms: &shared_auth.mechanisms,
         authenticator: shared_auth.authenticator.as_deref(),
+        token_validator: shared_auth.token_validator.as_deref(),
+        scram: shared_auth.scram.as_deref(),
+        scram_decoys: &shared_auth.scram_decoys,
         resolver: shared_auth.resolver.as_deref(),
         auth_slots: &shared_auth.slots,
         lookup_slots: &shared_auth.lookup_slots,
@@ -1044,6 +1253,7 @@ where
         peer: &peer,
         cancel: &cancel,
     };
+    let mut session = SaslSession::default();
     let mut principal = if let Some(username) = certificate_name {
         let Some(resolved) = resolve_certificate_principal(&ctx, &username).await else {
             return Ok(());
@@ -1101,7 +1311,15 @@ where
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
-        let outcome = route_frame(&ctx, &mut sasl_state, &mut principal, &req, body).await;
+        let outcome = route_frame(
+            &ctx,
+            &mut sasl_state,
+            &mut session,
+            &mut principal,
+            &req,
+            body,
+        )
+        .await;
         if dispatch_outcome(
             &mut stream,
             &peer,
@@ -1170,37 +1388,379 @@ async fn resolve_certificate_principal(
     }
 }
 
-/// Verifies a `SaslAuthenticate` token and answers it.
+/// What one connection's SASL exchange has established beyond [`SaslState`].
+#[derive(Default)]
+struct SaslSession {
+    /// The mechanism the connection authenticated with, which a re-authentication must reuse.
+    mechanism: Option<SaslMechanism>,
+    /// When the session must have re-authenticated by, or `None` when it never has to.
+    expires_at: Option<Instant>,
+    /// Set while a re-authentication runs.
+    reauth: Option<Reauthentication>,
+    /// An exchange that spans more than one `SaslAuthenticate`.
+    exchange: Option<Exchange>,
+}
+
+/// A KIP-368 re-authentication in progress.
+struct Reauthentication {
+    /// The mechanism the session authenticated with. Kafka refuses a re-authentication under
+    /// another one.
+    previous: SaslMechanism,
+    /// The principal the session authenticated as. A re-authentication may not change it.
+    username: String,
+}
+
+/// Exchange state carried from one `SaslAuthenticate` to the next.
+enum Exchange {
+    /// An OAUTHBEARER token was refused with RFC 7628's error challenge. The client acknowledges
+    /// it with a lone `^A`, and is then failed with the challenge as the message.
+    OAuthRefused,
+    /// SCRAM's server-first message was sent; the client-final one is next.
+    Scram(Box<ScramServer>),
+}
+
+/// What a `SaslAuthenticate` frame led to.
+enum AuthStep {
+    /// The exchange goes on: answer and wait for the next token.
+    Continue(HandleOutcome),
+    /// The exchange ended without an identity: answer (or close) and drop the connection.
+    Fail(HandleOutcome),
+    /// The client proved who it is.
+    Done {
+        principal: AuthenticatedPrincipal,
+        /// The server's final message, empty when the mechanism has none.
+        auth_bytes: Bytes,
+        /// When the credential itself stops being valid (an OAUTHBEARER token's `exp`).
+        credential_expiry: Option<SystemTime>,
+    },
+}
+
+/// The 58 every credential failure is answered with, then a close.
+fn auth_failed(api_version: i16) -> AuthStep {
+    AuthStep::Fail(sasl_authenticate_outcome(
+        api_version,
+        ERROR_SASL_AUTHENTICATION_FAILED,
+        true,
+    ))
+}
+
+/// Starts a KIP-368 re-authentication on an authenticated connection whose session has a
+/// lifetime.
 ///
-/// Every failure answers with the same code and the same message. A malformed token, an unknown
-/// user, a wrong password and an unreachable Iggy are indistinguishable to the client on purpose;
-/// the gateway's own log carries the difference.
+/// Mirrors Kafka's `SaslServerAuthenticator`: an enabled mechanism is answered `NONE` even when it
+/// differs from the session's, and the `SaslAuthenticate` that follows is then refused with 58;
+/// a mechanism the listener does not offer is refused at once with 33.
+fn begin_reauthentication(
+    ctx: &ConnectionContext<'_>,
+    sasl_state: &mut SaslState,
+    session: &mut SaslSession,
+    principal: Option<&AuthenticatedPrincipal>,
+    req: &RequestHeader,
+    body: Bytes,
+) -> HandleOutcome {
+    let peer = ctx.peer;
+    let version = req.request_api_version;
+    let requested = decode_sasl_mechanism(version, body)
+        .ok()
+        .and_then(|name| name.parse::<SaslMechanism>().ok())
+        .filter(|mechanism| ctx.mechanisms.contains(*mechanism));
+    let (Some(requested), Some(previous), Some(principal)) =
+        (requested, session.mechanism, principal)
+    else {
+        return sasl_handshake_outcome(
+            version,
+            ERROR_UNSUPPORTED_SASL_MECHANISM,
+            ctx.mechanisms,
+            true,
+        );
+    };
+    debug!(%peer, %requested, "SASL re-authentication started");
+    session.reauth = Some(Reauthentication {
+        previous,
+        username: principal.username.clone(),
+    });
+    session.exchange = None;
+    *sasl_state = SaslState::AwaitToken(requested);
+    sasl_handshake_outcome(version, ERROR_NONE, ctx.mechanisms, false)
+}
+
+/// Answers a completed exchange: checks the re-authentication rules, computes the session
+/// lifetime, and advances the connection to `Authenticated`.
+#[allow(clippy::too_many_arguments)]
+fn finish_authentication(
+    ctx: &ConnectionContext<'_>,
+    sasl_state: &mut SaslState,
+    session: &mut SaslSession,
+    principal: &mut Option<AuthenticatedPrincipal>,
+    mechanism: SaslMechanism,
+    api_version: i16,
+    verified: AuthenticatedPrincipal,
+    auth_bytes: Bytes,
+    credential_expiry: Option<SystemTime>,
+) -> HandleOutcome {
+    let peer = ctx.peer;
+    if let Some(reauth) = session.reauth.take()
+        && reauth.username != verified.username
+    {
+        // Kafka's `ReauthInfo::ensurePrincipalUnchanged`. Letting a connection swap identities
+        // mid-stream would let one credential's grants serve requests already queued under
+        // another's.
+        debug!(%peer, "re-authentication named a different principal; closing");
+        return sasl_authenticate_reply(
+            api_version,
+            ERROR_SASL_AUTHENTICATION_FAILED,
+            Some("Cannot change principals during re-authentication"),
+            Bytes::new(),
+            0,
+            true,
+        );
+    }
+    let lifetime = session_lifetime(
+        SystemTime::now(),
+        credential_expiry,
+        ctx.config.connections_max_reauth,
+    );
+    session.mechanism = Some(mechanism);
+    session.exchange = None;
+    session.expires_at = lifetime.map(|lifetime| Instant::now() + lifetime);
+    *sasl_state = SaslState::Authenticated;
+    *principal = Some(verified);
+    let lifetime_ms = lifetime.map_or(0, |lifetime| {
+        i64::try_from(lifetime.as_millis()).unwrap_or(i64::MAX)
+    });
+    debug!(%peer, %mechanism, lifetime_ms, "SASL authentication succeeded");
+    sasl_authenticate_reply(
+        api_version,
+        ERROR_NONE,
+        None,
+        auth_bytes,
+        lifetime_ms,
+        false,
+    )
+}
+
+/// The session lifetime Kafka's `SaslServerAuthenticator` computes: the credential's remaining
+/// life, capped by `connections.max.reauth.ms`; either alone when only one is set; `None` (no
+/// re-authentication) when neither is. A credential already past its expiry gives zero.
+fn session_lifetime(
+    now: SystemTime,
+    credential_expiry: Option<SystemTime>,
+    max_reauth: Option<Duration>,
+) -> Option<Duration> {
+    let remaining =
+        credential_expiry.map(|expiry| expiry.duration_since(now).unwrap_or(Duration::ZERO));
+    match (remaining, max_reauth.filter(|max| !max.is_zero())) {
+        (Some(remaining), Some(max)) => Some(remaining.min(max)),
+        (Some(remaining), None) => Some(remaining),
+        (None, Some(max)) => Some(max),
+        (None, None) => None,
+    }
+}
+
+/// Runs one `SaslAuthenticate` of the exchange `mechanism` selected.
+///
+/// Every credential failure answers with the same code and the same message. A malformed token,
+/// an unknown user, a wrong password and an expired token are indistinguishable to the client on
+/// purpose; the gateway's own log carries the difference. An unreachable Iggy or identity
+/// provider closes instead, which the client retries.
 async fn authenticate_token(
     ctx: &ConnectionContext<'_>,
+    session: &mut SaslSession,
+    mechanism: SaslMechanism,
     api_version: i16,
     body: Bytes,
-) -> (HandleOutcome, Option<AuthenticatedPrincipal>) {
+) -> AuthStep {
     let peer = ctx.peer;
-    let failed = || {
-        (
-            sasl_authenticate_outcome(api_version, ERROR_SASL_AUTHENTICATION_FAILED, true),
-            None,
-        )
+    if let Some(reauth) = &session.reauth
+        && reauth.previous != mechanism
+    {
+        debug!(%peer, %mechanism, previous = %reauth.previous, "re-authentication under another mechanism; closing");
+        return AuthStep::Fail(sasl_authenticate_reply(
+            api_version,
+            ERROR_SASL_AUTHENTICATION_FAILED,
+            Some("SASL mechanism requested by client is not supported for re-authentication"),
+            Bytes::new(),
+            0,
+            true,
+        ));
+    }
+    let Ok(auth_bytes) = decode_sasl_auth_bytes(api_version, body) else {
+        debug!(%peer, "malformed SaslAuthenticate token");
+        return auth_failed(api_version);
     };
+    match mechanism {
+        SaslMechanism::Plain => authenticate_plain(ctx, api_version, &auth_bytes).await,
+        SaslMechanism::OAuthBearer => {
+            authenticate_oauthbearer(ctx, session, api_version, &auth_bytes).await
+        }
+        SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512 => {
+            authenticate_scram(ctx, session, mechanism, api_version, &auth_bytes).await
+        }
+    }
+}
 
+/// Looks up `username` as an Iggy user, after a mechanism that does not ask Iggy itself proved
+/// the client is them. A name with no active user is a credential failure; an Iggy that cannot
+/// be asked closes, which the client retries.
+async fn resolve_mechanism_principal(
+    ctx: &ConnectionContext<'_>,
+    api_version: i16,
+    username: &str,
+    what: &'static str,
+) -> std::result::Result<AuthenticatedPrincipal, AuthStep> {
+    let peer = ctx.peer;
+    let Some(resolver) = ctx.resolver else {
+        // Unreachable: `check_sasl_wiring` refuses these mechanisms without a lookup.
+        error!(%peer, what, "nothing can look the principal up");
+        return Err(auth_failed(api_version));
+    };
+    let Some(lookup) = verify_in_slot(ctx, ctx.lookup_slots, what, |slot| async move {
+        let _slot = slot;
+        resolver.resolve(username).await
+    })
+    .await
+    else {
+        return Err(AuthStep::Fail(HandleOutcome::Close));
+    };
+    match lookup {
+        Ok(principal) => Ok(principal),
+        Err(AuthError::Rejected) => {
+            // warn!: the credential checked out, so the account missing from Iggy is a
+            // provisioning gap or a wrong principal mapping, not a client mistake.
+            warn!(%peer, username, what, "the authenticated principal names no active Iggy user");
+            ctx.failed_logins.record_rejection(peer.ip());
+            Err(auth_failed(api_version))
+        }
+        Err(AuthError::Unavailable) => {
+            warn!(%peer, what, "the principal lookup could not reach Iggy");
+            Err(AuthStep::Fail(HandleOutcome::Close))
+        }
+    }
+}
+
+/// SCRAM: two `SaslAuthenticate` rounds, client-first then client-final, against the salted keys
+/// the gateway stores (`scram`).
+async fn authenticate_scram(
+    ctx: &ConnectionContext<'_>,
+    session: &mut SaslSession,
+    mechanism: SaslMechanism,
+    api_version: i16,
+    auth_bytes: &[u8],
+) -> AuthStep {
+    let peer = ctx.peer;
+    let Some(scram_mechanism) = ScramMechanism::from_sasl(mechanism) else {
+        return auth_failed(api_version);
+    };
+    if let Some(Exchange::Scram(server)) = session.exchange.take() {
+        let username = server.username().to_string();
+        let server_final = match server.finish(auth_bytes) {
+            Ok(server_final) => server_final,
+            Err(error) => {
+                debug!(%peer, ?error, "SCRAM proof refused");
+                ctx.failed_logins.record_rejection(peer.ip());
+                return auth_failed(api_version);
+            }
+        };
+        return match resolve_mechanism_principal(
+            ctx,
+            api_version,
+            &username,
+            "SCRAM principal lookup",
+        )
+        .await
+        {
+            Ok(principal) => {
+                ctx.failed_logins.record_success(peer.ip());
+                AuthStep::Done {
+                    principal,
+                    auth_bytes: Bytes::from(server_final),
+                    credential_expiry: None,
+                }
+            }
+            Err(step) => step,
+        };
+    }
+    let Some(store) = ctx.scram else {
+        // Unreachable: `check_sasl_wiring` refuses SCRAM without a store.
+        error!(%peer, "SCRAM negotiated with no credential store");
+        return auth_failed(api_version);
+    };
+    let first = match parse_client_first(auth_bytes) {
+        Ok(first) => first,
+        Err(error) => {
+            debug!(%peer, ?error, "malformed SCRAM client-first message");
+            return auth_failed(api_version);
+        }
+    };
+    if ctx.failed_logins.is_blocked(peer.ip()) {
+        debug!(%peer, "SCRAM refused: peer is throttled after a rejected login");
+        return AuthStep::Fail(HandleOutcome::Close);
+    }
+    let username = first.username.clone();
+    let looked_up = verify_in_slot(ctx, ctx.lookup_slots, "SCRAM credential lookup", |slot| {
+        let username = username.as_str();
+        async move {
+            let _slot = slot;
+            store.scram_credential(username, scram_mechanism).await
+        }
+    })
+    .await;
+    let Some(Ok(credential)) = looked_up else {
+        warn!(%peer, "SCRAM credential lookup could not be completed");
+        return AuthStep::Fail(HandleOutcome::Close);
+    };
+    let (server, server_first) =
+        ScramServer::start(scram_mechanism, first, credential, ctx.scram_decoys);
+    session.exchange = Some(Exchange::Scram(Box::new(server)));
+    AuthStep::Continue(sasl_authenticate_reply(
+        api_version,
+        ERROR_NONE,
+        None,
+        Bytes::from(server_first),
+        0,
+        false,
+    ))
+}
+
+/// Runs `work` inside an authentication slot, watching for shutdown. `None` means overloaded,
+/// timed out or shutting down, each of which closes the connection rather than answering 58.
+async fn verify_in_slot<'a, T, Work, Fut>(
+    ctx: &ConnectionContext<'a>,
+    slots: &'a Semaphore,
+    operation: &'static str,
+    work: Work,
+) -> Option<T>
+where
+    Work: FnOnce(SemaphorePermit<'a>) -> Fut,
+    Fut: Future<Output = T>,
+{
+    // The connection loop only watches the shutdown token between frames, so a verification in
+    // flight has to watch it here or a drain waits out the whole budget.
+    tokio::select! {
+        () = ctx.cancel.cancelled() => {
+            debug!(peer = %ctx.peer, operation, "abandoned by shutdown");
+            None
+        }
+        verified = within_auth_budget(ctx, slots, operation, work) => verified,
+    }
+}
+
+/// PLAIN: the credentials go to an Iggy login.
+async fn authenticate_plain(
+    ctx: &ConnectionContext<'_>,
+    api_version: i16,
+    auth_bytes: &[u8],
+) -> AuthStep {
+    let peer = ctx.peer;
     let Some(authenticator) = ctx.authenticator else {
         // Unreachable: `run` refuses to start in this combination. Fail closed anyway, since the
         // alternative is admitting an unauthenticated connection.
         error!(%peer, "SASL is enabled but no authenticator is configured");
-        return failed();
+        return auth_failed(api_version);
     };
-    let Ok(auth_bytes) = decode_sasl_auth_bytes(api_version, body) else {
-        debug!(%peer, "malformed SaslAuthenticate token");
-        return failed();
-    };
-    let Ok(credentials) = parse_plain(&auth_bytes) else {
+    let Ok(credentials) = parse_plain(auth_bytes) else {
         debug!(%peer, "malformed PLAIN initial response");
-        return failed();
+        return auth_failed(api_version);
     };
 
     // Checked before a slot is taken, so a throttled peer costs neither a slot nor a hash. Closed
@@ -1208,42 +1768,34 @@ async fn authenticate_token(
     // fatal, and a correct password retried after the delay must still get through.
     if ctx.failed_logins.is_blocked(peer.ip()) {
         debug!(%peer, "SASL authentication refused: peer is throttled after a rejected login");
-        return (HandleOutcome::Close, None);
+        return AuthStep::Fail(HandleOutcome::Close);
     }
 
-    // The connection loop only watches the shutdown token between frames, so a verification in
-    // flight has to watch it here or a drain waits out the whole budget.
-    let verified = tokio::select! {
-        () = ctx.cancel.cancelled() => {
-            debug!(%peer, "SASL authentication abandoned by shutdown");
-            return (HandleOutcome::Close, None);
-        }
-        verified = within_auth_budget(ctx, ctx.auth_slots, "SASL authentication", |slot| {
-            authenticator.authenticate(&credentials, slot)
-        }) => verified,
-    };
-
-    let Some(result) = verified else {
+    let Some(result) = verify_in_slot(ctx, ctx.auth_slots, "SASL authentication", |slot| {
+        authenticator.authenticate(&credentials, slot)
+    })
+    .await
+    else {
         // Overloaded or timed out. Close rather than answer 58: a Kafka client treats that code as
         // fatal and surfaces it to the application, and nothing here says the credentials were
         // wrong. A close reads as a transport failure, which is retriable.
-        return (HandleOutcome::Close, None);
+        return AuthStep::Fail(HandleOutcome::Close);
     };
 
     match result {
         Ok(authenticated) => {
-            debug!(%peer, "SASL authentication succeeded");
             ctx.failed_logins.record_success(peer.ip());
-            (
-                sasl_authenticate_outcome(api_version, ERROR_NONE, false),
-                Some(authenticated),
-            )
+            AuthStep::Done {
+                principal: authenticated,
+                auth_bytes: Bytes::new(),
+                credential_expiry: None,
+            }
         }
         // A rejection is the client's problem and is terminal, so it earns a parseable 58.
         Err(AuthError::Rejected) => {
             debug!(%peer, "SASL authentication rejected");
             ctx.failed_logins.record_rejection(peer.ip());
-            failed()
+            auth_failed(api_version)
         }
         // An outage is not. Kafka clients treat 58 as fatal and surface it to the application, so
         // answering with it would turn a momentary Iggy blip into a permanent authentication error
@@ -1252,8 +1804,107 @@ async fn authenticate_token(
         // the account exists.
         Err(AuthError::Unavailable) => {
             warn!(%peer, "SASL authentication could not be completed; Iggy is unreachable");
-            (HandleOutcome::Close, None)
+            AuthStep::Fail(HandleOutcome::Close)
         }
+    }
+}
+
+/// RFC 7628's error challenge, which Kafka's `OAuthBearerSaslServer` sends for every refused
+/// token, whatever the reason.
+const OAUTH_INVALID_TOKEN: &str = r#"{"status":"invalid_token"}"#;
+
+/// OAUTHBEARER: the JWT is validated here, then its principal is looked up as an Iggy user.
+///
+/// A refused token is answered the way Kafka answers it: `NONE` with the JSON error status as the
+/// server challenge, then, once the client acknowledges with `^A`, 58 with that status as the
+/// message. Every refusal looks the same from the client's side.
+async fn authenticate_oauthbearer(
+    ctx: &ConnectionContext<'_>,
+    session: &mut SaslSession,
+    api_version: i16,
+    auth_bytes: &[u8],
+) -> AuthStep {
+    let peer = ctx.peer;
+    if matches!(session.exchange.take(), Some(Exchange::OAuthRefused))
+        && auth_bytes == [OAUTHBEARER_SEPARATOR]
+    {
+        return AuthStep::Fail(sasl_authenticate_reply(
+            api_version,
+            ERROR_SASL_AUTHENTICATION_FAILED,
+            Some(OAUTH_INVALID_TOKEN),
+            Bytes::new(),
+            0,
+            true,
+        ));
+    }
+    let (Some(validator), Some(_)) = (ctx.token_validator, ctx.resolver) else {
+        // Unreachable: `check_sasl_wiring` refuses OAUTHBEARER without both.
+        error!(%peer, "OAUTHBEARER negotiated with no validator or no principal lookup");
+        return auth_failed(api_version);
+    };
+    let Ok(response) = parse_oauthbearer(auth_bytes) else {
+        debug!(%peer, "malformed OAUTHBEARER initial response");
+        return auth_failed(api_version);
+    };
+    if ctx.failed_logins.is_blocked(peer.ip()) {
+        debug!(%peer, "OAUTHBEARER refused: peer is throttled after a rejected token");
+        return AuthStep::Fail(HandleOutcome::Close);
+    }
+    let validated = {
+        use secrecy::ExposeSecret;
+        let token = response.token.expose_secret();
+        verify_in_slot(
+            ctx,
+            ctx.auth_slots,
+            "OAUTHBEARER validation",
+            |slot| async move {
+                let _slot = slot;
+                validator.validate(token).await
+            },
+        )
+        .await
+    };
+    let token = match validated {
+        None | Some(Err(TokenError::Unavailable)) => {
+            warn!(%peer, "OAUTHBEARER could not be checked; no signing keys are loaded");
+            return AuthStep::Fail(HandleOutcome::Close);
+        }
+        Some(Err(TokenError::Invalid(reason))) => {
+            debug!(%peer, reason, "OAUTHBEARER token refused");
+            ctx.failed_logins.record_rejection(peer.ip());
+            session.exchange = Some(Exchange::OAuthRefused);
+            return AuthStep::Continue(sasl_authenticate_reply(
+                api_version,
+                ERROR_NONE,
+                None,
+                Bytes::from_static(OAUTH_INVALID_TOKEN.as_bytes()),
+                0,
+                false,
+            ));
+        }
+        Some(Ok(token)) => token,
+    };
+    if !response.authorization_id.is_empty() && response.authorization_id != token.principal {
+        debug!(%peer, "OAUTHBEARER authorization id differs from the token's principal");
+        return auth_failed(api_version);
+    }
+    match resolve_mechanism_principal(
+        ctx,
+        api_version,
+        &token.principal,
+        "OAUTHBEARER principal lookup",
+    )
+    .await
+    {
+        Ok(principal) => {
+            ctx.failed_logins.record_success(peer.ip());
+            AuthStep::Done {
+                principal,
+                auth_bytes: Bytes::new(),
+                credential_expiry: Some(token.expires_at),
+            }
+        }
+        Err(step) => step,
     }
 }
 
@@ -1364,7 +2015,12 @@ fn illegal_state_outcome(
 ) -> HandleOutcome {
     match api_key {
         API_KEY_SASL_HANDSHAKE if (0..=SASL_HANDSHAKE_VERSION).contains(&api_version) => {
-            sasl_handshake_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)
+            sasl_handshake_outcome(
+                api_version,
+                ERROR_ILLEGAL_SASL_STATE,
+                &EnabledMechanisms::new([]),
+                !keep_open,
+            )
         }
         API_KEY_SASL_AUTHENTICATE if (0..=SASL_AUTHENTICATE_MAX_VERSION).contains(&api_version) => {
             sasl_authenticate_outcome(api_version, ERROR_ILLEGAL_SASL_STATE, !keep_open)

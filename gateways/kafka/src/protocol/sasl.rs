@@ -40,24 +40,43 @@ use crate::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE,
 };
 
-/// Mechanisms this gateway can answer for.
+/// Mechanisms this gateway can answer for, when the deployment enables them.
 ///
-/// `PLAIN` alone, and not by preference: Iggy stores one Argon2 hash per user, while SCRAM
-/// requires the server to hold PBKDF2-derived keys and to send the salt and iteration count to
-/// the client. Neither is derivable from an Argon2 hash, so SCRAM needs credential storage that
-/// does not exist. `docs/AUTHENTICATION.md` has the full argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `PLAIN` forwards the password to an Iggy login. `SCRAM-SHA-256` and `SCRAM-SHA-512` verify
+/// against salted keys the gateway keeps in Iggy (`docs/AUTHENTICATION.md`, "SCRAM"), and
+/// `OAUTHBEARER` validates a JWT against the identity provider's published keys. Which of them a
+/// listener offers is [`EnabledMechanisms`]; a name this enum knows is not therefore enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SaslMechanism {
     Plain,
+    ScramSha256,
+    ScramSha512,
+    OAuthBearer,
 }
 
 impl SaslMechanism {
     pub const PLAIN: &'static str = "PLAIN";
+    pub const SCRAM_SHA_256: &'static str = "SCRAM-SHA-256";
+    pub const SCRAM_SHA_512: &'static str = "SCRAM-SHA-512";
+    pub const OAUTHBEARER: &'static str = "OAUTHBEARER";
 
-    /// Mechanism names advertised in a `SaslHandshake` response, in preference order.
+    /// Every mechanism, in the order a handshake lists the enabled ones.
+    pub const ALL: [Self; 4] = [
+        Self::Plain,
+        Self::ScramSha256,
+        Self::ScramSha512,
+        Self::OAuthBearer,
+    ];
+
+    /// The name on the wire.
     #[must_use]
-    pub const fn advertised() -> &'static [&'static str] {
-        &[Self::PLAIN]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Plain => Self::PLAIN,
+            Self::ScramSha256 => Self::SCRAM_SHA_256,
+            Self::ScramSha512 => Self::SCRAM_SHA_512,
+            Self::OAuthBearer => Self::OAUTHBEARER,
+        }
     }
 }
 
@@ -65,18 +84,102 @@ impl FromStr for SaslMechanism {
     type Err = SaslError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            Self::PLAIN => Ok(Self::Plain),
-            _ => Err(SaslError::UnsupportedMechanism),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|mechanism| mechanism.name() == value)
+            .ok_or(SaslError::UnsupportedMechanism)
     }
 }
 
 impl Display for SaslMechanism {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Plain => f.write_str(Self::PLAIN),
+        f.write_str(self.name())
+    }
+}
+
+/// The mechanisms a gateway offers, in the order its handshake lists them.
+///
+/// `PLAIN` alone by default, which is what a gateway built before the other mechanisms offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnabledMechanisms(Vec<SaslMechanism>);
+
+impl Default for EnabledMechanisms {
+    fn default() -> Self {
+        Self(vec![SaslMechanism::Plain])
+    }
+}
+
+impl EnabledMechanisms {
+    /// `mechanisms` without repeats, in [`SaslMechanism::ALL`] order. Empty is allowed here and
+    /// refused where the listeners are wired, since only a SASL listener needs one.
+    #[must_use]
+    pub fn new(mechanisms: impl IntoIterator<Item = SaslMechanism>) -> Self {
+        let chosen: Vec<SaslMechanism> = mechanisms.into_iter().collect();
+        Self(
+            SaslMechanism::ALL
+                .into_iter()
+                .filter(|mechanism| chosen.contains(mechanism))
+                .collect(),
+        )
+    }
+
+    /// Parses a comma-separated list such as `PLAIN,OAUTHBEARER`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first entry that is not a mechanism this gateway knows, or
+    /// saying the list is empty.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut chosen = Vec::new();
+        for entry in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let mechanism = SaslMechanism::from_str(entry).map_err(|_| {
+                format!(
+                    "unknown SASL mechanism `{entry}`; expected any of PLAIN, SCRAM-SHA-256, \
+                     SCRAM-SHA-512, OAUTHBEARER"
+                )
+            })?;
+            chosen.push(mechanism);
         }
+        if chosen.is_empty() {
+            return Err("the SASL mechanism list is empty".to_string());
+        }
+        Ok(Self::new(chosen))
+    }
+
+    #[must_use]
+    pub fn contains(&self, mechanism: SaslMechanism) -> bool {
+        self.0.contains(&mechanism)
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether either SCRAM mechanism is offered.
+    #[must_use]
+    pub fn any_scram(&self) -> bool {
+        self.contains(SaslMechanism::ScramSha256) || self.contains(SaslMechanism::ScramSha512)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SaslMechanism> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Mechanism names for a `SaslHandshake` response.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        self.0.iter().map(|mechanism| mechanism.name()).collect()
+    }
+}
+
+impl Display for EnabledMechanisms {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.names().join(","))
     }
 }
 
@@ -134,6 +237,112 @@ pub fn parse_plain(auth_bytes: &[u8]) -> Result<PlainCredentials, SaslError> {
         username: login.to_string(),
         password: SecretString::from(secret.to_string()),
     })
+}
+
+/// The client's first message under OAUTHBEARER (RFC 7628, section 3.1).
+///
+/// No `Debug`, for the same reason as [`PlainCredentials`]: the token is a bearer credential.
+pub struct BearerResponse {
+    pub token: SecretString,
+    /// The authorization id the GS2 header names, decoded, or empty when it names none.
+    pub authorization_id: String,
+}
+
+/// The byte that separates OAUTHBEARER's key-value pairs, and that a client sends alone to
+/// acknowledge the server's error challenge (RFC 7628, section 3.2.3).
+pub const OAUTHBEARER_SEPARATOR: u8 = 0x01;
+
+/// Parses an OAUTHBEARER client initial response: `n,[a=authzid],^Aauth=Bearer <token>^A^A`.
+///
+/// The grammar is Kafka's own `OAuthBearerClientInitialResponse`: only the `n` GS2 flag (no
+/// channel binding), keys of letters only, values of printable ASCII plus space, tab, CR and LF,
+/// an `auth` pair with the `Bearer` scheme (any case) and a token of the RFC 6750 `b64token`
+/// alphabet. Any other pair is an extension, which Kafka's default validator ignores and so does
+/// this gateway.
+///
+/// # Errors
+///
+/// [`SaslError::MalformedInitialResponse`] for any violation, without saying which.
+pub fn parse_oauthbearer(auth_bytes: &[u8]) -> Result<BearerResponse, SaslError> {
+    const MALFORMED: SaslError = SaslError::MalformedInitialResponse;
+    let message = std::str::from_utf8(auth_bytes).map_err(|_| MALFORMED)?;
+    let rest = message.strip_prefix("n,").ok_or(MALFORMED)?;
+    let (gs2_authzid, rest) = rest.split_once(',').ok_or(MALFORMED)?;
+    let authorization_id = if gs2_authzid.is_empty() {
+        String::new()
+    } else {
+        let name = gs2_authzid.strip_prefix("a=").ok_or(MALFORMED)?;
+        decode_saslname(name).ok_or(MALFORMED)?
+    };
+    // What follows the GS2 header is `^A`, then zero or more `key=value^A`, then a final `^A`.
+    let pairs = rest
+        .strip_prefix('\u{1}')
+        .and_then(|pairs| pairs.strip_suffix('\u{1}'))
+        .ok_or(MALFORMED)?;
+    let mut token = None;
+    if !pairs.is_empty() {
+        let pairs = pairs.strip_suffix('\u{1}').ok_or(MALFORMED)?;
+        for pair in pairs.split('\u{1}') {
+            let (key, value) = pair.split_once('=').ok_or(MALFORMED)?;
+            let key_ok = !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphabetic());
+            let value_ok = !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| matches!(byte, 0x21..=0x7e | b' ' | b'\t' | b'\r' | b'\n'));
+            if !key_ok || !value_ok {
+                return Err(MALFORMED);
+            }
+            if key == "auth" {
+                if token.is_some() {
+                    return Err(MALFORMED);
+                }
+                token = Some(bearer_token(value).ok_or(MALFORMED)?);
+            }
+        }
+    }
+    Ok(BearerResponse {
+        token: SecretString::from(token.ok_or(MALFORMED)?.to_string()),
+        authorization_id,
+    })
+}
+
+/// The token of an `auth` value `Bearer <token>`: one or more spaces after the scheme, and a
+/// token of `[-_~+/.A-Za-z0-9]+` followed by any number of `=`.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim_start_matches(' ');
+    let body = token.trim_end_matches('=');
+    let body_ok = !body.is_empty()
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_~+/.".contains(&byte));
+    body_ok.then_some(token)
+}
+
+/// Decodes a SASL `saslname` (RFC 5802, section 5.1): `=2C` is a comma, `=3D` an equals sign,
+/// and any other `=` or a bare comma makes the name invalid.
+#[must_use]
+pub fn decode_saslname(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains(',') {
+        return None;
+    }
+    let mut decoded = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(at) = rest.find('=') {
+        decoded.push_str(&rest[..at]);
+        let escape = rest.get(at..at + 3)?;
+        decoded.push(match escape {
+            "=2C" => ',',
+            "=3D" => '=',
+            _ => return None,
+        });
+        rest = &rest[at + 3..];
+    }
+    decoded.push_str(rest);
+    Some(decoded)
 }
 
 /// Where one connection stands in the SASL exchange.
@@ -314,13 +523,16 @@ pub fn encode_sasl_handshake_response(
 
 /// `SaslAuthenticate` response.
 ///
-/// `session_lifetime_ms` is always 0, meaning the session never needs re-authenticating (KIP-368).
-/// That is not only a simplification: Iggy's sole correct re-authentication is logout followed by
-/// login, which drops and re-mints the session, and re-login on a still-bound connection takes a
-/// replay branch that reports the new user while leaving the server bound to the old one. Until
-/// that is resolved, promising a finite lifetime would promise something unsafe to deliver.
+/// `auth_bytes` is the server's next challenge or its final message: empty for PLAIN and a
+/// successful OAUTHBEARER, the server-first and server-final messages for SCRAM, and the JSON
+/// error status for a refused OAUTHBEARER token (RFC 7628, section 3.2.2).
 ///
-/// `auth_bytes` is empty on success, which is what PLAIN's server completion looks like.
+/// `session_lifetime_ms` is KIP-368's: 0 means the session never needs re-authenticating, and a
+/// positive value tells the client to authenticate again on this connection before it passes.
+/// It is positive for an OAUTHBEARER token (its remaining life) and whenever the operator sets
+/// `IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS`. Re-authenticating costs no Iggy session here: no
+/// connection holds one in the principal's name, so a re-authentication is a fresh verification
+/// and nothing has to be re-bound (`docs/AUTHENTICATION.md`, "Re-authentication").
 ///
 /// # Errors
 ///
@@ -329,13 +541,15 @@ pub fn encode_sasl_authenticate_response(
     version: i16,
     error_code: i16,
     error_message: Option<&str>,
+    auth_bytes: Bytes,
+    session_lifetime_ms: i64,
 ) -> EncodeResult<Bytes> {
     let resp = SaslAuthenticateResponse::default()
         .with_error_code(error_code)
         .with_error_message(error_message.map(|msg| StrBytes::from_string(msg.to_string())))
-        .with_auth_bytes(Bytes::new())
-        .with_session_lifetime_ms(0);
-    encode_message(&resp, version, 64)
+        .with_auth_bytes(auth_bytes)
+        .with_session_lifetime_ms(session_lifetime_ms);
+    encode_message(&resp, version, 256)
 }
 
 #[cfg(test)]
@@ -412,7 +626,7 @@ mod tests {
     #[test]
     fn given_an_unknown_mechanism_name_when_parsed_should_be_rejected() {
         assert_eq!(
-            SaslMechanism::from_str("SCRAM-SHA-256").err(),
+            SaslMechanism::from_str("GSSAPI").err(),
             Some(SaslError::UnsupportedMechanism)
         );
         assert_eq!(
