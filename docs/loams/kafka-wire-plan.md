@@ -204,9 +204,9 @@ breadth. Status is `Planned` unless noted.
 | KW-1 | Differential oracle harness (Apache Kafka, Redpanda) | #4531 | **Built** (this PR) | KW-0 | Yes |
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | **Built** (smoke green locally; nightly first run pending in fork CI) | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Built** (parts 1–3); Java/franz-go e2e under injected timeouts open | KW-1 | Yes |
-| KW-4 | Topic configurations frameworks send | #4508 | **Built** (wire, bridge, oracle diff); framework exit criteria wait on the KW-2 nightly matrix | KW-1 | Only if krishvishal has not landed it |
+| KW-4 | Topic configurations frameworks send | #4508 | **Built, in review** (fork PR #13): unit tests and clippy pass locally; real-server, Java and oracle suites not yet run (local memlock limit); framework exit criteria wait on the KW-2 nightly matrix | KW-1 | Only if krishvishal has not landed it |
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
-| KW-6 | Log compaction | #4521 | Planned | KW-4 | Design discussion first |
+| KW-6 | Log compaction | #4521 | Planned; design note drafted (`docs/loams/compaction-design.md`, PR #13), nothing built | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | Planned | KW-1 | Yes |
