@@ -139,3 +139,118 @@ async fn given_the_java_producer_when_it_commits_aborts_and_is_fenced_should_see
     let _ = shutdown.send(());
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_consume_transform_produce_loop_with_aborts_should_copy_each_record_once() {
+    if !java::java_available() {
+        java::skip("java or javac is unavailable");
+        return;
+    }
+    let jars = java::jar_dir();
+    if let Err(reason) = java::ensure_jars(&jars) {
+        java::skip(&reason);
+        return;
+    }
+    let classes = tempfile::tempdir().expect("class dir");
+    java::compile(&jars, classes.path(), "EosCopyProbe.java")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let run = |bootstrap: String| {
+        let (jars, classes) = (jars.clone(), classes.path().to_path_buf());
+        move || {
+            let (ok, text) = java::run(
+                &jars,
+                &classes,
+                "EosCopyProbe",
+                &[&bootstrap, "eos-in", "eos-out", "eos-group", "eos-copier", "60"],
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            println!("EosCopyProbe against {bootstrap}:\n{text}");
+            assert!(ok && text.contains("EOS_PROBE_OK"), "the probe failed\n{text}");
+            text
+        }
+    };
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (address, shutdown) = gateway(&server).await;
+    let ours = tokio::task::spawn_blocking(run(address))
+        .await
+        .expect("the probe ran");
+    assert_eq!(java::line(&ours, "exactly_once"), Some("true"), "{ours}");
+    assert_eq!(java::line(&ours, "output_records"), Some("60"));
+    assert_ne!(java::line(&ours, "aborted"), Some("0"), "the loop aborted some");
+
+    match KafkaOracle::start().await {
+        Ok(kafka) => {
+            let theirs = tokio::task::spawn_blocking(run(kafka.target.address.clone()))
+                .await
+                .expect("the probe ran");
+            assert_eq!(java::line(&theirs, "exactly_once"), Some("true"), "{theirs}");
+            drop(kafka);
+        }
+        Err(Unavailable::Skipped(reason)) => java::skip(&reason),
+        Err(Unavailable::Failed(reason)) => panic!("Apache Kafka oracle: {reason}"),
+    }
+    let _ = shutdown.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_kafka_streams_word_count_at_exactly_once_v2_should_count_as_on_kafka() {
+    if !java::java_available() {
+        java::skip("java or javac is unavailable");
+        return;
+    }
+    let jars = java::jar_dir();
+    if let Err(reason) = java::ensure_jars(&jars) {
+        java::skip(&reason);
+        return;
+    }
+    let classes = tempfile::tempdir().expect("class dir");
+    java::compile(&jars, classes.path(), "StreamsEosProbe.java")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let run = |bootstrap: String, application: String| {
+        let (jars, classes) = (jars.clone(), classes.path().to_path_buf());
+        move || {
+            let (ok, text) = java::run(
+                &jars,
+                &classes,
+                "StreamsEosProbe",
+                &[&bootstrap, &application, "wc-in", "wc-out"],
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            println!("StreamsEosProbe against {bootstrap}:\n{text}");
+            assert!(ok && text.contains("STREAMS_PROBE_OK"), "the probe failed\n{text}");
+            text
+        }
+    };
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (address, shutdown) = gateway(&server).await;
+    let ours = tokio::task::spawn_blocking(run(address, format!("wc-gateway-{stamp}")))
+        .await
+        .expect("the probe ran");
+    assert_eq!(java::line(&ours, "exactly_once"), Some("true"), "{ours}");
+
+    match KafkaOracle::start().await {
+        Ok(kafka) => {
+            let theirs = tokio::task::spawn_blocking(run(
+                kafka.target.address.clone(),
+                format!("wc-kafka-{stamp}"),
+            ))
+            .await
+            .expect("the probe ran");
+            assert_eq!(java::line(&theirs, "exactly_once"), Some("true"), "{theirs}");
+            assert_eq!(java::line(&ours, "counts"), java::line(&theirs, "counts"));
+            drop(kafka);
+        }
+        Err(Unavailable::Skipped(reason)) => java::skip(&reason),
+        Err(Unavailable::Failed(reason)) => panic!("Apache Kafka oracle: {reason}"),
+    }
+    let _ = shutdown.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}

@@ -47,7 +47,10 @@ use bytes::{Buf, Bytes};
 use crate::error::{KafkaProtocolError, Result};
 
 mod txn;
-pub use txn::{validate_add_partitions_to_txn_shape, validate_end_txn_shape};
+pub use txn::{
+    validate_add_offsets_to_txn_shape, validate_add_partitions_to_txn_shape,
+    validate_end_txn_shape, validate_txn_offset_commit_shape,
+};
 
 /// Per-array cap: large enough that no single legitimate array (e.g. a topic list) is rejected,
 /// small enough that a `Vec::with_capacity` sized from it is trivial memory regardless of element

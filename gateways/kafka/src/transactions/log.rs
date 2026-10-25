@@ -94,6 +94,15 @@ struct LoggedPartition {
     start: Option<u64>,
 }
 
+/// One offset a transaction commits for a group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LoggedOffset {
+    g: String,
+    t: String,
+    p: i32,
+    o: i64,
+}
+
 /// One record of the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRecord {
@@ -109,6 +118,8 @@ pub struct LogRecord {
     partitions: Vec<LoggedPartition>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     groups: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    offsets: Vec<LoggedOffset>,
     start_ms: i64,
     update_ms: i64,
     /// On a `CompleteCommit` or `CompleteAbort`: the range of each partition.
@@ -138,6 +149,20 @@ impl LogRecord {
                 })
                 .collect(),
             groups: metadata.groups.clone(),
+            offsets: metadata
+                .offsets
+                .iter()
+                .flat_map(|(group, offsets)| {
+                    offsets
+                        .iter()
+                        .map(|((topic, partition), offset)| LoggedOffset {
+                            g: group.clone(),
+                            t: topic.clone(),
+                            p: *partition,
+                            o: *offset,
+                        })
+                })
+                .collect(),
             start_ms: metadata.start_ms,
             update_ms: metadata.update_ms,
             ended,
@@ -173,6 +198,16 @@ impl LogRecord {
                 })
                 .collect::<BTreeMap<_, _>>(),
             groups: self.groups.clone(),
+            offsets: self
+                .offsets
+                .iter()
+                .fold(BTreeMap::new(), |mut offsets, logged| {
+                    offsets
+                        .entry(logged.g.clone())
+                        .or_insert_with(BTreeMap::new)
+                        .insert((logged.t.clone(), logged.p), logged.o);
+                    offsets
+                }),
             start_ms: self.start_ms,
             update_ms: self.update_ms,
         }
