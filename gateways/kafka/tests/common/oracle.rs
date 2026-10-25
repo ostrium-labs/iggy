@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::{
     ApiKey, ApiVersionsRequest, DeleteTopicsRequest, FetchRequest, FindCoordinatorRequest,
@@ -851,6 +852,51 @@ impl WireClient {
             return connection.send_direct(request, version).await;
         }
         self.send_direct(request, version).await
+    }
+
+    /// On a multi-broker target, waits until each partition's leader serves `topic`: a leader
+    /// can answer 3 (`UNKNOWN_TOPIC_OR_PARTITION`) for a while after Metadata lists the topic.
+    /// Does nothing on a single broker, where Metadata and the leader are the same process.
+    pub async fn await_leaders(&mut self, topic: &str, partitions: i32) -> Result<(), String> {
+        if self.router.is_none() {
+            return Ok(());
+        }
+        let version = self
+            .version(ApiKey::ListOffsets, 7)
+            .ok_or("the target does not serve ListOffsets")?;
+        for partition in 0..partitions {
+            let request = ListOffsetsRequest::default()
+                .with_replica_id(kafka_protocol::messages::BrokerId(-1))
+                .with_topics(vec![
+                    ListOffsetsTopic::default()
+                        .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                        .with_partitions(vec![
+                            ListOffsetsPartition::default()
+                                .with_partition_index(partition)
+                                .with_current_leader_epoch(-1)
+                                .with_timestamp(-1),
+                        ]),
+                ]);
+            let mut last = -1;
+            for _ in 0..120 {
+                let response = self.send(&request, version).await?;
+                last = response
+                    .topics
+                    .first()
+                    .and_then(|found| found.partitions.first())
+                    .map_or(-1, |found| found.error_code);
+                if last == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if last != 0 {
+                return Err(format!(
+                    "the leader of {topic}/{partition} still answers {last}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The node that owns `route`, asked of the bootstrap; `None` when none does yet.
