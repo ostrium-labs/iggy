@@ -652,7 +652,9 @@ fn encode_real_response(
                 (0..result.partitions_count)
                     .map(|index| {
                         let index = i32::try_from(index).unwrap_or(i32::MAX);
-                        let leader = BrokerId(advertised.leader(result.name.as_str(), index));
+                        // A found topic always has its name, even when asked for by id.
+                        let name = result.name.as_ref().map_or("", |name| name.as_str());
+                        let leader = BrokerId(advertised.leader(name, index));
                         MetadataResponsePartition::default()
                             .with_partition_index(index)
                             .with_leader_id(leader)

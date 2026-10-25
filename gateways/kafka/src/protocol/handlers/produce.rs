@@ -182,19 +182,10 @@ pub async fn handle(
     } else {
         Vec::new()
     };
-    // Among several gateways, a partition's batches go to its leader only, so one gateway holds
-    // its producer state. A client with stale metadata is told to refresh it, and nothing of the
-    // request is written: Kafka clients send one request per leader, so this is a request that
-    // went to the wrong gateway, and its retry goes to the right one. After the naming: from v13
-    // a topic has no name until its id is looked up, and leadership is decided by name.
-    if !leads_every_partition(state, &request) {
-        tracing::debug!("Produce names a partition another gateway leads");
-        if request.acks == ACKS_NONE {
-            return HandleOutcome::Close;
-        }
-        let mut responses = uniform_responses(&request, ERROR_NOT_LEADER_OR_FOLLOWER);
-        responses.extend(unnamed);
-        return respond_or_close(encode_written_response(api_version, responses), "Produce");
+    // After the naming: from v13 a topic has no name until its id is looked up, and leadership is
+    // decided by name.
+    if let Some(refused) = refuse_if_led_elsewhere(state, api_version, &request, &unnamed) {
+        return refused;
     }
     // The turn before the memory: a request that waits behind its producer's stuck send then
     // holds none, and no large slot.
@@ -271,6 +262,32 @@ async fn name_topics(
         false
     });
     unnamed
+}
+
+/// Among several gateways, a partition's batches go to its leader only, so one gateway holds its
+/// producer state. A client with stale metadata is told to refresh it, and nothing of the request
+/// is written: Kafka clients send one request per leader, so this is a request that went to the
+/// wrong gateway, and its retry goes to the right one. `unnamed` are the answers for topic ids no
+/// topic has, which go back with the refusal.
+fn refuse_if_led_elsewhere(
+    state: &GatewayState,
+    api_version: i16,
+    request: &ProduceRequest,
+    unnamed: &[TopicProduceResponse],
+) -> Option<HandleOutcome> {
+    if leads_every_partition(state, request) {
+        return None;
+    }
+    tracing::debug!("Produce names a partition another gateway leads");
+    if request.acks == ACKS_NONE {
+        return Some(HandleOutcome::Close);
+    }
+    let mut responses = uniform_responses(request, ERROR_NOT_LEADER_OR_FOLLOWER);
+    responses.extend(unnamed.iter().cloned());
+    Some(respond_or_close(
+        encode_written_response(api_version, responses),
+        "Produce",
+    ))
 }
 
 /// Whether this gateway leads every partition `request` writes to (`crate::membership`). A
