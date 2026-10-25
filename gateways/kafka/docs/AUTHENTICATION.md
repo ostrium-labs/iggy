@@ -101,6 +101,11 @@ removing a credential that does not exist or describing a user with none, `UNACC
 answered `CLUSTER_AUTHORIZATION_FAILED` (31). An Iggy user is not required to exist when its SCRAM
 credential is set, as in Kafka; logging in with it is refused until it does.
 
+`DescribeClientQuotas` (48), v0-1, is advertised and served with them, because `kafka-configs
+--describe --entity-type users` asks for a user's quotas along with its credentials and fails
+outright on a broker without the key. The gateway enforces no client quotas, so the answer is always
+that there are none; it needs `read_users`, like describing credentials.
+
 ### The exchange
 
 RFC 5802 and RFC 7677, as Kafka's `ScramSaslServer` runs them, over two `SaslAuthenticate` rounds.

@@ -161,8 +161,9 @@ All API keys not listed above close the connection (see Governance model above) 
 | 29 | DescribeAcls | Implemented on listeners that name a principal: the SASL ones, and `SSL` with client certificates; advertised only there ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 50, 51 | DescribeUserScramCredentials, AlterUserScramCredentials | Implemented (v0) where SCRAM is enabled, the bridge keeps the credentials and the listener names a principal; advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md#scram)) |
+| 48 | DescribeClientQuotas | v0-1, with keys 50 and 51 and only where they are: always answers that no entity has a quota (the gateway enforces none), so `kafka-configs --describe --entity-type users` works ([`AUTHENTICATION.md`](AUTHENTICATION.md#administration)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
-| 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 48, 49, 52 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
+| 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 49, 52 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).

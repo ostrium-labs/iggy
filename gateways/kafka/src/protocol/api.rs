@@ -82,6 +82,7 @@ pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
 pub const API_KEY_DELETE_GROUPS: i16 = 42;
 pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 pub const API_KEY_OFFSET_DELETE: i16 = 47;
+pub const API_KEY_DESCRIBE_CLIENT_QUOTAS: i16 = 48;
 pub const API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS: i16 = 50;
 pub const API_KEY_ALTER_USER_SCRAM_CREDENTIALS: i16 = 51;
 pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
@@ -885,7 +886,17 @@ pub fn sasl_advertised_ranges() -> &'static [ApiVersionRange] {
 /// The SCRAM credential keys, advertised only where SCRAM is on, the bridge keeps the
 /// credentials, and the listener names who asks. Absent from [`SUPPORTED_RANGES`] like the ACL
 /// keys: they answer about the authenticated principal's grants.
+///
+/// `DescribeClientQuotas` comes with them because `kafka-configs --describe --entity-type users`
+/// asks for a user's quotas and its SCRAM credentials together, and fails outright on a broker
+/// that does not advertise the quota key. The gateway enforces no client quotas, so it answers
+/// that there are none.
 static SCRAM_ADVERTISED_RANGES: &[ApiVersionRange] = &[
+    ApiVersionRange {
+        api_key: API_KEY_DESCRIBE_CLIENT_QUOTAS,
+        min_version: 0,
+        max_version: 1,
+    },
     ApiVersionRange {
         api_key: API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS,
         min_version: 0,
