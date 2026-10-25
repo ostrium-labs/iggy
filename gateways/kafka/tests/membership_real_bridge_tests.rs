@@ -280,12 +280,7 @@ fn one_record() -> Bytes {
     buf.freeze()
 }
 
-/// The Produce error a gateway answers for one record to `partition`.
-async fn produce_error(gateway: &Gateway, partition: i32) -> i16 {
-    produce_error_at(gateway, partition, 9, None).await
-}
-
-/// The Produce error at `version`, naming the topic by `topic_id` (v13 and later) or by name.
+/// The Produce error a gateway answers for one record to `partition` at `version`, naming the topic by `topic_id` (v13 and later) or by name.
 async fn produce_error_at(
     gateway: &Gateway,
     partition: i32,
@@ -294,10 +289,10 @@ async fn produce_error_at(
 ) -> i16 {
     let mut client = client(gateway).await;
     let version = client.version(ApiKey::Produce, version).expect("Produce");
-    let topic = match topic_id {
-        Some(id) => TopicProduceData::default().with_topic_id(id),
-        None => TopicProduceData::default().with_name(TopicName(s(TOPIC))),
-    };
+    let topic = topic_id.map_or_else(
+        || TopicProduceData::default().with_name(TopicName(s(TOPIC))),
+        |id| TopicProduceData::default().with_topic_id(id),
+    );
     let request = ProduceRequest::default()
         .with_acks(-1)
         .with_timeout_ms(10_000)
