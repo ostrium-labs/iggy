@@ -47,11 +47,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::{
-    ApiKey, ApiVersionsRequest, DeleteTopicsRequest, FetchRequest, FindCoordinatorRequest,
-    HeartbeatRequest, InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest,
-    ListOffsetsRequest, MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
-    RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslHandshakeRequest, SyncGroupRequest,
-    TopicName,
+    AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, ApiKey, ApiVersionsRequest,
+    DeleteTopicsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest, HeartbeatRequest,
+    InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest, ListOffsetsRequest,
+    MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest, RequestHeader,
+    ResponseHeader, SaslAuthenticateRequest, SaslHandshakeRequest, SyncGroupRequest, TopicName,
+    TxnOffsetCommitRequest,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
 use rustls::pki_types::ServerName;
@@ -1112,6 +1113,21 @@ fn route_of<R: 'static>(request: &R) -> Option<Route> {
     if let Some(init) = any.downcast_ref::<InitProducerIdRequest>() {
         let id = init.transactional_id.as_ref()?;
         return Some(Route::Coordinator(1, id.0.to_string()));
+    }
+    if let Some(add) = any.downcast_ref::<AddPartitionsToTxnRequest>() {
+        return Some(Route::Coordinator(
+            1,
+            add.v3_and_below_transactional_id.0.to_string(),
+        ));
+    }
+    if let Some(add) = any.downcast_ref::<AddOffsetsToTxnRequest>() {
+        return Some(Route::Coordinator(1, add.transactional_id.0.to_string()));
+    }
+    if let Some(end) = any.downcast_ref::<EndTxnRequest>() {
+        return Some(Route::Coordinator(1, end.transactional_id.0.to_string()));
+    }
+    if let Some(commit) = any.downcast_ref::<TxnOffsetCommitRequest>() {
+        return group(&commit.group_id.0);
     }
     None
 }

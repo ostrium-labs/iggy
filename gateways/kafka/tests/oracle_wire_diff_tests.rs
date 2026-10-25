@@ -77,6 +77,7 @@ use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
 use iggy_gateway_kafka::records::{HeaderList, encode_batch_with};
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
+use iggy_gateway_kafka::transactions::TransactionConfig;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[path = "common/facts.rs"]
@@ -85,6 +86,8 @@ mod facts;
 mod iggy_server;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "oracle/transactions.rs"]
+mod transactions;
 
 use facts::{Allowed, Difference, Facts, compare, judge, parse_allowed};
 use oracle::{
@@ -136,10 +139,11 @@ enum Scenario {
     DescribeConfigs,
     TopicConfigs,
     TopicIds,
+    Transactions,
 }
 
 impl Scenario {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -154,6 +158,7 @@ impl Scenario {
         Self::DescribeConfigs,
         Self::TopicConfigs,
         Self::TopicIds,
+        Self::Transactions,
     ];
 
     const fn name(self) -> &'static str {
@@ -172,6 +177,7 @@ impl Scenario {
             Self::DescribeConfigs => "describe_configs",
             Self::TopicConfigs => "topic_configs",
             Self::TopicIds => "topic_ids",
+            Self::Transactions => "transactions",
         }
     }
 
@@ -198,6 +204,9 @@ impl Scenario {
             Self::DescribeConfigs => describe_configs(cx, &mut client, &mut facts).await?,
             Self::TopicConfigs => topic_configs(cx, &mut client, &mut facts).await?,
             Self::TopicIds => topic_ids(cx, &mut client, &mut facts).await?,
+            Self::Transactions => {
+                transactions::transactions(cx, &mut client, &mut facts).await?;
+            }
         }
         Ok(facts)
     }
@@ -518,6 +527,59 @@ async fn fetch(
         }
     }
     Ok((partition, records))
+}
+
+/// One Fetch of `partition` from `offset` at `isolation_level`: the partition's answer and its
+/// raw record bytes, control batches included.
+async fn fetch_raw(
+    client: &mut WireClient,
+    name: &str,
+    partition: i32,
+    offset: i64,
+    isolation_level: i8,
+) -> Result<
+    (
+        kafka_protocol::messages::fetch_response::PartitionData,
+        Bytes,
+    ),
+    String,
+> {
+    let request = FetchRequest::default()
+        .with_replica_id(BrokerId(-1))
+        .with_max_wait_ms(500)
+        .with_min_bytes(1)
+        .with_max_bytes(1 << 20)
+        .with_isolation_level(isolation_level)
+        .with_session_id(0)
+        .with_session_epoch(-1)
+        .with_topics(vec![
+            FetchTopic::default()
+                .with_topic(topic(name))
+                .with_partitions(vec![
+                    FetchPartition::default()
+                        .with_partition(partition)
+                        .with_current_leader_epoch(-1)
+                        .with_fetch_offset(offset)
+                        .with_last_fetched_epoch(-1)
+                        .with_log_start_offset(-1)
+                        .with_partition_max_bytes(1 << 20),
+                ]),
+        ]);
+    let version = version(client, ApiKey::Fetch, 12)?;
+    let response = client.send(&request, version).await?;
+    let partition = response
+        .responses
+        .into_iter()
+        .next()
+        .and_then(|topic| topic.partitions.into_iter().next())
+        .ok_or_else(|| {
+            format!(
+                "Fetch answered no partition (error {})",
+                response.error_code
+            )
+        })?;
+    let bytes = partition.records.clone().unwrap_or_default();
+    Ok((partition, bytes))
 }
 
 async fn produce_fetch(
@@ -2079,6 +2141,8 @@ async fn run_gateway(
     let mut config = GatewayConfig::default();
     // As the oracles run: Kafka's group.initial.rebalance.delay.ms is 0 there.
     config.group.initial_rebalance_delay = Duration::ZERO;
+    // KW-T: the oracles serve transactions.
+    config.transactions = Some(TransactionConfig::default());
     let gateway = KafkaGateway::new(config).with_bridge(Some(Arc::new(bridge)));
     let (shutdown, receiver) = broadcast::channel(1);
     let task = tokio::spawn(async move {
@@ -2218,7 +2282,19 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
 
     let mut sorted = Sorted::default();
     let mut ran = Vec::new();
+    // `KAFKA_ORACLE_SCENARIOS=a,b` runs only those, for a local loop on one scenario.
+    let only: Option<Vec<String>> = std::env::var("KAFKA_ORACLE_SCENARIOS").ok().map(|list| {
+        list.split(',')
+            .map(|name| name.trim().to_string())
+            .collect()
+    });
     for scenario in Scenario::ALL {
+        if only
+            .as_ref()
+            .is_some_and(|only| !only.iter().any(|name| name == scenario.name()))
+        {
+            continue;
+        }
         let context = |target: &Target| Context {
             target: target.clone(),
             run: run.clone(),

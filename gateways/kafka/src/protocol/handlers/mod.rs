@@ -24,6 +24,7 @@
 //! `kafka_protocol` owns wire encoding. What lives here is policy: which placeholder values and
 //! error codes a request gets back, and when the connection closes instead.
 
+pub mod add_partitions_to_txn;
 pub mod alter_configs;
 pub mod api_versions;
 pub mod create_partitions;
@@ -34,6 +35,7 @@ pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;
 pub mod describe_groups;
+pub mod end_txn;
 pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
@@ -52,6 +54,7 @@ pub mod produce;
 pub mod scram_credentials;
 pub mod sync_group;
 pub(crate) mod topic_config;
+pub mod txn;
 
 use std::time::Duration;
 
@@ -160,6 +163,11 @@ pub async fn dispatch(
             offset_delete::handle(state, connection, principal, api_version, body).await
         }
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
+        // KW-T: served only while transactions are on; each handler closes otherwise.
+        add_partitions_to_txn::API_KEY => {
+            add_partitions_to_txn::handle(state, principal, api_version, body).await
+        }
+        end_txn::API_KEY => end_txn::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
     }
 }

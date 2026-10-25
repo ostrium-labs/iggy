@@ -37,4 +37,5 @@ pub use iggy_bridge::{
     StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget, cluster_id_stream,
     kafka_topic_details_id, kafka_topic_id,
 };
+pub use iggy_bridge::{IggyTxnLog, TXN_STATE_TOPIC};
 pub use topic_map::{TopicMapping, TopicOverride};

@@ -39,7 +39,7 @@ use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
     ScramCredentialSource,
 };
-use crate::bridge::IggyBridge;
+use crate::bridge::{IggyBridge, IggyTxnLog};
 use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
@@ -67,6 +67,7 @@ use crate::protocol::sasl::{
 };
 use crate::scram::{DecoySecret, ScramMechanism, ScramServer, parse_client_first};
 use crate::tls::{IdentityError, TlsConfig, TlsState};
+use crate::transactions::{DataPlane, TransactionConfig, TransactionCoordinator, TxnLog};
 
 const READ_CHUNK: usize = 65536;
 const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
@@ -173,6 +174,10 @@ pub struct GatewayConfig {
     /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
     /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
     pub auto_topic_creation: AutoTopicCreationConfig,
+    /// The transaction coordinator's settings, when transactions are on
+    /// (`IGGY_KAFKA_TRANSACTIONS_ENABLED`, KW-T). `None`, the default, refuses them. Needs the
+    /// bridge.
+    pub transactions: Option<TransactionConfig>,
     /// Kafka's `connections.max.reauth.ms` (`IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS`): the longest
     /// an authenticated SASL session lasts before the client must re-authenticate on the same
     /// connection (KIP-368). `None`, the default, sets no limit beyond a credential's own
@@ -204,6 +209,7 @@ impl Default for GatewayConfig {
             auto_topic_creation: AutoTopicCreationConfig::default(),
             connections_max_reauth: None,
             membership: None,
+            transactions: None,
         }
     }
 }
@@ -384,6 +390,7 @@ impl SharedAuth {
 }
 
 /// One listener as its accept loop and its connections see it.
+#[allow(clippy::struct_excessive_bools)] // one flag per listener-dependent key set
 struct Listener {
     protocol: SecurityProtocol,
     broker: BrokerAdvertise,
@@ -397,6 +404,8 @@ struct Listener {
     /// Whether the SCRAM credential keys are served here: SCRAM is on, the bridge keeps the
     /// credentials, and this listener names principals.
     scram_admin: bool,
+    /// Whether the transaction keys are served here: transactions are on (KW-T).
+    transactions: bool,
 }
 
 impl Listener {
@@ -408,6 +417,7 @@ impl Listener {
         )
         .with_scram_admin(self.scram_admin)
         .with_protocol(self.protocol)
+        .with_transactions(self.transactions)
     }
 
     const fn advertisement(&self) -> Advertisement {
@@ -415,6 +425,7 @@ impl Listener {
             sasl: self.protocol.uses_sasl(),
             acls: self.acls_enabled,
             scram: self.scram_admin,
+            transactions: self.transactions,
         }
     }
 }
@@ -539,6 +550,7 @@ impl KafkaGateway {
     /// Returns an error on invalid config, unusable TLS material, or a non-transient `accept()`
     /// error on any listener. With a bridge and no [`Self::with_cluster_id`], also returns the
     /// bridge's error when it cannot load the cluster id from Iggy.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(
         self,
         listeners: Vec<BoundListener>,
@@ -566,6 +578,7 @@ impl KafkaGateway {
             .iter()
             .any(|listener| names_principals(listener.config.protocol));
         let scram_admin = self.bridge.is_some() && self.enabled_mechanisms().any_scram();
+        let transactions = self.bridge.is_some() && self.config.transactions.is_some();
 
         let mut bound = Vec::with_capacity(listeners.len());
         for BoundListener { config, socket } in listeners {
@@ -587,6 +600,7 @@ impl KafkaGateway {
                     acls_enabled: names_principals(protocol),
                     anonymous_without_principal: any_names_principals && !protocol.uses_sasl(),
                     scram_admin: scram_admin && names_principals(protocol),
+                    transactions,
                 }),
                 socket,
             ));
@@ -600,7 +614,15 @@ impl KafkaGateway {
         // Abandoned rather than shut down: the tasks below must not outlive this future. Declared
         // before `heartbeats`, so those are aborted (no goodbye) before this cancel fires.
         let _abandoned = cancel.clone().drop_guard();
-        let (state, heartbeats) = self.start_state(&bound, &cancel).await?;
+        let (state, heartbeats, txn_log) = self.start_state(&bound, &cancel).await?;
+        if let Some(coordinator) = &state.transactions {
+            // Not tracked: both end on the cancel token, which the drain fires first.
+            let loading = Arc::clone(coordinator);
+            tokio::spawn(async move {
+                loading.load().await;
+                loading.abort_timed_out_forever().await;
+            });
+        }
         let shared_auth = Arc::new(SharedAuth::new(
             self.enabled_mechanisms(),
             self.authenticator.clone(),
@@ -665,24 +687,46 @@ impl KafkaGateway {
         state
             .shutdown_auto_topic_creation(auto_topic_creation::SHUTDOWN_WAIT)
             .await;
+        if let Some(coordinator) = &state.transactions {
+            coordinator.shutdown();
+        }
+        if let Some(txn_log) = txn_log {
+            txn_log.close().await;
+        }
         outcome
     }
 
     /// The state every connection of [`Self::run`] shares. The group coordinator stops with
     /// `cancel`.
+    ///
+    /// With transactions on, also the transaction log's client, which the caller closes last.
     fn shared_state(
         &self,
         cluster_id: ClusterId,
         cancel: &CancellationToken,
-    ) -> Result<GatewayState> {
-        GatewayState::new(
+    ) -> Result<(GatewayState, Option<Arc<IggyTxnLog>>)> {
+        let state = GatewayState::new(
             self.bridge.clone(),
             self.config.max_frame_size,
             self.config.instance_id,
             GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         )
         .with_cluster_id(cluster_id)
-        .with_auto_topic_creation(self.config.auto_topic_creation)
+        .with_auto_topic_creation(self.config.auto_topic_creation)?;
+        let (Some(config), Some(bridge)) = (&self.config.transactions, &self.bridge) else {
+            return Ok((state, None));
+        };
+        let txn_log = Arc::new(IggyTxnLog::new(Arc::clone(bridge)));
+        let ids = Arc::clone(&state.producer_ids);
+        let coordinator = TransactionCoordinator::new(
+            config.clone(),
+            Arc::clone(&txn_log) as Arc<dyn TxnLog>,
+            Arc::clone(bridge) as Arc<dyn DataPlane>,
+            Arc::new(move || ids.allocate()),
+            cancel.child_token(),
+        );
+        info!("Kafka transactions are on: this gateway is the transaction coordinator");
+        Ok((state.with_transactions(coordinator), Some(txn_log)))
     }
 
     /// The state every connection shares, with this gateway's membership started: announced and
@@ -692,19 +736,25 @@ impl KafkaGateway {
         &self,
         bound: &[(Arc<Listener>, TcpListener)],
         cancel: &CancellationToken,
-    ) -> Result<(Arc<GatewayState>, Heartbeats)> {
+    ) -> Result<(Arc<GatewayState>, Heartbeats, Option<Arc<IggyTxnLog>>)> {
         let cluster_id = self.cluster_id().await?;
         let endpoints = bound
             .iter()
             .map(|(listener, _)| Endpoint::new(listener.protocol, &listener.broker))
             .collect();
         let membership = self.membership(endpoints)?;
-        let state = Arc::new(
-            self.shared_state(cluster_id, cancel)?
-                .with_membership(Arc::clone(&membership)),
-        );
+        if membership.is_shared() && self.config.transactions.is_some() {
+            // Every gateway would coordinate every transactional id. KW-T step 5 shares them out.
+            return Err(KafkaProtocolError::InvalidConfig(
+                "IGGY_KAFKA_TRANSACTIONS_ENABLED needs a single gateway for now: unset \
+                 IGGY_KAFKA_NODE_ID, or turn transactions off"
+                    .into(),
+            ));
+        }
+        let (state, txn_log) = self.shared_state(cluster_id, cancel)?;
+        let state = Arc::new(state.with_membership(Arc::clone(&membership)));
         let heartbeats = self.start_membership(&membership).await;
-        Ok((state, heartbeats))
+        Ok((state, heartbeats, txn_log))
     }
 
     /// This gateway's membership: alone as node 1, or shared with the gateways that announce

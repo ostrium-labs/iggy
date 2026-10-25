@@ -54,8 +54,8 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::{PROBE_INTERVAL, Snapshot, recent};
 use crate::records::{
-    BATCH_HEADER_BYTES, RecordCodecError, RepeatedHeaders, encode_batch_with, from_iggy_with,
-    record_size_bound_with,
+    BATCH_HEADER_BYTES, RecordCodecError, RepeatedHeaders, continues_batch, encode_batch_with,
+    from_iggy_with, record_size_bound_with,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -1742,6 +1742,13 @@ fn encode_records(
             Err(_) => break,
         };
         size = size.saturating_add(record_size_bound_with(&record, headers.as_deref()));
+        // KW-T: a transactional or control record may start a batch of its own.
+        if records
+            .last()
+            .is_some_and(|previous| !continues_batch(previous, &record))
+        {
+            size = size.saturating_add(BATCH_HEADER_BYTES);
+        }
         if size > budget && !(keep_one && records.is_empty()) {
             break;
         }
@@ -1884,7 +1891,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::probe_board::{Good, ProbeBoard};
-    use crate::records::{PRODUCER_MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
+    use crate::records::{CONTROL_MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
     const CREATE_TIME: i64 = 1_700_000_000_123;
     /// Every partition code Fetch sends. The Java consumer throws on 29 on purpose, and on 1
@@ -1928,7 +1935,7 @@ mod tests {
         let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from(VERSION_HEADER).unwrap(),
-            HeaderValue::try_from(&[PRODUCER_MAPPING_VERSION + 1][..]).unwrap(),
+            HeaderValue::try_from(&[CONTROL_MAPPING_VERSION + 1][..]).unwrap(),
         );
         let mut message = IggyMessage::builder()
             .payload(Bytes::from_static(b"v"))

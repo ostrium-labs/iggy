@@ -2,7 +2,9 @@
 
 Status: **plan, 2026-10-23.** Nothing in this document is built yet unless a
 task row says so. Transactions and exactly-once (KW-T, apache/iggy#4522) are
-**planned, not built**, and start only after KW-2, KW-3 and KW-13 are done (owner, 2026-10-24).
+**being built** in steps behind `IGGY_KAFKA_TRANSACTIONS_ENABLED` (owner, 2026-10-25: start now;
+this overrides the 2026-10-24 ruling that they wait for KW-2, KW-3 and KW-13). Step 1 is built;
+section 6 has the state of each step.
 
 Owner direction (2026-10-23): "work on kafka wire now, do all things except
 kafka transactions but plan it fully, do these in our fork." Loams' side of the
@@ -221,7 +223,7 @@ breadth. Status is `Planned` unless noted.
 | KW-18 | Kafka-to-Iggy migration guide | #3550 | Planned | KW-5 | Assigned upstream; fork copy only |
 | KW-L1 | Fork images: `iggy-server` and `iggy-gateway-kafka` on GHCR | — | **Done** (one image, `ghcr.io/ostrium-labs/iggy`) | KW-0 | No |
 | KW-L2 | Loams compose profile `kafka` | — (Loams repo) | **Done** (ostrium-labs/loams#1148) | KW-L1 | No |
-| KW-T | Transactions and exactly-once | #4522 | **Planned, not built**; starts after KW-2, KW-3 and KW-13 are done (owner, 2026-10-24) | KW-2, KW-3, KW-13, then KW-5, KW-6, KW-7 | Design discussion first |
+| KW-T | Transactions and exactly-once | #4522 | **Step 1 built** (coordinator, log, handshake, markers, fencing, timeouts, recovery; behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`); steps 2-5 planned. Started 2026-10-25 on the owner's word, ahead of KW-13 | KW-3 (done); KW-5 for step 5, KW-6 for a bounded log | Design discussion first |
 
 ### KW-1. Differential oracle harness
 
@@ -1003,12 +1005,58 @@ consume through the gateway. Not wired to the Loams engine: the Iggy to Loams
 hop is FL1's `loams_sink`. SASL is the gateway's own (`KAFKA_SASL_ENABLED`),
 against Iggy users, not yet mapped to Loams credentials.
 
-## 6. KW-T: transactions and exactly-once (planned, not built)
+## 6. KW-T: transactions and exactly-once (being built)
 
-**Status: planned, not built.** Owner: "do all things except kafka transactions
-but plan it fully." Nothing in this section is implemented, and the gateway
-keeps refusing transactions as `SCOPE.md` "Transactions" describes until the
-owner approves building it.
+**Status: step 1 of 5 built (2026-10-26), behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`, off by
+default.** Owner, 2026-10-25: "start transactions now"; Confluent Cloud is the managed-Kafka
+reference (report-only), the Apache Kafka container stays pass/fail, and the crash and
+network-fault tests run on the second laptop. With the switch off the gateway keeps refusing
+transactions as `SCOPE.md` "Transactions" describes. `gateways/kafka/docs/TRANSACTIONS.md` is the
+as-built design.
+
+| Step | Scope (6.8's letters) | State |
+| --- | --- | --- |
+| 1 | (a) log and state machine, (b) `InitProducerId`, `FindCoordinator`, `AddPartitionsToTxn`, `EndTxn`, transactional Produce, markers; timeouts, fencing, recovery of `Prepare*` | **Built** (this PR) |
+| 2 | (c) last stable offset, aborted transactions, `read_committed` Fetch and `ListOffsets` | Planned, next |
+| 3 | (d) `AddOffsetsToTxn`, `TxnOffsetCommit`, `require_stable`; Streams `exactly_once_v2`, Flink 2PC | Planned |
+| 4 | `DescribeTransactions`, `ListTransactions`, `DescribeProducers`, id expiry, log snapshots | Planned |
+| 5 | (e) KW-5 ownership, coordinator move, crash and fault matrix on the second laptop | Planned |
+| — | (f) TV2 | Not planned yet |
+
+**As built, step 1.** Differences from 6.3, each for a reason:
+
+- The aborted-transaction index is not a second topic (`txn_aborted`): each `CompleteAbort`
+  record of `txn_state` lists its aborted ranges, and `CompleteCommit` its committed ones (their
+  markers bound the producer's next transaction). One log, written once per transaction end, in
+  the order that makes it safe: the ranges are durable before the transaction stops holding the
+  last stable offset.
+- A transaction's first offset on a partition is not scanned for: it is the high watermark when
+  the partition was added, raised to one past the producer's last marker there, and lowered to the
+  first record once a send names it. Never above the first record, never at or below the previous
+  marker, which is what a consumer's aborted filter needs.
+- Every record of a transactional batch carries `kafka.t` (producer, epoch, its sequence), not
+  only the first, so Fetch can serve a transactional batch from a read that starts mid-batch.
+- Markers are written on the producer's own Iggy session after its Produce turn, so no batch the
+  coordinator accepted lands after its marker (the SDK lane replays a send in doubt first).
+- The coordinator epoch in markers is 0 until step 5.
+
+Tests: unit tests for the state table, the coordinator (commit, fence, timeout, recovery,
+errors), the index, the log, the marks and the handlers; `transactions_real_bridge_tests.rs`
+(gateway binary on `iggy-server`: markers and control batches, SIGKILL and replay, a decision
+whose markers were never written, a timeout abort); `transactions_java_client_tests.rs` (Java
+producer commit, abort and fencing, on the gateway and on Apache Kafka 4.3.1: same outcome);
+the oracle scenario `transactions` (43 facts, all equal to Apache Kafka 4.3.1).
+
+Confluent Cloud (report-only, 2026-10-26, Basic cluster) differs from Apache Kafka and the
+gateway on the same scenario, and these are recorded, not followed: it answers `AddPartitionsToTxn`
+v3 with 0 for a fenced epoch and for an unknown transactional id (Kafka: 90 and 49), lets a
+transactional batch land on a partition the transaction never added (Kafka: 48), answers `EndTxn`
+v3 from a fenced producer with 47 (Kafka: 90), and its `read_uncommitted` Fetch shows no control
+batch: markers take no offset there (high watermark 2 after a committed transaction of two
+records, where Kafka and the gateway say 3). Everything else (fencing by `InitProducerId`, the
+double bump when an open transaction is fenced, 48 and 50, zombie writes refused with 47,
+the records a consumer reads) matches. The plan reads these as Confluent's own engine (Kora)
+verifying lazily and keeping markers out of the offset space; Apache Kafka stays the contract.
 
 ### 6.1 Who needs it
 
@@ -1208,6 +1256,8 @@ recommendations").
    No server change, and `ExternalGroup`'s `u64` offset is untouched.
 5. **KW-T: transactions start after KW-2, KW-3 and KW-13 are done.** Until then
    the gateway keeps refusing them as `SCOPE.md` "Transactions" describes.
+   **Overridden 2026-10-25:** start now; classic groups suffice for `TxnOffsetCommit`; Confluent
+   Cloud is the managed reference (report-only); faults run on the second laptop.
 6. **KW-8: the computed topic ids are accepted**: a stable UUID per Iggy topic,
    stored as a topic option at creation and minted once for existing topics on
    first read.

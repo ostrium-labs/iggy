@@ -155,7 +155,8 @@ An empty `transactional_id` reads as absent. A wire null decodes to `None`, but
 `kafka-protocol`'s own `Default` is `Some("")`, and a producer that is idempotent-only names no
 transaction either way.
 
-InitProducerId with a `transactional_id`:
+InitProducerId with a `transactional_id` (with transactions off, the default; the Ostrium fork's
+`IGGY_KAFKA_TRANSACTIONS_ENABLED=true` serves it instead, see [`TRANSACTIONS.md`](TRANSACTIONS.md)):
 
 - answer `UNSUPPORTED_VERSION` (35). Transactions stay out of scope, and so do
   AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26) and TxnOffsetCommit (28)
