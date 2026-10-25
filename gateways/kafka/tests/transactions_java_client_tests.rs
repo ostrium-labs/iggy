@@ -161,11 +161,21 @@ async fn given_a_consume_transform_produce_loop_with_aborts_should_copy_each_rec
                 &jars,
                 &classes,
                 "EosCopyProbe",
-                &[&bootstrap, "eos-in", "eos-out", "eos-group", "eos-copier", "60"],
+                &[
+                    &bootstrap,
+                    "eos-in",
+                    "eos-out",
+                    "eos-group",
+                    "eos-copier",
+                    "60",
+                ],
             )
             .unwrap_or_else(|error| panic!("{error}"));
             println!("EosCopyProbe against {bootstrap}:\n{text}");
-            assert!(ok && text.contains("EOS_PROBE_OK"), "the probe failed\n{text}");
+            assert!(
+                ok && text.contains("EOS_PROBE_OK"),
+                "the probe failed\n{text}"
+            );
             text
         }
     };
@@ -178,14 +188,22 @@ async fn given_a_consume_transform_produce_loop_with_aborts_should_copy_each_rec
         .expect("the probe ran");
     assert_eq!(java::line(&ours, "exactly_once"), Some("true"), "{ours}");
     assert_eq!(java::line(&ours, "output_records"), Some("60"));
-    assert_ne!(java::line(&ours, "aborted"), Some("0"), "the loop aborted some");
+    assert_ne!(
+        java::line(&ours, "aborted"),
+        Some("0"),
+        "the loop aborted some"
+    );
 
     match KafkaOracle::start().await {
         Ok(kafka) => {
             let theirs = tokio::task::spawn_blocking(run(kafka.target.address.clone()))
                 .await
                 .expect("the probe ran");
-            assert_eq!(java::line(&theirs, "exactly_once"), Some("true"), "{theirs}");
+            assert_eq!(
+                java::line(&theirs, "exactly_once"),
+                Some("true"),
+                "{theirs}"
+            );
             drop(kafka);
         }
         Err(Unavailable::Skipped(reason)) => java::skip(&reason),
@@ -223,7 +241,10 @@ async fn given_a_kafka_streams_word_count_at_exactly_once_v2_should_count_as_on_
             )
             .unwrap_or_else(|error| panic!("{error}"));
             println!("StreamsEosProbe against {bootstrap}:\n{text}");
-            assert!(ok && text.contains("STREAMS_PROBE_OK"), "the probe failed\n{text}");
+            assert!(
+                ok && text.contains("STREAMS_PROBE_OK"),
+                "the probe failed\n{text}"
+            );
             text
         }
     };
@@ -244,7 +265,11 @@ async fn given_a_kafka_streams_word_count_at_exactly_once_v2_should_count_as_on_
             ))
             .await
             .expect("the probe ran");
-            assert_eq!(java::line(&theirs, "exactly_once"), Some("true"), "{theirs}");
+            assert_eq!(
+                java::line(&theirs, "exactly_once"),
+                Some("true"),
+                "{theirs}"
+            );
             assert_eq!(java::line(&ours, "counts"), java::line(&theirs, "counts"));
             drop(kafka);
         }

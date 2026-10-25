@@ -229,12 +229,18 @@ mod tests {
         for version in 0..=4 {
             validate_add_offsets_to_txn_shape(version, &encoded(&add_offsets, version)).unwrap();
         }
-        let commit = TxnOffsetCommitRequest::default()
-            .with_transactional_id(TransactionalId(StrBytes::from_static_str("tx")))
-            .with_group_id(GroupId(StrBytes::from_static_str("g")))
-            .with_member_id(StrBytes::from_static_str("m"))
-            .with_group_instance_id(Some(StrBytes::from_static_str("i")))
-            .with_topics(vec![
+        let commit = |version: i16| {
+            let request = TxnOffsetCommitRequest::default()
+                .with_transactional_id(TransactionalId(StrBytes::from_static_str("tx")))
+                .with_group_id(GroupId(StrBytes::from_static_str("g")));
+            let request = if version >= 3 {
+                request
+                    .with_member_id(StrBytes::from_static_str("m"))
+                    .with_group_instance_id(Some(StrBytes::from_static_str("i")))
+            } else {
+                request.with_group_instance_id(None)
+            };
+            request.with_topics(vec![
                 TxnOffsetCommitRequestTopic::default()
                     .with_name(TopicName(StrBytes::from_static_str("t")))
                     .with_partitions(vec![
@@ -242,9 +248,11 @@ mod tests {
                             .with_committed_offset(9)
                             .with_committed_metadata(Some(StrBytes::from_static_str("md"))),
                     ]),
-            ]);
+            ])
+        };
         for version in 0..=4 {
-            validate_txn_offset_commit_shape(version, &encoded(&commit, version), 1 << 20).unwrap();
+            validate_txn_offset_commit_shape(version, &encoded(&commit(version), version), 1 << 20)
+                .unwrap();
         }
     }
 
