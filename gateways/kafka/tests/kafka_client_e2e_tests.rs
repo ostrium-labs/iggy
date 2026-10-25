@@ -1241,9 +1241,11 @@ async fn given_kafka_configs_sh_when_adding_then_deleting_retention_should_round
         ],
     )
     .expect_ran("kafka-configs.sh --describe after --delete-config");
+    // As on Kafka: a deleted topic override goes back to the default, which is not a dynamic
+    // topic config, so `--describe` no longer lists it.
     assert!(
-        described_after.contains("retention.ms=-1 sensitive=false"),
-        "a deleted retention.ms reads as never expire, got: {described_after}"
+        !described_after.contains("retention.ms="),
+        "a deleted retention.ms is no longer a topic override, got: {described_after}"
     );
 }
 
