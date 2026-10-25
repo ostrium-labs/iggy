@@ -73,6 +73,26 @@ fact = "retention.ms.value"
 issue = "apache/iggy#4508"
 reason = "an Iggy topic never expires by default; Kafka's default is 7 days"
 
+# KW-4: a topic without a retention.ms override reports Iggy's default.
+[[difference]]
+scenario = "topic_configs"
+fact = "all.retention.ms.value"
+issue = "apache/iggy#4508"
+reason = "an Iggy topic never expires by default, so the default retention.ms is -1; Kafka's default is 7 days"
+
+[[difference]]
+scenario = "topic_configs"
+fact = "after_delete.retention.ms.value"
+issue = "apache/iggy#4508"
+reason = "a deleted retention.ms override goes back to Iggy's default, -1 (never expire); Kafka's default is 7 days"
+
+# KW-4: no broker-level dynamic configs on the gateway.
+[[difference]]
+scenario = "topic_configs"
+fact = "after_delete.min.insync.replicas.source"
+issue = "apache/iggy#4508"
+reason = "the gateway has no cluster-wide dynamic broker defaults, so a topic without an override reports min.insync.replicas as DEFAULT_CONFIG (5); a KRaft Kafka cluster keeps min.insync.replicas as a dynamic cluster default and reports DYNAMIC_DEFAULT_BROKER_CONFIG (3)"
+
 # After a restart the gateway still deduplicates a retry of an older batch.
 [[difference]]
 scenario = "idempotent_restart"
