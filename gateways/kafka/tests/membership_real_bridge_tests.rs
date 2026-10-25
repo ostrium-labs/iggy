@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
@@ -209,7 +210,7 @@ async fn converge_coordinators(
     }
 }
 
-/// The JoinGroup error a gateway answers for a new member of `group`.
+/// The `JoinGroup` error a gateway answers for a new member of `group`.
 async fn join_error(gateway: &Gateway, group: &str) -> i16 {
     let mut client = client(gateway).await;
     let version = client.version(ApiKey::JoinGroup, 9).expect("JoinGroup");
@@ -245,7 +246,7 @@ fn one_record() -> Bytes {
         timestamp: 1_700_000_000_000,
         key: Some(Bytes::from_static(b"k")),
         value: Some(Bytes::from_static(b"v")),
-        headers: Default::default(),
+        headers: IndexMap::new(),
     };
     let mut buf = BytesMut::new();
     RecordBatchEncoder::encode(
