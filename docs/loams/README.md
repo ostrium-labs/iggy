@@ -79,3 +79,5 @@ first, and one PR per issue.
 
 [`kafka-wire-plan.md`](kafka-wire-plan.md) lists the Kafka parity tasks, their
 order, tests and status.
+[`confluent-oracle.md`](confluent-oracle.md) describes the Confluent Cloud
+cluster used as a local, report-only Kafka oracle.
