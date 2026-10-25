@@ -82,11 +82,11 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
         let matches = credentials.username == self.username
             && credentials.password.expose_secret() == self.password;
         if matches {
-            Ok(AuthenticatedPrincipal {
-                username: credentials.username.clone(),
-                permissions: self.permissions,
-                permissions_known: true,
-            })
+            Ok(AuthenticatedPrincipal::from_projection(
+                credentials.username.clone(),
+                self.permissions,
+                true,
+            ))
         } else {
             Err(AuthError::Rejected)
         }
@@ -1033,11 +1033,11 @@ impl SaslAuthenticator for StallingAuthenticator {
         _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         let _held = self.release.acquire().await;
-        Ok(AuthenticatedPrincipal {
-            username: credentials.username.clone(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: true,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            credentials.username.clone(),
+            PrincipalPermissions::default(),
+            true,
+        ))
     }
 }
 
@@ -1099,11 +1099,11 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
         // bounded run still finishes well inside the pre-authentication budget.
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        Ok(AuthenticatedPrincipal {
-            username: credentials.username.clone(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: true,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            credentials.username.clone(),
+            PrincipalPermissions::default(),
+            true,
+        ))
     }
 }
 
@@ -1498,11 +1498,11 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
         credentials: &PlainCredentials,
         _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
-        Ok(AuthenticatedPrincipal {
-            username: credentials.username.clone(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: false,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            credentials.username.clone(),
+            PrincipalPermissions::default(),
+            false,
+        ))
     }
 }
 

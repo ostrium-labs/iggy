@@ -312,7 +312,6 @@ mod tests {
     use kafka_protocol::protocol::StrBytes;
 
     use super::*;
-    use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::ERROR_NONE;
 
     fn probe(high_watermark: u64, messages_count: u64, deleted_below: u64) -> PartitionProbe {
@@ -384,14 +383,14 @@ mod tests {
     }
 
     fn principal(manage_topics: bool, known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "app".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "app",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
-            permissions_known: known,
-        }
+            known,
+        )
     }
 
     #[test]

@@ -388,7 +388,6 @@ mod tests {
 
     use super::*;
     use crate::group::{GroupCoordinator, GroupCoordinatorConfig, JoinRequest};
-    use crate::protocol::acl::PrincipalPermissions;
 
     /// No bridge, and a first join that completes at once.
     fn state() -> GatewayState {
@@ -435,14 +434,14 @@ mod tests {
     }
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     /// The top-level error and each partition's `(topic, partition, error)`.

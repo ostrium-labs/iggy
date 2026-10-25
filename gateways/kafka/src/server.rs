@@ -1970,8 +1970,25 @@ async fn authenticate_plain(
     };
 
     match result {
-        Ok(authenticated) => {
+        Ok(mut authenticated) => {
             ctx.failed_logins.record_success(peer.ip());
+            // The login's own session may not see the streams its grants name, so the bridge
+            // names them. Without that, the per-stream grants would deny what they grant.
+            if authenticated.grants.needs_names() {
+                let Some(resolver) = ctx.resolver else {
+                    warn!(%peer, "no bridge to name the principal's per-stream grants; they grant nothing");
+                    return AuthStep::Done {
+                        principal: authenticated,
+                        auth_bytes: Bytes::new(),
+                        credential_expiry: None,
+                    };
+                };
+                let grants = (*authenticated.grants).clone();
+                match resolver.name_grants(grants).await {
+                    Ok(named) => authenticated.grants = Arc::new(named),
+                    Err(_) => return AuthStep::Fail(HandleOutcome::Close),
+                }
+            }
             AuthStep::Done {
                 principal: authenticated,
                 auth_bytes: Bytes::new(),

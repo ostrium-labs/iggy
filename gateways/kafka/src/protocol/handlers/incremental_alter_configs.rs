@@ -330,17 +330,16 @@ fn resource_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::acl::PrincipalPermissions;
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     fn resource(name: &str) -> AlterConfigsResource {

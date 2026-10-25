@@ -1011,7 +1011,6 @@ mod tests {
     use kafka_protocol::messages::TopicName;
 
     use super::*;
-    use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR};
 
     fn topic(name: &str, count: i32) -> CreatePartitionsTopic {
@@ -1027,14 +1026,14 @@ mod tests {
     }
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     fn topic_state(id: u32, created_at: u64, partitions_count: u32) -> TopicState {

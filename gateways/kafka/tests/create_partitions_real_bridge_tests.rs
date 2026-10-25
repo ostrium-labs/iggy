@@ -37,7 +37,6 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REQUEST, ERROR_NONE,
     ERROR_POLICY_VIOLATION, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
@@ -187,14 +186,14 @@ async fn iggy_partition_ids(server: &TestServer, name: &str) -> Vec<u32> {
 }
 
 fn principal(manage_topics: bool) -> AuthenticatedPrincipal {
-    AuthenticatedPrincipal {
-        username: "alice".to_string(),
-        permissions: PrincipalPermissions {
-            manage_topics,
-            ..PrincipalPermissions::default()
+    AuthenticatedPrincipal::with_global(
+        "alice",
+        iggy::prelude::GlobalPermissions {
+            manage_topics: manage_topics,
+            ..iggy::prelude::GlobalPermissions::default()
         },
-        permissions_known: true,
-    }
+        true,
+    )
 }
 
 #[tokio::test]

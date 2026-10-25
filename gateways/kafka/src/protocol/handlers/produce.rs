@@ -1337,11 +1337,11 @@ mod tests {
     }
 
     fn principal(username: &str) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: username.to_string(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: true,
-        }
+        AuthenticatedPrincipal::from_projection(
+            username.to_string(),
+            PrincipalPermissions::default(),
+            true,
+        )
     }
 
     #[test]

@@ -34,6 +34,7 @@ use iggy::prelude::{
 use tokio::sync::SemaphorePermit;
 use tracing::{debug, warn};
 
+use crate::authz::{Grants, IdNames};
 use crate::bridge::config::{DEFAULT_IGGY_ADDR, IggyTls};
 use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::sasl::PlainCredentials;
@@ -200,10 +201,15 @@ pub enum AuthError {
 /// authentication design rejects on cost, or keeping the password, which it rejects outright. A
 /// permission changed mid-connection is therefore invisible until the client reconnects, the same
 /// way Iggy's own data plane lags a revocation until the owning shard applies it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthenticatedPrincipal {
     pub username: String,
+    /// The global grants projected onto what has a Kafka meaning, for `DescribeAcls` and the
+    /// credential administration keys.
     pub permissions: PrincipalPermissions,
+    /// Every grant, per-stream and per-topic ones included, which the authorization checks read
+    /// (`crate::authz`).
+    pub grants: Arc<Grants>,
     /// Whether [`Self::permissions`] is a real answer or a fallback.
     ///
     /// A read that failed after a successful login degrades to an empty set, which is
@@ -220,6 +226,52 @@ impl AuthenticatedPrincipal {
     /// Kafka's name for a client that proved no identity, as `DescribeAcls` renders it.
     pub const ANONYMOUS: &'static str = "ANONYMOUS";
 
+    /// A principal whose grants are exactly the global flags `projection` describes, for tests
+    /// and tools that think in the projected flags.
+    #[must_use]
+    pub fn from_projection(
+        username: impl Into<String>,
+        projection: PrincipalPermissions,
+        permissions_known: bool,
+    ) -> Self {
+        let global = iggy::prelude::GlobalPermissions {
+            read_servers: projection.read_servers,
+            read_topics: projection.read_topics,
+            manage_topics: projection.manage_topics,
+            poll_messages: projection.poll_messages,
+            send_messages: projection.send_messages,
+            read_users: projection.read_users,
+            manage_users: projection.manage_users,
+            ..iggy::prelude::GlobalPermissions::default()
+        };
+        Self {
+            username: username.into(),
+            permissions: projection,
+            grants: Arc::new(Grants::global(global)),
+            permissions_known,
+        }
+    }
+
+    /// A principal holding `global` and no per-stream grant, as a user record with only global
+    /// permissions reads.
+    #[must_use]
+    pub fn with_global(
+        username: &str,
+        global: iggy::prelude::GlobalPermissions,
+        permissions_known: bool,
+    ) -> Self {
+        let permissions = Permissions {
+            global,
+            streams: None,
+        };
+        Self {
+            username: username.to_string(),
+            permissions: PrincipalPermissions::from(&permissions),
+            grants: Arc::new(Grants::from_iggy(&permissions)),
+            permissions_known,
+        }
+    }
+
     /// A connection that proved no identity on a gateway that authenticates somewhere: it holds
     /// nothing, and that is a real answer rather than a failed read. It is "authenticated" only in
     /// the sense that the connection's identity has been decided.
@@ -228,6 +280,7 @@ impl AuthenticatedPrincipal {
         Self {
             username: Self::ANONYMOUS.to_string(),
             permissions: PrincipalPermissions::default(),
+            grants: Arc::default(),
             permissions_known: true,
         }
     }
@@ -272,6 +325,49 @@ pub trait PrincipalResolver: Send + Sync + std::fmt::Debug {
     /// Returns [`AuthError::Rejected`] when no such active user exists and
     /// [`AuthError::Unavailable`] when Iggy cannot be asked.
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError>;
+
+    /// Names the per-stream and per-topic grants of a principal another path authenticated
+    /// (PLAIN logs in as the user, whose own session may not see the streams it is granted on).
+    /// The default leaves them unnamed, which denies what they would grant.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Unavailable`] when Iggy cannot be asked.
+    async fn name_grants(&self, grants: Grants) -> Result<Grants, AuthError> {
+        Ok(grants)
+    }
+}
+
+/// The names of the streams and topics `grants` refers to by id, read on `client`.
+///
+/// # Errors
+///
+/// The SDK's error when the streams or a stream's topics cannot be listed.
+pub async fn read_grant_names(client: &impl Client, grants: &Grants) -> Result<IdNames, IggyError> {
+    let mut names = IdNames::default();
+    let wanted = grants.unresolved();
+    if wanted.is_empty() {
+        return Ok(names);
+    }
+    for stream in client.get_streams().await? {
+        names
+            .streams
+            .insert(stream.id as usize, stream.name.clone());
+    }
+    for (stream_id, topic_ids) in wanted {
+        if topic_ids.is_empty() || !names.streams.contains_key(&stream_id) {
+            continue;
+        }
+        let id = Identifier::numeric(u32::try_from(stream_id).unwrap_or(u32::MAX))?;
+        for topic in client.get_topics(&id).await? {
+            if topic_ids.contains(&(topic.id as usize)) {
+                names
+                    .topics
+                    .insert((stream_id, topic.id as usize), topic.name.clone());
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Where SCRAM credentials are looked up. The bridge implements it over the credential log it
@@ -436,9 +532,10 @@ impl SaslAuthenticator for IggyAuthenticator {
             }
         }
 
-        outcome.map(|(permissions, read)| AuthenticatedPrincipal {
+        outcome.map(|(permissions, grants, read)| AuthenticatedPrincipal {
             username: credentials.username.clone(),
             permissions,
+            grants: Arc::new(grants),
             permissions_known: read == PermissionRead::Resolved,
         })
     }
@@ -494,13 +591,21 @@ pub(crate) async fn resolve_principal(
         debug!(username, "the certificate names an inactive Iggy user");
         return Err(AuthError::Rejected);
     }
+    let permissions = user.permissions.unwrap_or_default();
+    let mut grants = Grants::from_iggy(&permissions);
+    if grants.needs_names() {
+        match read_grant_names(client, &grants).await {
+            Ok(names) => grants = grants.resolve(&names),
+            Err(error) => {
+                warn!(%error, username, "could not name the principal's per-stream grants");
+                return Err(AuthError::Unavailable);
+            }
+        }
+    }
     Ok(AuthenticatedPrincipal {
         username: username.to_string(),
-        permissions: user
-            .permissions
-            .as_ref()
-            .map(PrincipalPermissions::from)
-            .unwrap_or_default(),
+        permissions: PrincipalPermissions::from(&permissions),
+        grants: Arc::new(grants),
         permissions_known: true,
     })
 }
@@ -522,13 +627,17 @@ enum PermissionRead {
 async fn fetch_permissions(
     client: &impl Client,
     username: &str,
-) -> Result<(PrincipalPermissions, PermissionRead), AuthError> {
+) -> Result<(PrincipalPermissions, Grants, PermissionRead), AuthError> {
     // Unreachable in practice: a username that reached a successful login is already inside
     // Identifier's own length bounds. Propagating rather than degrading is still the wrong shape
     // for this function, so it degrades like every other failure below.
     let Ok(identifier) = Identifier::named(username) else {
         warn!("authenticated, but the principal's name is not a valid Iggy identifier");
-        return Ok((PrincipalPermissions::default(), PermissionRead::Failed));
+        return Ok((
+            PrincipalPermissions::default(),
+            Grants::default(),
+            PermissionRead::Failed,
+        ));
     };
     // Deliberately not propagated as a failure. The credentials were already accepted by the login
     // above, so turning a stumble on this second round trip into a rejection would answer a correct
@@ -560,11 +669,10 @@ async fn fetch_permissions(
 
     // A record that resolved but carries no permissions is a real answer: the principal holds
     // nothing. Only a read that did not resolve is unknown.
+    let permissions = user.and_then(|user| user.permissions).unwrap_or_default();
     Ok((
-        user.and_then(|user| user.permissions)
-            .as_ref()
-            .map(PrincipalPermissions::from)
-            .unwrap_or_default(),
+        PrincipalPermissions::from(&permissions),
+        Grants::from_iggy(&permissions),
         read,
     ))
 }
