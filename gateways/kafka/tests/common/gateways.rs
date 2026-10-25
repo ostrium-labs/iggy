@@ -38,6 +38,13 @@ use crate::iggy_server::TestServer;
 /// Short timings, so a test sees joins and expiries in seconds.
 pub const HEARTBEAT: Duration = Duration::from_millis(200);
 pub const LEASE: Duration = Duration::from_millis(1500);
+/// How long a gateway announces itself before it owns groups and leads partitions.
+pub const JOIN_DELAY: Duration = MembershipConfig {
+    node_id: 0,
+    heartbeat_interval: HEARTBEAT,
+    lease: LEASE,
+}
+.join_delay();
 
 pub struct Gateway {
     pub node_id: i32,
