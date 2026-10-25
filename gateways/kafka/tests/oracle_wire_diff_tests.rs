@@ -290,7 +290,7 @@ async fn await_topic(client: &mut WireClient, name: &str) -> Result<(), String> 
                 .iter()
                 .all(|(error, leader)| *error == 0 && *leader >= 0)
         {
-            return Ok(());
+            return client.await_leaders(name, PARTITIONS).await;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
