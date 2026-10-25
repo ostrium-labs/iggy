@@ -80,3 +80,37 @@ fn generate_accepts_repeated_api_key_flags() {
         output.0.display()
     );
 }
+
+#[test]
+fn generate_above_max_writes_the_next_version_with_the_newest_body() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let output = TempOutputDir(std::env::temp_dir().join(format!("kafka-gen-above-{nanos}")));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_kafka-message-gen"))
+        .arg("generate")
+        .arg("--output")
+        .arg(&output.0)
+        .arg("--api-key")
+        .arg("0")
+        .arg("--above-max")
+        .status()
+        .expect("run kafka-message-gen generate --above-max");
+    assert!(status.success(), "generate --above-max: {status:?}");
+
+    // Produce's newest schema version is 13: v14 is the next one, and it carries v13's body.
+    let newest = std::fs::read(output.0.join("000_Produce_v13.bin")).expect("v13 written");
+    let above = std::fs::read(output.0.join("000_Produce_v14.bin")).expect("v14 written");
+    assert_eq!(
+        i16::from_be_bytes([above[6], above[7]]),
+        14,
+        "header version"
+    );
+    // Same length and bytes, apart from the header version and the correlation id.
+    assert_eq!(newest.len(), above.len());
+    assert_eq!(newest[..6], above[..6]);
+    assert_eq!(newest[12..], above[12..]);
+    assert!(!has_file_with_prefix(&output.0, "000_Produce_v15"));
+}

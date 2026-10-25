@@ -83,6 +83,11 @@ enum Command {
         /// Print hex dump to stdout
         #[arg(long)]
         hex: bool,
+        /// Also write each key's first version past its newest schema version, as a client
+        /// newer than these schemas sends it: the newest body under the next version number.
+        /// For version-firewall tests that need a readable request above a server's maximum.
+        #[arg(long)]
+        above_max: bool,
     },
     /// Send messages to a live Kafka-compatible server and show responses
     Send {
@@ -661,6 +666,27 @@ fn build_framed(api_key: i16, version: i16, corr: i32) -> Result<Bytes> {
     ))
 }
 
+/// A request at `version`, past the newest one these schemas know (`newest`): the `newest` body
+/// under the `version` header, which is what a client built against a later schema sends when
+/// it adds only optional or tagged fields. No schema describes the result; it exists so a
+/// server's version firewall can be tested with a body it could otherwise read.
+fn build_framed_above_max(api_key: i16, newest: i16, version: i16, corr: i32) -> Result<Bytes> {
+    let payload = build_payload(api_key, newest)?;
+    let api =
+        ApiKey::try_from(api_key).map_err(|()| anyhow::anyhow!("unknown api_key={api_key}"))?;
+    // The header version of the newest known version: header versions only ever move to the
+    // flexible v2 and stay there.
+    let flexible = api.request_header_version(newest) >= 2;
+    Ok(frame_request(
+        api_key,
+        version,
+        corr,
+        "kafka-message-gen",
+        &payload,
+        flexible,
+    ))
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 fn cmd_list() {
@@ -696,6 +722,7 @@ async fn cmd_generate(
     filter_keys: Vec<i16>,
     fv: Option<i16>,
     hex_dump: bool,
+    above_max: bool,
 ) -> Result<()> {
     tokio::fs::create_dir_all(&out).await?;
     let (mut n, mut corr) = (0usize, 1i32);
@@ -708,11 +735,17 @@ async fn cmd_generate(
         if !filter_keys.is_empty() && !filter_keys.contains(&ak) {
             continue;
         }
-        for v in min..=max {
+        let last = if above_max { max + 1 } else { max };
+        for v in min..=last {
             if fv.is_some_and(|fv| fv != v) {
                 continue;
             }
-            match build_framed(ak, v, corr) {
+            let built = if v > max {
+                build_framed_above_max(ak, max, v, corr)
+            } else {
+                build_framed(ak, v, corr)
+            };
+            match built {
                 Ok(msg) => {
                     let fname = format!("{:03}_{}_v{}.bin", ak, name, v);
                     tokio::fs::write(out.join(&fname), &msg).await?;
@@ -906,7 +939,8 @@ async fn main() -> Result<()> {
             api_key,
             version,
             hex,
-        } => cmd_generate(output, api_key, version, hex).await?,
+            above_max,
+        } => cmd_generate(output, api_key, version, hex, above_max).await?,
         Command::Send {
             host,
             api_key,

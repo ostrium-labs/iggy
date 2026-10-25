@@ -1252,8 +1252,9 @@ async fn given_a_pre_auth_request_above_the_firewall_should_close_rather_than_an
     let addr = spawn_sasl_gateway().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    // Fetch v13: inside the crate's encoder range, outside this gateway's.
-    let frame = build_request_frame(1, 13, 1, Some("sasl-test"), &[]);
+    // FindCoordinator v5: inside the crate's encoder range (0-6), outside this gateway's (0-4).
+    // KW-8 raised Fetch to the crate's own maximum, so a Fetch version can no longer be both.
+    let frame = build_request_frame(10, 5, 1, Some("sasl-test"), &[]);
     stream.write_all(&frame).await.expect("write request");
     assert_closed(&mut stream).await;
 }

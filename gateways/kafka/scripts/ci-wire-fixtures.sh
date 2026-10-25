@@ -39,8 +39,11 @@ generate() {
   for key in "${FIXTURE_API_KEYS[@]}"; do
     api_key_args+=(--api-key "$key")
   done
+  # --above-max: the version firewall tests send each key at the gateway's max + 1, and for
+  # Produce and Fetch that is past the newest schema version, so only this writes it.
   cargo run --locked -p kafka-message-gen -- generate \
     --output "$FIXTURES_DIR" \
+    --above-max \
     "${api_key_args[@]}"
   echo "Generated wire fixtures under ${FIXTURES_DIR}/"
 }
