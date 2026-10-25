@@ -212,7 +212,7 @@ breadth. Status is `Planned` unless noted.
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | **Built** (fork PR #10; full suite and oracle green in local CI; see As built) | KW-1 | Yes |
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (fork PR #12; auth oracle and real-client e2e green in local CI; see "As built") | KW-1 | Yes |
-| KW-10 | Per-principal authorization, ACL admin | #4518 | Planned (design notes below; not started) | KW-9 | Yes (design first) |
+| KW-10 | Per-principal authorization, ACL admin | #4518 | **Built, in review** (fork PR for parts 1-4: enforcement, group namespace, DescribeAcls of scoped grants); ACL writes (CreateAcls/DeleteAcls) next | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
 | KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Started** (branch `kw12-limits`, not built or tested) | KW-0 | Yes |
 | KW-13 | KIP-848 consumer groups | #4523 | **Started, not wired** (branch `kw13-kip848-draft`) | KW-8 | Yes |
@@ -841,6 +841,20 @@ grants by id). Quotas (48, 49) stay on request.
 rule: group ids are scoped per principal, so a principal sees, joins and deletes only the groups in
 its own namespace. One tenant can no longer disrupt another's group membership, which closes the
 open question above.
+
+**As built (2026-10-26, parts 1-4).** `src/authz.rs`: `Grants` holds every Iggy grant of the
+principal with stream and topic ids named by the bridge at authentication (PLAIN through the bridge
+after the login), checked with Iggy's own rules (`get_topic`, `poll_messages`, `append_messages`,
+`create_topic`, `manage_topic`). Enforcement per topic in Produce, Fetch, ListOffsets, Metadata
+(all-topics filtered, named/identified 29), CreateTopics and auto-creation, DeleteTopics,
+DeleteRecords, CreatePartitions, (Incremental)AlterConfigs, DescribeConfigs (broker: 31 without
+`read_servers`), OffsetCommit/Fetch/Delete; InitProducerId needs WRITE somewhere (31).
+`protocol/handlers/group_scope.rs` scopes every group API to `<len>:<principal>/<group>` and
+rewrites answers back; group access = any topic read grant (else 30). DescribeAcls renders per-stream
+and per-topic grants on their Kafka topics (`TopicMapping::kafka_topic_of`). Tests: `authz` unit
+rules, scoped rendering, `authz_real_bridge_tests.rs` (per-topic and per-stream grants, group
+isolation). Left: CreateAcls/DeleteAcls (Kafka bindings onto Iggy grants, exact cases only), grant
+refresh on this gateway's own ACL writes, an ACL oracle vs Kafka's StandardAuthorizer.
 
 ### KW-11. Repeated header names and header order
 

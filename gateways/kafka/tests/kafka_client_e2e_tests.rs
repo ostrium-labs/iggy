@@ -1055,9 +1055,9 @@ async fn given_distinct_principals_when_listing_acls_should_describe_each_differ
         "poll_messages must still render a topic read, got: {poller}"
     );
     assert!(
-        !poller.contains("resourceType=GROUP"),
-        "polling alone grants no topic read, so Iggy would refuse this principal a consumer \
-         group; rendering one over-reports, got: {poller}"
+        grants(&poller, "GROUP", "READ"),
+        "group access follows any topic read access since KW-10, polling included: a poller \
+         commits offsets to its own groups, got: {poller}"
     );
 
     let producer = list_acls(gateway, "producer-only", USER_PASSWORD);
