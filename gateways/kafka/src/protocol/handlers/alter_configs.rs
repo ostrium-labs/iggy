@@ -307,13 +307,19 @@ mod tests {
 
     #[test]
     fn no_principal_is_not_gated() {
-        assert!(authorize(None, None, &mut vec![resource("orders")]).is_empty());
+        assert_eq!(
+            authorize(None, None, &mut vec![resource("orders")]),
+            Vec::new()
+        );
     }
 
     #[test]
     fn a_principal_with_manage_topics_is_allowed() {
         let principal = principal(true, true);
-        assert!(authorize(None, Some(&principal), &mut vec![resource("orders")]).is_empty());
+        assert_eq!(
+            authorize(None, Some(&principal), &mut vec![resource("orders")]),
+            Vec::new()
+        );
     }
 
     #[test]

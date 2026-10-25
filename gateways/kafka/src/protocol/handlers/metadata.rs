@@ -102,41 +102,9 @@ pub async fn handle(
     let per_partition_bytes = template_partition_bytes(api_version);
 
     let results = match requested {
-        None => match tokio::time::timeout(REQUEST_DEADLINE, bridge.list_kafka_topics()).await {
-            Ok(Ok(topics)) => {
-                // Kafka leaves out of an all-topics answer every topic the principal may not
-                // describe, rather than naming it with an error.
-                let results: Vec<TopicResult> = topics
-                    .into_iter()
-                    .filter(|topic| {
-                        may_topic(state, principal, &topic.kafka_topic, TopicOp::Describe)
-                    })
-                    .map(found_result)
-                    .collect();
-                truncate_all_topics_to_frame_budget(
-                    results,
-                    state.max_frame_size,
-                    per_partition_bytes,
-                )
-            }
-            Ok(Err(error)) => {
-                // Same "no top-level error field" constraint as a decode failure: there is no
-                // way to answer "the bridge itself is unreachable" for an all-topics request
-                // that doesn't also falsely claim zero topics exist.
-                tracing::warn!(%error, "Failed to list Kafka topics from the Iggy bridge; closing connection");
-                return HandleOutcome::Close;
-            }
-            Err(_elapsed) => {
-                // No per-name cap to answer against here (this is the server-driven all-topics
-                // path), so there is no honest per-topic RETRIABLE list to send back either -
-                // same close as an unreachable bridge, not a different case.
-                tracing::warn!(
-                    deadline_secs = REQUEST_DEADLINE.as_secs(),
-                    "Listing Kafka topics from the Iggy bridge exceeded its deadline; closing \
-                     connection"
-                );
-                return HandleOutcome::Close;
-            }
+        None => match all_topics(state, principal, bridge, per_partition_bytes).await {
+            Some(results) => results,
+            None => return HandleOutcome::Close,
         },
         Some(Requested::Names(names)) => {
             let mut results = resolve_requested_named_topics(bridge, &names).await;
@@ -343,6 +311,50 @@ async fn resolve_requested_topic_ids(
             }
         })
         .collect()
+}
+
+/// Every topic the principal may describe, cut to the frame budget, or `None` when the bridge
+/// could not list them, which closes the connection.
+async fn all_topics(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    bridge: &Arc<IggyBridge>,
+    per_partition_bytes: usize,
+) -> Option<Vec<TopicResult>> {
+    match tokio::time::timeout(REQUEST_DEADLINE, bridge.list_kafka_topics()).await {
+        Ok(Ok(topics)) => {
+            // Kafka leaves out of an all-topics answer every topic the principal may not
+            // describe, rather than naming it with an error.
+            let results: Vec<TopicResult> = topics
+                .into_iter()
+                .filter(|topic| may_topic(state, principal, &topic.kafka_topic, TopicOp::Describe))
+                .map(found_result)
+                .collect();
+            Some(truncate_all_topics_to_frame_budget(
+                results,
+                state.max_frame_size,
+                per_partition_bytes,
+            ))
+        }
+        Ok(Err(error)) => {
+            // Same "no top-level error field" constraint as a decode failure: there is no
+            // way to answer "the bridge itself is unreachable" for an all-topics request
+            // that doesn't also falsely claim zero topics exist.
+            tracing::warn!(%error, "Failed to list Kafka topics from the Iggy bridge; closing connection");
+            None
+        }
+        Err(_elapsed) => {
+            // No per-name cap to answer against here (this is the server-driven all-topics
+            // path), so there is no honest per-topic RETRIABLE list to send back either -
+            // same close as an unreachable bridge, not a different case.
+            tracing::warn!(
+                deadline_secs = REQUEST_DEADLINE.as_secs(),
+                "Listing Kafka topics from the Iggy bridge exceeded its deadline; closing \
+                     connection"
+            );
+            None
+        }
+    }
 }
 
 /// Records the id of every topic a Metadata answer reports, so later requests may name it by id.

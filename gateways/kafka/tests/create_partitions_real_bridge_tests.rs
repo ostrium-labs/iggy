@@ -189,7 +189,7 @@ fn principal(manage_topics: bool) -> AuthenticatedPrincipal {
     AuthenticatedPrincipal::with_global(
         "alice",
         iggy::prelude::GlobalPermissions {
-            manage_topics: manage_topics,
+            manage_topics,
             ..iggy::prelude::GlobalPermissions::default()
         },
         true,

@@ -51,7 +51,8 @@ pub enum TopicOp {
     Create,
 }
 
-/// One stream's grants, with its topics' grants by topic name.
+/// One stream's grants, with its topics' grants by topic name. The flags are Iggy's own.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamGrants {
     pub manage_stream: bool,
@@ -63,7 +64,8 @@ pub struct StreamGrants {
     pub topics: HashMap<String, TopicGrants>,
 }
 
-/// One topic's grants.
+/// One topic's grants. The flags are Iggy's own.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TopicGrants {
     pub manage_topic: bool,
@@ -386,12 +388,6 @@ impl GroupScope {
     pub fn unscope<'a>(&self, scoped: &'a str) -> Option<&'a str> {
         scoped.strip_prefix(self.prefix.as_str())
     }
-
-    /// Bytes a scoped id adds to the group id a client names.
-    #[must_use]
-    pub fn overhead(&self) -> usize {
-        self.prefix.len()
-    }
 }
 
 #[cfg(test)]
@@ -450,10 +446,7 @@ mod tests {
         ] {
             assert!(manage.allows(op, "any", "topic"), "{op:?}");
         }
-        assert!(
-            Grants::global(GlobalPermissions::default()).allows(TopicOp::Describe, "s", "t")
-                == false
-        );
+        assert!(!Grants::global(GlobalPermissions::default()).allows(TopicOp::Describe, "s", "t"));
     }
 
     #[test]

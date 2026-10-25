@@ -201,7 +201,7 @@ async fn incremental_alter_configs_requires_manage_topics_before_the_stub() {
         AuthenticatedPrincipal::with_global(
             "alice",
             iggy::prelude::GlobalPermissions {
-                manage_topics: manage_topics,
+                manage_topics,
                 ..iggy::prelude::GlobalPermissions::default()
             },
             true,
