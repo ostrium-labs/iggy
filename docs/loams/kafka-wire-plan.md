@@ -209,7 +209,7 @@ breadth. Status is `Planned` unless noted.
 | KW-6 | Log compaction | #4521 | Planned; design note drafted (`docs/loams/compaction-design.md`, PR #13), nothing built | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | Planned | KW-1 | Yes |
-| KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (PR for lane F; see "As built") | KW-1 | Yes |
+| KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (fork PR #12; auth oracle and real-client e2e green in local CI; see "As built") | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned (design notes below; not started) | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
 | KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Started** (branch `kw12-limits`, not built or tested) | KW-0 | Yes |
@@ -723,8 +723,18 @@ ES256 / EdDSA test issuer (`oauth_validator_tests.rs`: expired, foreign issuer, 
 (`sasl_clients_e2e_tests.rs`: Java 3.9 tools incl. `kafka-configs` SCRAM admin and OAUTHBEARER via
 the token endpoint, kcat 1.7 SCRAM, confluent-kafka-python 2.16 with all mechanisms and a
 re-authentication run), and the oracle (`oracle_auth_diff_tests.rs`, Apache Kafka 4.3.1 with the
-same four mechanisms and Kafka's JWKS validator). Expected declared differences: the unknown-user
-SCRAM timing and the gateway's `manage_users` gate on Alter (Kafka runs without an authorizer).
+same four mechanisms and Kafka's JWKS validator). Declared differences
+(`tests/oracle/auth_allowed_differences.toml`): a user with no SCRAM credential fails at the proof
+rather than the first message, under both mechanisms, and the gateway's `manage_users` gate on
+Alter (Kafka runs without an authorizer).
+
+Local CI fixes (2026-10-25): SCRAM and OAUTHBEARER no longer read or feed the PLAIN failed-login
+throttle (it closed every login after a rejected one, which the oracle saw as SCRAM-SHA-512
+failing outright and bad tokens closing instead of getting `invalid_token` and 58; Kafka does not
+throttle them, and they cost Iggy nothing); a SCRAM final nonce only has to end with the agreed
+one, as in Kafka (kcat 1.7 sends its nonce twice); `DescribeClientQuotas` (48) answers "no
+quotas" with the SCRAM admin keys, which `kafka-configs --describe --entity-type users` needs;
+the e2e sets each SCRAM mechanism in its own `kafka-configs` call (92 otherwise, in Kafka too).
 Not done: franz-go (waits for the KW-2 matrix harness), Redpanda as an auth oracle (needs an OIDC
 discovery document), GSSAPI and delegation tokens (on request).
 
