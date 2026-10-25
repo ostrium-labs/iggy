@@ -208,7 +208,7 @@ breadth. Status is `Planned` unless noted.
 | KW-5 | Several gateways behind one bootstrap | #4515 | Planned | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned; design note drafted (`docs/loams/compaction-design.md`, PR #13), nothing built | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
-| KW-8 | Newer protocol versions and topic ids | #4527 | **Built, in review** (see As built) | KW-1 | Yes |
+| KW-8 | Newer protocol versions and topic ids | #4527 | **Built** (fork PR #10; full suite and oracle green in local CI; see As built) | KW-1 | Yes |
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (fork PR #12; auth oracle and real-client e2e green in local CI; see "As built") | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned (design notes below; not started) | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
@@ -671,9 +671,12 @@ Produce 3-13 (by id at v13), ListOffsets 1-10 (-4 EARLIEST_LOCAL as EARLIEST, -5
 answers -1), CreateTopics 2-7 (id in the answer), DeleteTopics 1-6 (by name or id), ApiVersions
 0-4. Tests: unit tests for the derivation and registry, real-bridge tests per API at the new
 versions, the version-firewall matrix moved to the new maxima, and a `topic_ids` oracle scenario
-against Apache Kafka 4.3.1. Status at hand-off: lint (`clippy -D warnings`) green locally; the full
-suite and the oracle diff run in fork CI on the PR (the shared machine's build queue did not let
-the local run finish). Left: OffsetCommit and OffsetFetch v10 and ListOffsets v11 wait for a
+against Apache Kafka 4.3.1. Local CI (2026-10-25) found three tests still on the old maxima: the
+ApiVersions v1/v3 golden bytes (updated), the above-max firewall matrix, which needs Produce v14 and
+Fetch v19 fixtures past the newest schema versions (`kafka-message-gen generate --above-max` now
+writes each key's next version as a newer client sends it, the newest body under the next version
+number, and `ci-wire-fixtures.sh` passes it), and the SASL pre-auth probe above the firewall, which
+used Fetch v13 and now uses FindCoordinator v5 (encoded by the crate, not served). Left: OffsetCommit and OffsetFetch v10 and ListOffsets v11 wait for a
 `kafka-protocol` release that has their schemas (0.18 stops at 9, 9 and 10); `@platformatic/kafka`
 and Sarama nightly checks belong to KW-2's matrix; FindCoordinator v5-6 not advertised.
 
