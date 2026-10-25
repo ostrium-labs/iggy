@@ -672,10 +672,11 @@ answers -1), CreateTopics 2-7 (id in the answer), DeleteTopics 1-6 (by name or i
 0-4. Tests: unit tests for the derivation and registry, real-bridge tests per API at the new
 versions, the version-firewall matrix moved to the new maxima, and a `topic_ids` oracle scenario
 against Apache Kafka 4.3.1. Local CI (2026-10-25) found three tests still on the old maxima: the
-ApiVersions v1/v3 golden bytes (updated), the above-max firewall matrix, which needs Produce v14 and
-Fetch v19 fixtures past the newest schema versions (`kafka-message-gen generate --above-max` now
-writes each key's next version as a newer client sends it, the newest body under the next version
-number, and `ci-wire-fixtures.sh` passes it), and the SASL pre-auth probe above the firewall, which
+ApiVersions v1/v3 golden bytes (updated), the above-max firewall matrix, which needs Produce v14,
+Fetch v19 and ListOffsets v11 fixtures past what the generator could build (the schemas stop at 13
+and 18; `kafka-protocol` encodes ListOffsets only to 10), so `kafka-message-gen generate
+--above-max` now writes, per key, the version after the newest one that builds, as a newer client
+sends it (the newest body under the next version number), and `ci-wire-fixtures.sh` passes it, and the SASL pre-auth probe above the firewall, which
 used Fetch v13 and now uses FindCoordinator v5 (encoded by the crate, not served). Left: OffsetCommit and OffsetFetch v10 and ListOffsets v11 wait for a
 `kafka-protocol` release that has their schemas (0.18 stops at 9, 9 and 10); `@platformatic/kafka`
 and Sarama nightly checks belong to KW-2's matrix; FindCoordinator v5-6 not advertised.

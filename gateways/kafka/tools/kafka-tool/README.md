@@ -103,7 +103,7 @@ kafka_messages/
 | `--api-key N` | Generate only for API key N | all |
 | `--version N` | Generate only for version N | all |
 | `--hex` | Print hex dump to stdout | off |
-| `--above-max` | Also write each key's first version past its newest schema version (the newest body under the next version number), for version-firewall tests | off |
+| `--above-max` | Also write, per key, the version after the newest one that builds (the newest body under the next version number), for version-firewall tests | off |
 
 ```bash
 # Generate only Metadata messages

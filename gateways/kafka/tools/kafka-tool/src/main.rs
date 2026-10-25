@@ -83,9 +83,10 @@ enum Command {
         /// Print hex dump to stdout
         #[arg(long)]
         hex: bool,
-        /// Also write each key's first version past its newest schema version, as a client
-        /// newer than these schemas sends it: the newest body under the next version number.
-        /// For version-firewall tests that need a readable request above a server's maximum.
+        /// Also write, for each key, the version after the newest one that builds (past the
+        /// schema's maximum, or past what `kafka-protocol` can encode), as a newer client sends
+        /// it: the newest body under the next version number. For version-firewall tests that
+        /// need a readable request above a server's maximum.
         #[arg(long)]
         above_max: bool,
     },
@@ -666,7 +667,7 @@ fn build_framed(api_key: i16, version: i16, corr: i32) -> Result<Bytes> {
     ))
 }
 
-/// A request at `version`, past the newest one these schemas know (`newest`): the `newest` body
+/// A request at `version`, past the newest one that builds (`newest`): the `newest` body
 /// under the `version` header, which is what a client built against a later schema sends when
 /// it adds only optional or tagged fields. No schema describes the result; it exists so a
 /// server's version firewall can be tested with a body it could otherwise read.
@@ -735,15 +736,24 @@ async fn cmd_generate(
         if !filter_keys.is_empty() && !filter_keys.contains(&ak) {
             continue;
         }
-        let last = if above_max { max + 1 } else { max };
-        for v in min..=last {
+        // The version after the newest one that builds: past the schema's maximum, or past the
+        // newest version `kafka-protocol` can encode when that is lower.
+        let above = above_max
+            .then(|| (min..=max).rev().find(|&v| build_payload(ak, v).is_ok()))
+            .flatten()
+            .map(|newest| (newest, newest + 1));
+        let versions = (min..=max).map(|v| (v, None)).chain(
+            above
+                .into_iter()
+                .map(|(newest, version)| (version, Some(newest))),
+        );
+        for (v, body_version) in versions {
             if fv.is_some_and(|fv| fv != v) {
                 continue;
             }
-            let built = if v > max {
-                build_framed_above_max(ak, max, v, corr)
-            } else {
-                build_framed(ak, v, corr)
+            let built = match body_version {
+                Some(newest) => build_framed_above_max(ak, newest, v, corr),
+                None => build_framed(ak, v, corr),
             };
             match built {
                 Ok(msg) => {
