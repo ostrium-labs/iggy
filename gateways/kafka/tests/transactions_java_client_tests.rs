@@ -112,9 +112,7 @@ async fn given_the_java_producer_when_it_commits_aborts_and_is_fenced_should_see
     let uncommitted = "[a1, a2, c1, c2, c3, c4, c5]";
     assert_eq!(java::line(&ours, "fenced"), Some("ProducerFencedException"));
     assert_eq!(java::line(&ours, "read_uncommitted"), Some(uncommitted));
-    // KW-T step 1 does not serve read_committed yet: the gateway shows the aborted records too.
-    // Step 2 (last stable offset and aborted transactions in Fetch) turns this into `committed`.
-    assert_eq!(java::line(&ours, "read_committed"), Some(uncommitted));
+    assert_eq!(java::line(&ours, "read_committed"), Some(committed));
 
     match KafkaOracle::start().await {
         Ok(kafka) => {
@@ -125,7 +123,7 @@ async fn given_the_java_producer_when_it_commits_aborts_and_is_fenced_should_see
             })
             .await
             .expect("the probe ran");
-            for key in ["fenced", "read_uncommitted"] {
+            for key in ["fenced", "read_uncommitted", "read_committed"] {
                 assert_eq!(
                     java::line(&ours, key),
                     java::line(&theirs, key),

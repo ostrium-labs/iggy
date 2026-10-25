@@ -286,7 +286,7 @@ rather than having its records stored as if they were ordinary ones. None of tho
 connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
 In the Ostrium fork, `IGGY_KAFKA_TRANSACTIONS_ENABLED=true` turns on a transaction coordinator
-instead (KW-T, in steps; `read_committed` is not served yet). `docs/TRANSACTIONS.md` has what is
+instead (KW-T, in steps; `read_committed` is served, consume-transform-produce is not yet). `docs/TRANSACTIONS.md` has what is
 built and what is not.
 
 ## Consumer groups ([#3544](https://github.com/apache/iggy/issues/3544))
