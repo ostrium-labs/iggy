@@ -71,6 +71,8 @@ const ADMIN: (&str, &str) = ("admin", "admin-secret");
 const ALICE: (&str, &str) = ("alice", "alice-secret");
 /// A user who exists on both sides but is given no SCRAM credential.
 const BOB: &str = "bob";
+/// A name only the unprivileged `AlterUserScramCredentials` targets.
+const CAROL: &str = "carol";
 
 fn skip(reason: &str) {
     assert!(
@@ -414,13 +416,15 @@ async fn scram_admin(address: &str, facts: &mut Facts) -> Result<(), String> {
     facts.set("describe_all.users", everyone.join(","));
 
     // A principal without the cluster grants. Kafka here has no authorizer, so it lets alice
-    // alter; the gateway checks Iggy's manage_users. Declared, not hidden.
+    // alter; the gateway checks Iggy's manage_users. Declared, not hidden. The target is a user
+    // no other scenario reads: were it bob, Kafka would give him the credential the gateway
+    // refused, and `scram_login`'s `no_credential` case would differ only because of this one.
     let mut alice = WireClient::connect(address).await?;
     let login = scram(&mut alice, Scram::Sha256, ALICE.0, ALICE.1).await?;
     if login.last == "0" {
         let response = alice
             .send(
-                &alter_request(vec![upsertion(BOB, Scram::Sha256, "bob-secret", 4096)]),
+                &alter_request(vec![upsertion(CAROL, Scram::Sha256, "carol-secret", 4096)]),
                 0,
             )
             .await?;

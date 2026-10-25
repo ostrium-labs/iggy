@@ -344,29 +344,30 @@ fn root_admin(stack: &Stack) -> tempfile::TempDir {
     java_properties(stack, "PLAIN", ROOT.0, ROOT.1)
 }
 
-/// Sets alice's SCRAM credentials with `kafka-configs.sh`, as root over PLAIN.
+/// Sets alice's SCRAM credentials with `kafka-configs.sh`, as root over PLAIN: one call per
+/// mechanism, since Kafka (and the gateway) refuse a user altered twice in one request with
+/// `DUPLICATE_RESOURCE` (92).
 fn provision_scram(stack: &Stack) {
     let admin = root_admin(stack);
-    java(
-        stack,
-        &admin,
-        "/opt/kafka/bin/kafka-configs.sh",
-        &[
-            "--command-config",
-            "/cfg/client.properties",
-            "--alter",
-            "--add-config",
-            &format!(
-                "SCRAM-SHA-256=[iterations=4096,password={}],SCRAM-SHA-512=[iterations=8192,password={}]",
-                ALICE.1, ALICE.1
-            ),
-            "--entity-type",
-            "users",
-            "--entity-name",
-            ALICE.0,
-        ],
-    )
-    .expect_ok("kafka-configs --alter SCRAM credentials");
+    for (mechanism, iterations) in [("SCRAM-SHA-256", 4096), ("SCRAM-SHA-512", 8192)] {
+        java(
+            stack,
+            &admin,
+            "/opt/kafka/bin/kafka-configs.sh",
+            &[
+                "--command-config",
+                "/cfg/client.properties",
+                "--alter",
+                "--add-config",
+                &format!("{mechanism}=[iterations={iterations},password={}]", ALICE.1),
+                "--entity-type",
+                "users",
+                "--entity-name",
+                ALICE.0,
+            ],
+        )
+        .expect_ok(&format!("kafka-configs --alter {mechanism} credential"));
+    }
 }
 
 fn kcat(stack: &Stack, mechanism: &str, password: &str, mode: &[&str]) -> Run {
@@ -417,8 +418,12 @@ fn python_deps() -> PathBuf {
         "-e",
         "HOME=/tmp",
     ]);
-    // Owned by the invoking user, so the cache can be deleted without root.
-    if let (Some(uid), Some(gid)) = (id_of("-u"), id_of("-g")) {
+    // Owned by the invoking user, so the cache can be deleted without root. Under rootless Podman
+    // the container's root already is the invoking user, and `--user` would map to a subordinate
+    // id that cannot write the mounted directory (as `common/matrix.rs` does it).
+    if !rootless_podman()
+        && let (Some(uid), Some(gid)) = (id_of("-u"), id_of("-g"))
+    {
         command.args(["--user", &format!("{uid}:{gid}")]);
     }
     let status = command
@@ -442,6 +447,13 @@ fn python_deps() -> PathBuf {
         "pip install confluent-kafka failed"
     );
     dir
+}
+
+fn rootless_podman() -> bool {
+    Command::new(container_cli())
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("podman"))
 }
 
 fn id_of(flag: &str) -> Option<String> {

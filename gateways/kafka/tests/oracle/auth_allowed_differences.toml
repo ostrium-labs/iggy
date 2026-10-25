@@ -18,3 +18,57 @@
 # Intended differences between the gateway's SASL mechanisms and Apache Kafka's, read by
 # oracle_auth_diff_tests.rs. Same rules as allowed_differences.toml: an undeclared difference
 # fails, and so does an entry that no longer occurs.
+
+[[difference]]
+scenario = "scram_admin"
+fact = "unprivileged_alter.carol.error"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md Administration: altering SCRAM credentials needs Iggy's manage_users (Kafka's ALTER on the cluster), else 31; the oracle Kafka runs without an authorizer, so it lets any principal alter"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-256.unknown_user.first"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: a name with no Iggy user is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); the client-first message is answered (0) with a decoy salt instead of 58"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-256.unknown_user.last"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: a name with no Iggy user is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); so it fails at the proof (58) where Kafka never got that far (-)"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-256.no_credential.first"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: an Iggy user with no credential for the mechanism is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); the client-first message is answered (0) with a decoy salt instead of 58"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-256.no_credential.last"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: an Iggy user with no credential for the mechanism is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); so it fails at the proof (58) where Kafka never got that far (-)"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-512.unknown_user.first"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: a name with no Iggy user is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); the client-first message is answered (0) with a decoy salt instead of 58"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-512.unknown_user.last"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: a name with no Iggy user is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); so it fails at the proof (58) where Kafka never got that far (-)"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-512.no_credential.first"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: an Iggy user with no credential for the mechanism is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); the client-first message is answered (0) with a decoy salt instead of 58"
+
+[[difference]]
+scenario = "scram_login"
+fact = "SCRAM-SHA-512.no_credential.last"
+issue = "apache/iggy#4512"
+reason = "AUTHENTICATION.md The exchange: an Iggy user with no credential for the mechanism is not refused at the first message, to avoid a user-enumeration oracle (RFC 5802 section 9); so it fails at the proof (58) where Kafka never got that far (-)"
