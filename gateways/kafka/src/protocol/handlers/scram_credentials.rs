@@ -39,7 +39,8 @@ use kafka_protocol::messages::describe_user_scram_credentials_response::{
 };
 use kafka_protocol::messages::{
     AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse,
-    DescribeUserScramCredentialsRequest, DescribeUserScramCredentialsResponse,
+    DescribeClientQuotasRequest, DescribeClientQuotasResponse, DescribeUserScramCredentialsRequest,
+    DescribeUserScramCredentialsResponse,
 };
 use kafka_protocol::protocol::StrBytes;
 use tracing::{debug, warn};
@@ -81,6 +82,40 @@ fn may_alter(principal: Option<&AuthenticatedPrincipal>) -> bool {
 
 fn text(value: &str) -> StrBytes {
     StrBytes::from_string(value.to_string())
+}
+
+/// The `DescribeClientQuotas` versions served, v1 being the flexible one.
+const CLIENT_QUOTAS_MAX_VERSION: i16 = 1;
+
+/// Answers `DescribeClientQuotas` (48): no entity has a quota, since the gateway enforces none.
+/// Served with the SCRAM keys, for `kafka-configs --describe --entity-type users`, and gated as
+/// Kafka gates it, on describing the cluster (here Iggy's `read_users`).
+#[must_use]
+pub fn describe_client_quotas(
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
+    if !(0..=CLIENT_QUOTAS_MAX_VERSION).contains(&api_version) || body.len() > MAX_BODY_BYTES {
+        return HandleOutcome::Close;
+    }
+    if decode_exhaustive::<DescribeClientQuotasRequest>(api_version, body).is_err() {
+        debug!("malformed DescribeClientQuotas request");
+        return HandleOutcome::Close;
+    }
+    let response = if may_describe(principal) {
+        DescribeClientQuotasResponse::default().with_entries(Some(Vec::new()))
+    } else {
+        DescribeClientQuotasResponse::default()
+            .with_error_code(ERROR_CLUSTER_AUTHORIZATION_FAILED)
+            .with_error_message(Some(text(
+                "describing client quotas needs the Iggy read_users permission",
+            )))
+    };
+    respond_or_close(
+        encode_message(&response, api_version, 64),
+        "DescribeClientQuotas",
+    )
 }
 
 /// Answers `DescribeUserScramCredentials`.

@@ -46,7 +46,7 @@ use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{ListenerConfig, SecurityProtocol};
 use crate::oauth::{TokenError, TokenValidator};
 use crate::protocol::api::{
-    API_KEY_ALTER_USER_SCRAM_CREDENTIALS, API_KEY_DESCRIBE_ACLS,
+    API_KEY_ALTER_USER_SCRAM_CREDENTIALS, API_KEY_DESCRIBE_ACLS, API_KEY_DESCRIBE_CLIENT_QUOTAS,
     API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE,
     BrokerAdvertise, ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE,
     ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
@@ -1062,13 +1062,21 @@ async fn route_frame(
             if ctx.listener.scram_admin
                 && matches!(
                     req.request_api_key,
-                    API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS | API_KEY_ALTER_USER_SCRAM_CREDENTIALS
+                    API_KEY_DESCRIBE_CLIENT_QUOTAS
+                        | API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS
+                        | API_KEY_ALTER_USER_SCRAM_CREDENTIALS
                 ) =>
         {
             let Some(bridge) = ctx.state.bridge.as_deref() else {
                 return HandleOutcome::Close;
             };
-            if req.request_api_key == API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS {
+            if req.request_api_key == API_KEY_DESCRIBE_CLIENT_QUOTAS {
+                scram_credentials::describe_client_quotas(
+                    principal.as_ref(),
+                    req.request_api_version,
+                    body,
+                )
+            } else if req.request_api_key == API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS {
                 scram_credentials::describe(
                     bridge,
                     principal.as_ref(),

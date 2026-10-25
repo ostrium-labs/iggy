@@ -122,9 +122,21 @@ struct Run {
 
 impl Run {
     fn expect_ok(self, what: &str) -> String {
-        assert!(self.ok, "{what} failed:\n{}", self.text);
+        assert!(
+            self.ok,
+            "{what} failed:\n{}\nthe gateway's log ends with:\n{}",
+            self.text,
+            log_tail(60)
+        );
         self.text
     }
+}
+
+/// The last `lines` lines the gateway logged, for a failure message.
+fn log_tail(lines: usize) -> String {
+    let log = logged();
+    let all: Vec<&str> = log.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
 }
 
 /// Runs `image` with `args` on the host network, read-only `mounts` and `env`.
