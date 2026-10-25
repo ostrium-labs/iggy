@@ -654,16 +654,12 @@ impl KafkaGateway {
         };
         // The accept loops stop first, so no connection is spawned after the drain starts waiting.
         cancel.cancel();
-        // The goodbye goes out while the connections drain.
-        if let Some(heartbeats) = &heartbeats {
-            heartbeats.say_goodbye();
-        }
+        // The goodbye goes out while the connections drain, and is awaited so no heartbeat runs
+        // when the bridge signs out.
+        heartbeats.say_goodbye();
         accept_loops.shutdown().await;
         drain(&tracker, &cancel, drain_timeout).await;
-        // Awaited so no heartbeat runs when the bridge signs out.
-        if let Some(heartbeats) = heartbeats {
-            heartbeats.finish().await;
-        }
+        heartbeats.finish().await;
         // After the drain, so no connection starts one after it, and before `run` returns, so
         // none still runs when the bridge signs out.
         state
@@ -696,7 +692,7 @@ impl KafkaGateway {
         &self,
         bound: &[(Arc<Listener>, TcpListener)],
         cancel: &CancellationToken,
-    ) -> Result<(Arc<GatewayState>, Option<Heartbeats>)> {
+    ) -> Result<(Arc<GatewayState>, Heartbeats)> {
         let cluster_id = self.cluster_id().await?;
         let endpoints = bound
             .iter()
@@ -733,8 +729,10 @@ impl KafkaGateway {
 
     /// Announces this gateway and reads the others once, before any client is served, then keeps
     /// doing so in the background until [`Heartbeats::say_goodbye`], or until the handle drops.
-    async fn start_membership(&self, membership: &Arc<Membership>) -> Option<Heartbeats> {
-        let bridge = self.bridge.clone().filter(|_| membership.is_shared())?;
+    async fn start_membership(&self, membership: &Arc<Membership>) -> Heartbeats {
+        let Some(bridge) = self.bridge.clone().filter(|_| membership.is_shared()) else {
+            return Heartbeats::none();
+        };
         let registry: Arc<dyn Registry> = bridge;
         match membership.beat(registry.as_ref()).await {
             Ok(snapshot) => info!(
@@ -752,10 +750,10 @@ impl KafkaGateway {
         }
         let stop = CancellationToken::new();
         let task = tokio::spawn(Arc::clone(membership).run(registry, stop.clone()));
-        Some(Heartbeats {
+        Heartbeats {
             stop,
             task: Some(task),
-        })
+        }
     }
 
     /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
@@ -897,7 +895,7 @@ impl KafkaGateway {
     }
 }
 
-/// The membership heartbeat task of a running gateway.
+/// The membership heartbeat task of a running gateway, if it has one.
 ///
 /// Dropped without [`Self::finish`] (the `run` future abandoned, its task aborted), it stops the
 /// heartbeats without a goodbye, as a crash does, and the other gateways take this one's groups
@@ -910,6 +908,14 @@ struct Heartbeats {
 }
 
 impl Heartbeats {
+    /// A gateway that runs alone: nothing to stop.
+    fn none() -> Self {
+        Self {
+            stop: CancellationToken::new(),
+            task: None,
+        }
+    }
+
     /// Stops the heartbeats; the task says goodbye.
     fn say_goodbye(&self) {
         self.stop.cancel();
