@@ -287,8 +287,10 @@ against #3536.
 
 **Confluent Cloud oracle (2026-10-25).** Added as a third, report-only
 oracle ([`confluent-oracle.md`](confluent-oracle.md)). On the first runs it
-answered as Apache Kafka on 16 of the 17 declared differences, so those gaps
-are Kafka behaviour, not single-node artefacts. Where it differs from both
+answered as Apache Kafka on 16 of the 17 declared differences in the
+scenarios it runs, so those gaps are Kafka behaviour, not single-node
+artefacts. It skips `idempotent_restart`: a managed cluster's brokers cannot
+be restarted. Where it differs from both
 Kafka and the gateway: ListOffsets answers the requested timestamp in the
 `timestamp` field for EARLIEST, LATEST, MAX_TIMESTAMP and lookups before the
 first or after the last record (Kafka answers -1 or the found record's
