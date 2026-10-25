@@ -95,13 +95,105 @@ pub fn validate_end_txn_shape(version: i16, body: &Bytes) -> Result<()> {
     Ok(())
 }
 
+/// Mirrors the field order `AddOffsetsToTxnRequest::decode` walks. The response echoes nothing.
+///
+/// # Errors
+///
+/// Returns an error when a declared string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_add_offsets_to_txn_shape(version: i16, body: &Bytes) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
+    let flexible = version >= 3;
+    let string = |c: &mut ShapeCursor| {
+        if flexible {
+            c.compact_string(false)
+        } else {
+            c.legacy_string(false)
+        }
+    };
+    string(&mut c)?;
+    let _producer_id = c.read_i64()?;
+    let _producer_epoch = c.read_i16()?;
+    string(&mut c)?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `TxnOffsetCommitRequest::decode` walks. Topic names are echoed.
+///
+/// # Errors
+///
+/// Returns an error when a declared array or string length cannot fit in the bytes remaining in
+/// the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_txn_offset_commit_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 3;
+    let string = |c: &mut ShapeCursor, nullable: bool| {
+        if flexible {
+            c.compact_string(nullable)
+        } else {
+            c.legacy_string(nullable)
+        }
+    };
+    string(&mut c, false)?;
+    string(&mut c, false)?;
+    let _producer_id = c.read_i64()?;
+    let _producer_epoch = c.read_i16()?;
+    if version >= 3 {
+        let _generation_id = c.read_i32()?;
+        string(&mut c, false)?;
+        string(&mut c, true)?;
+    }
+    let topics = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..topics {
+        string(&mut c, false)?;
+        let partitions = if flexible {
+            c.compact_array_count()?
+        } else {
+            c.legacy_array_count()?
+        };
+        for _ in 0..partitions {
+            let _partition = c.read_i32()?;
+            let _offset = c.read_i64()?;
+            if version >= 2 {
+                let _leader_epoch = c.read_i32()?;
+            }
+            string(&mut c, true)?;
+            if flexible {
+                c.tagged_fields()?;
+            }
+        }
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::BytesMut;
     use kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use kafka_protocol::messages::txn_offset_commit_request::{
+        TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+    };
     use kafka_protocol::messages::{
-        AddPartitionsToTxnRequest, EndTxnRequest, ProducerId, TopicName, TransactionalId,
+        AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, EndTxnRequest, GroupId, ProducerId,
+        TopicName, TransactionalId, TxnOffsetCommitRequest,
     };
     use kafka_protocol::protocol::{Encodable, StrBytes};
 
@@ -130,6 +222,29 @@ mod tests {
         }
         for version in 0..=4 {
             validate_end_txn_shape(version, &encoded(&end, version)).unwrap();
+        }
+        let add_offsets = AddOffsetsToTxnRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("tx")))
+            .with_group_id(GroupId(StrBytes::from_static_str("g")));
+        for version in 0..=4 {
+            validate_add_offsets_to_txn_shape(version, &encoded(&add_offsets, version)).unwrap();
+        }
+        let commit = TxnOffsetCommitRequest::default()
+            .with_transactional_id(TransactionalId(StrBytes::from_static_str("tx")))
+            .with_group_id(GroupId(StrBytes::from_static_str("g")))
+            .with_member_id(StrBytes::from_static_str("m"))
+            .with_group_instance_id(Some(StrBytes::from_static_str("i")))
+            .with_topics(vec![
+                TxnOffsetCommitRequestTopic::default()
+                    .with_name(TopicName(StrBytes::from_static_str("t")))
+                    .with_partitions(vec![
+                        TxnOffsetCommitRequestPartition::default()
+                            .with_committed_offset(9)
+                            .with_committed_metadata(Some(StrBytes::from_static_str("md"))),
+                    ]),
+            ]);
+        for version in 0..=4 {
+            validate_txn_offset_commit_shape(version, &encoded(&commit, version), 1 << 20).unwrap();
         }
     }
 

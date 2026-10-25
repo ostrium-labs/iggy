@@ -35,7 +35,7 @@ use kafka_protocol::records::{
 
 use super::{
     Context, Facts, TIMEOUT_MS, WireClient, await_topic, coordinator_loading, create_topic,
-    fetch_raw, now_ms, s, topic, version,
+    fetch_raw, find_group_coordinator, now_ms, s, topic, version,
 };
 
 /// Codes a client retries on, while a coordinator loads or markers are being written.
@@ -662,5 +662,221 @@ pub async fn read_committed(
     read_at(client, &name, 0, 1, facts, "after.committed").await?;
     let (error, offset) = latest(client, &name, 1).await?;
     facts.set("after.latest_committed", format!("{error}:{offset}"));
+    Ok(())
+}
+
+/// `AddOffsetsToTxn` for `group`, retried while retriable.
+async fn add_offsets(
+    client: &mut WireClient,
+    producer: &Producer,
+    group: &str,
+) -> Result<i16, String> {
+    let add_version = version(client, ApiKey::AddOffsetsToTxn, 3)?.min(3);
+    let request = kafka_protocol::messages::AddOffsetsToTxnRequest::default()
+        .with_transactional_id(TransactionalId(s(&producer.id)))
+        .with_producer_id(ProducerId(producer.producer_id))
+        .with_producer_epoch(producer.epoch)
+        .with_group_id(kafka_protocol::messages::GroupId(s(group)));
+    let mut error = 0;
+    for _ in 0..120 {
+        error = client
+            .send(&request, add_version)
+            .await
+            .map_err(|error| format!("AddOffsetsToTxn: {error}"))?
+            .error_code;
+        if !retriable(error) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(error)
+}
+
+/// `TxnOffsetCommit` of `offset` for partition 0 of `name`, standalone (no member), retried while
+/// retriable. Its code.
+async fn txn_commit(
+    client: &mut WireClient,
+    producer: &Producer,
+    group: &str,
+    name: &str,
+    offset: i64,
+) -> Result<i16, String> {
+    use kafka_protocol::messages::txn_offset_commit_request::{
+        TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+    };
+    let commit_version = version(client, ApiKey::TxnOffsetCommit, 3)?.min(3);
+    let request = kafka_protocol::messages::TxnOffsetCommitRequest::default()
+        .with_transactional_id(TransactionalId(s(&producer.id)))
+        .with_group_id(kafka_protocol::messages::GroupId(s(group)))
+        .with_producer_id(ProducerId(producer.producer_id))
+        .with_producer_epoch(producer.epoch)
+        .with_generation_id(-1)
+        .with_member_id(s(""))
+        .with_topics(vec![
+            TxnOffsetCommitRequestTopic::default()
+                .with_name(topic(name))
+                .with_partitions(vec![
+                    TxnOffsetCommitRequestPartition::default()
+                        .with_partition_index(0)
+                        .with_committed_offset(offset)
+                        .with_committed_leader_epoch(-1),
+                ]),
+        ]);
+    let mut error = 0;
+    for _ in 0..120 {
+        let response = client
+            .send(&request, commit_version)
+            .await
+            .map_err(|error| format!("TxnOffsetCommit: {error}"))?;
+        error = response
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .map_or(-2, |partition| partition.error_code);
+        if !retriable(error) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(error)
+}
+
+/// `OffsetFetch` v7 of partition 0 of `name` for `group`: `"error:offset"` of the partition.
+async fn committed_offset(
+    client: &mut WireClient,
+    group: &str,
+    name: &str,
+    require_stable: bool,
+) -> Result<String, String> {
+    use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
+    let fetch_version = version(client, ApiKey::OffsetFetch, 7)?.min(7);
+    let request = kafka_protocol::messages::OffsetFetchRequest::default()
+        .with_group_id(kafka_protocol::messages::GroupId(s(group)))
+        .with_topics(Some(vec![
+            OffsetFetchRequestTopic::default()
+                .with_name(topic(name))
+                .with_partition_indexes(vec![0]),
+        ]))
+        .with_require_stable(require_stable);
+    // A group coordinator loads its partition on first use: 14 and 16 until then.
+    for _ in 0..60 {
+        let response = client
+            .send(&request, fetch_version)
+            .await
+            .map_err(|error| format!("OffsetFetch: {error}"))?;
+        if let Some(partition) = response
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+        {
+            return Ok(format!(
+                "{}:{}",
+                partition.error_code, partition.committed_offset
+            ));
+        }
+        if !retriable(response.error_code) {
+            return Err(format!(
+                "OffsetFetch answered no partition (error {})",
+                response.error_code
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err("OffsetFetch kept answering retriable codes".to_string())
+}
+
+/// Consume-transform-produce on the wire (KIP-98, KIP-447): a transaction writes a record and
+/// commits the input group's offset; the offset is unstable while the transaction is open, and
+/// committed only when it commits. An aborted one leaves the committed offset as it was.
+pub async fn exactly_once(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let input = cx.name("exactly_once", "in");
+    let output = cx.name("exactly_once", "out");
+    for name in [&input, &output] {
+        create_topic(client, name, &[]).await?;
+        await_topic(client, name).await?;
+    }
+    let group = cx.name("exactly_once", "g");
+    find_group_coordinator(client, &group).await?;
+    let transactional_id = cx.name("exactly_once", "tx");
+    find_coordinator(client, &transactional_id).await?;
+    let (error, producer_id, epoch) = init(client, &transactional_id, 60_000).await?;
+    if error != 0 {
+        return Err(format!("InitProducerId answered {error}"));
+    }
+    let mut producer = Producer {
+        id: transactional_id,
+        producer_id,
+        epoch,
+        sequence: 0,
+    };
+
+    facts.set(
+        "commit_without_add.error",
+        txn_commit(client, &producer, &group, &input, 1).await?,
+    );
+    add_partitions(client, &producer, &output, &[0]).await?;
+    let batch = txn_batch(&mut producer, &["out1"])?;
+    produce_txn(client, &producer, &output, 0, batch).await?;
+    facts.set(
+        "add_offsets.error",
+        add_offsets(client, &producer, &group).await?,
+    );
+    facts.set(
+        "txn_commit.error",
+        txn_commit(client, &producer, &group, &input, 2).await?,
+    );
+    facts.set(
+        "open.stable",
+        committed_offset(client, &group, &input, true).await?,
+    );
+    facts.set(
+        "open.unstable_read",
+        committed_offset(client, &group, &input, false).await?,
+    );
+    facts.set("commit.error", end_settled(client, &producer, true).await?);
+    let mut after = String::new();
+    for _ in 0..60 {
+        after = committed_offset(client, &group, &input, true).await?;
+        if !after.starts_with("88:") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("after_commit.stable", after);
+
+    add_partitions(client, &producer, &output, &[0]).await?;
+    let batch = txn_batch(&mut producer, &["out2"])?;
+    produce_txn(client, &producer, &output, 0, batch).await?;
+    add_offsets(client, &producer, &group).await?;
+    txn_commit(client, &producer, &group, &input, 5).await?;
+    facts.set("abort.error", end_settled(client, &producer, false).await?);
+    let mut after = String::new();
+    for _ in 0..60 {
+        after = committed_offset(client, &group, &input, true).await?;
+        if !after.starts_with("88:") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("after_abort.stable", after);
+
+    let (_, _, bumped) = init(client, &producer.id, 60_000).await?;
+    facts.set("reinit.epoch_bump", bumped - producer.epoch);
+    let stale = Producer {
+        epoch: producer.epoch,
+        ..clone(&producer)
+    };
+    facts.set(
+        "fenced_add_offsets.error",
+        add_offsets(client, &stale, &group).await?,
+    );
+    facts.set(
+        "fenced_txn_commit.error",
+        txn_commit(client, &stale, &group, &input, 9).await?,
+    );
     Ok(())
 }
