@@ -29,8 +29,10 @@ use iggy::prelude::{
     PolledMessages,
 };
 use kafka_protocol::indexmap::IndexSet;
-use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
-use kafka_protocol::messages::{FetchRequest, FetchResponse, TopicName};
+use kafka_protocol::messages::fetch_response::{
+    AbortedTransaction, FetchableTopicResponse, PartitionData,
+};
+use kafka_protocol::messages::{FetchRequest, FetchResponse, ProducerId, TopicName};
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use kafka_protocol::records::Record;
 use tokio::sync::watch;
@@ -280,6 +282,7 @@ async fn fetch(
         (answers, slot) = fetch.read(&probes).await;
     }
     fetch.stamp_log_starts(&probes, &mut answers);
+    fetch.stamp_transactions(&mut answers);
     (group(request, &fetch.wanted, answers), slot)
 }
 
@@ -417,7 +420,13 @@ struct Fetch<'a> {
     give_up_at: Instant,
     /// The request's wait, at most [`MAX_WAIT`].
     max_wait: Duration,
+    /// `isolation_level` 1 on a gateway that serves transactions (KW-T): records stop at the last
+    /// stable offset, and each answer lists the aborted transactions it spans.
+    read_committed: bool,
 }
+
+/// `isolation_level` of a `read_committed` consumer.
+const READ_COMMITTED: i8 = 1;
 
 impl<'a> Fetch<'a> {
     fn new(
@@ -437,6 +446,70 @@ impl<'a> Fetch<'a> {
             response_bytes: response_bytes(request.max_bytes, state.max_frame_size),
             give_up_at,
             max_wait: wait_time(request.max_wait_ms),
+            read_committed: request.isolation_level == READ_COMMITTED
+                && state.transactions.is_some(),
+        }
+    }
+
+    /// The offset `read_committed` records stop before on `partition` of `topic`, whose high
+    /// watermark is `high_watermark`: its last stable offset. `None` for `read_uncommitted`.
+    ///
+    /// Taken after the poll, never before: a transaction marks itself as writing before its send
+    /// starts, so any of its records the poll found already hold the offset down.
+    fn committed_limit(&self, topic: &str, partition: i32, high_watermark: u64) -> Option<u64> {
+        if !self.read_committed {
+            return None;
+        }
+        let transactions = self.state.transactions.as_ref()?;
+        Some(
+            transactions
+                .index()
+                .last_stable_offset(&(topic.to_string(), partition), high_watermark),
+        )
+    }
+
+    /// Sets each served answer's last stable offset (KW-T) and, for `read_committed`, the aborted
+    /// transactions its records span, as Kafka's `collectAbortedTransactions` lists them. Without
+    /// transactions the last stable offset stays the high watermark.
+    fn stamp_transactions(&self, answers: &mut [PartitionData]) {
+        let Some(transactions) = self.state.transactions.as_ref() else {
+            return;
+        };
+        let index = transactions.index();
+        for (want, answer) in self.wanted.iter().zip(answers) {
+            if answer.error_code != ERROR_NONE {
+                continue;
+            }
+            let Ok(high_watermark) = u64::try_from(answer.high_watermark) else {
+                continue;
+            };
+            let partition = (want.topic.to_string(), want.partition);
+            let served_up_to = answer
+                .records
+                .as_deref()
+                .and_then(last_offset)
+                .and_then(|last| u64::try_from(last).ok())
+                .map(|last| last + 1);
+            let mut stable = index.last_stable_offset(&partition, high_watermark);
+            if self.read_committed {
+                // What was served was stable when it was read; a transaction that started since
+                // does not take it back.
+                stable = stable.max(served_up_to.unwrap_or(0)).min(high_watermark);
+                let from = u64::try_from(want.fetch_offset).unwrap_or(0);
+                let aborted = served_up_to.map_or_else(Vec::new, |upper| {
+                    index
+                        .aborted_between(&partition, from, upper)
+                        .into_iter()
+                        .map(|txn| {
+                            AbortedTransaction::default()
+                                .with_producer_id(ProducerId(txn.producer_id))
+                                .with_first_offset(i64::try_from(txn.first_offset).unwrap_or(0))
+                        })
+                        .collect()
+                });
+                answer.aborted_transactions = Some(aborted);
+            }
+            answer.last_stable_offset = i64::try_from(stable).unwrap_or(UNKNOWN_OFFSET);
         }
     }
 
@@ -971,8 +1044,11 @@ impl<'a> Reader<'a> {
             return Read::Done(refused(want.partition, ERROR_OFFSET_OUT_OF_RANGE));
         }
         let keep_one = self.owes_first_record;
+        let limit = self
+            .fetch
+            .committed_limit(want.topic, want.partition, polled.high_watermark);
         let encoded = off_worker(polled.bytes >= CODEC_OFF_WORKER_BYTES, || {
-            encode_records(&polled.messages, offset, budget, keep_one)
+            encode_records(&polled.messages, offset, limit, budget, keep_one)
         });
         Read::Done(match encoded {
             Ok(batch) => {
@@ -1722,15 +1798,19 @@ fn stored_bytes(message: &IggyMessage) -> usize {
 fn encode_records(
     messages: &[IggyMessage],
     offset: u64,
+    limit: Option<u64>,
     budget: usize,
     keep_one: bool,
 ) -> core::result::Result<Bytes, RecordCodecError> {
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
     let mut repeated = RepeatedHeaders::new();
     let mut size = BATCH_HEADER_BYTES;
+    // KW-T: a `read_committed` read stops at the last stable offset.
+    let below = limit.unwrap_or(u64::MAX);
     for message in messages
         .iter()
         .filter(|message| message.header.offset >= offset)
+        .take_while(|message| message.header.offset < below)
     {
         let Ok(kafka_offset) = i64::try_from(message.header.offset) else {
             break;
@@ -1758,6 +1838,21 @@ fn encode_records(
         records.push(record);
     }
     encode_batch_with(&mut records, &repeated)
+}
+
+/// The offset of the last record in `batches`, encoded record batches: the last batch's base
+/// offset plus its last offset delta.
+fn last_offset(batches: &[u8]) -> Option<i64> {
+    let mut rest = batches;
+    let mut last = None;
+    while rest.len() >= BATCH_HEADER_BYTES {
+        let base = i64::from_be_bytes(rest.get(0..8)?.try_into().ok()?);
+        let length = usize::try_from(i32::from_be_bytes(rest.get(8..12)?.try_into().ok()?)).ok()?;
+        let delta = i32::from_be_bytes(rest.get(23..27)?.try_into().ok()?);
+        last = Some(base + i64::from(delta));
+        rest = rest.get(12 + length..)?;
+    }
+    last
 }
 
 /// Whether the first of `messages` at or past `offset` comes after it: the read found no record at
@@ -1877,6 +1972,20 @@ fn partition_response(partition: i32, error_code: i16) -> PartitionData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn given_encoded_batches_the_last_offset_should_be_the_last_batchs_last_record() {
+        let records = vec![stored(5, b"a"), stored(6, b"b"), stored(7, b"c")];
+        let one = super::encode_records(&records, 5, None, usize::MAX, true).unwrap();
+        assert_eq!(super::last_offset(&one), Some(7));
+        assert_eq!(super::last_offset(&[]), None);
+        let stopped = super::encode_records(&records, 5, Some(7), usize::MAX, true).unwrap();
+        assert_eq!(
+            super::last_offset(&stopped),
+            Some(6),
+            "the limit is exclusive"
+        );
+    }
+
     use std::collections::BTreeMap;
 
     use iggy::prelude::{HeaderKey, HeaderValue};
@@ -2708,10 +2817,10 @@ mod tests {
     fn given_a_record_past_every_limit_when_owed_should_still_return_it() {
         let messages = [stored(0, &[b'a'; 1024]), stored(1, &[b'b'; 1024])];
 
-        let owed = encode_records(&messages, 0, 10, true).unwrap();
+        let owed = encode_records(&messages, 0, None, 10, true).unwrap();
         assert_eq!(offsets(owed), vec![0], "exactly the first record");
 
-        let not_owed = encode_records(&messages, 0, 10, false).unwrap();
+        let not_owed = encode_records(&messages, 0, None, 10, false).unwrap();
         assert!(not_owed.is_empty(), "no records rather than a cut batch");
     }
 
@@ -2720,7 +2829,7 @@ mod tests {
         let messages: Vec<IggyMessage> =
             (0..10).map(|offset| stored(offset, &[b'v'; 100])).collect();
 
-        let batch = encode_records(&messages, 0, 500, false).unwrap();
+        let batch = encode_records(&messages, 0, None, 500, false).unwrap();
         assert!(batch.len() <= 500, "{} bytes", batch.len());
         let served = offsets(batch);
         assert!(!served.is_empty() && served.len() < 10);
@@ -2730,7 +2839,7 @@ mod tests {
     #[test]
     fn given_messages_below_the_fetch_offset_when_encoding_should_skip_them() {
         let messages = [stored(3, b"a"), stored(4, b"b"), stored(5, b"c")];
-        let batch = encode_records(&messages, 4, usize::MAX, false).unwrap();
+        let batch = encode_records(&messages, 4, None, usize::MAX, false).unwrap();
         assert_eq!(offsets(batch), vec![4, 5]);
     }
 
@@ -2738,7 +2847,7 @@ mod tests {
     fn given_an_unmappable_message_when_it_comes_first_should_fail_the_partition() {
         let messages = [unmappable(0), stored(1, b"b")];
         assert!(matches!(
-            encode_records(&messages, 0, usize::MAX, true),
+            encode_records(&messages, 0, None, usize::MAX, true),
             Err(RecordCodecError::MappingVersion(_))
         ));
     }
@@ -2751,7 +2860,7 @@ mod tests {
             unmappable(2),
             stored(3, b"d"),
         ];
-        let batch = encode_records(&messages, 0, usize::MAX, true).unwrap();
+        let batch = encode_records(&messages, 0, None, usize::MAX, true).unwrap();
         assert_eq!(
             offsets(batch),
             vec![0, 1],

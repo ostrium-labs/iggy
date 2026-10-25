@@ -3,7 +3,7 @@
 Status: **plan, 2026-10-23.** Nothing in this document is built yet unless a
 task row says so. Transactions and exactly-once (KW-T, apache/iggy#4522) are
 **being built** in steps behind `IGGY_KAFKA_TRANSACTIONS_ENABLED` (owner, 2026-10-25: start now;
-this overrides the 2026-10-24 ruling that they wait for KW-2, KW-3 and KW-13). Step 1 is built;
+this overrides the 2026-10-24 ruling that they wait for KW-2, KW-3 and KW-13). Steps 1 and 2 are built;
 section 6 has the state of each step.
 
 Owner direction (2026-10-23): "work on kafka wire now, do all things except
@@ -223,7 +223,7 @@ breadth. Status is `Planned` unless noted.
 | KW-18 | Kafka-to-Iggy migration guide | #3550 | Planned | KW-5 | Assigned upstream; fork copy only |
 | KW-L1 | Fork images: `iggy-server` and `iggy-gateway-kafka` on GHCR | — | **Done** (one image, `ghcr.io/ostrium-labs/iggy`) | KW-0 | No |
 | KW-L2 | Loams compose profile `kafka` | — (Loams repo) | **Done** (ostrium-labs/loams#1148) | KW-L1 | No |
-| KW-T | Transactions and exactly-once | #4522 | **Step 1 built** (coordinator, log, handshake, markers, fencing, timeouts, recovery; behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`); steps 2-5 planned. Started 2026-10-25 on the owner's word, ahead of KW-13 | KW-3 (done); KW-5 for step 5, KW-6 for a bounded log | Design discussion first |
+| KW-T | Transactions and exactly-once | #4522 | **Steps 1-2 built** (coordinator, log, handshake, markers, fencing, timeouts, recovery; `read_committed` Fetch and `ListOffsets`; behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`); steps 3-5 planned. Started 2026-10-25 on the owner's word, ahead of KW-13 | KW-3 (done); KW-5 for step 5, KW-6 for a bounded log | Design discussion first |
 
 ### KW-1. Differential oracle harness
 
@@ -1007,7 +1007,7 @@ against Iggy users, not yet mapped to Loams credentials.
 
 ## 6. KW-T: transactions and exactly-once (being built)
 
-**Status: step 1 of 5 built (2026-10-26), behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`, off by
+**Status: steps 1 and 2 of 5 built (2026-10-26), behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`, off by
 default.** Owner, 2026-10-25: "start transactions now"; Confluent Cloud is the managed-Kafka
 reference (report-only), the Apache Kafka container stays pass/fail, and the crash and
 network-fault tests run on the second laptop. With the switch off the gateway keeps refusing
@@ -1016,8 +1016,8 @@ as-built design.
 
 | Step | Scope (6.8's letters) | State |
 | --- | --- | --- |
-| 1 | (a) log and state machine, (b) `InitProducerId`, `FindCoordinator`, `AddPartitionsToTxn`, `EndTxn`, transactional Produce, markers; timeouts, fencing, recovery of `Prepare*` | **Built** (this PR) |
-| 2 | (c) last stable offset, aborted transactions, `read_committed` Fetch and `ListOffsets` | Planned, next |
+| 1 | (a) log and state machine, (b) `InitProducerId`, `FindCoordinator`, `AddPartitionsToTxn`, `EndTxn`, transactional Produce, markers; timeouts, fencing, recovery of `Prepare*` | **Built** (fork PR #19) |
+| 2 | (c) last stable offset, aborted transactions, `read_committed` Fetch and `ListOffsets` | **Built** (this PR) |
 | 3 | (d) `AddOffsetsToTxn`, `TxnOffsetCommit`, `require_stable`; Streams `exactly_once_v2`, Flink 2PC | Planned |
 | 4 | `DescribeTransactions`, `ListTransactions`, `DescribeProducers`, id expiry, log snapshots | Planned |
 | 5 | (e) KW-5 ownership, coordinator move, crash and fault matrix on the second laptop | Planned |
@@ -1039,6 +1039,16 @@ as-built design.
 - Markers are written on the producer's own Iggy session after its Produce turn, so no batch the
   coordinator accepted lands after its marker (the SDK lane replays a send in doubt first).
 - The coordinator epoch in markers is 0 until step 5.
+
+**As built, step 2.** The last stable offset is the first offset of the earliest open
+transaction that may have written to the partition (a send started, or recovered from the log),
+taken after the poll, so a transaction that started writing meanwhile already holds it. Fetch at
+`read_committed` stops there and lists the aborted transactions its records span; `ListOffsets`
+`LATEST` at `read_committed` answers it, and a timestamp lookup past it answers -1, as Kafka does.
+The oracle scenario `read_committed` (27 facts: a commit, an abort, an open transaction with a
+plain record after it, reads from 0 and from the abort marker, `LATEST` at both levels, then the
+commit) equals Apache Kafka 4.3.1 on every fact, and the Java consumer reads the same committed
+records on the gateway as on Kafka.
 
 Tests: unit tests for the state table, the coordinator (commit, fence, timeout, recovery,
 errors), the index, the log, the marks and the handlers; `transactions_real_bridge_tests.rs`

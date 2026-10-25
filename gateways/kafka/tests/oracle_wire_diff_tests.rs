@@ -140,10 +140,11 @@ enum Scenario {
     TopicConfigs,
     TopicIds,
     Transactions,
+    ReadCommitted,
 }
 
 impl Scenario {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -159,6 +160,7 @@ impl Scenario {
         Self::TopicConfigs,
         Self::TopicIds,
         Self::Transactions,
+        Self::ReadCommitted,
     ];
 
     const fn name(self) -> &'static str {
@@ -178,6 +180,7 @@ impl Scenario {
             Self::TopicConfigs => "topic_configs",
             Self::TopicIds => "topic_ids",
             Self::Transactions => "transactions",
+            Self::ReadCommitted => "read_committed",
         }
     }
 
@@ -206,6 +209,9 @@ impl Scenario {
             Self::TopicIds => topic_ids(cx, &mut client, &mut facts).await?,
             Self::Transactions => {
                 transactions::transactions(cx, &mut client, &mut facts).await?;
+            }
+            Self::ReadCommitted => {
+                transactions::read_committed(cx, &mut client, &mut facts).await?;
             }
         }
         Ok(facts)
