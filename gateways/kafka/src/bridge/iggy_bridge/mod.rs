@@ -262,6 +262,12 @@ impl IggyBridge {
         })
     }
 
+    /// How Kafka topic names map onto Iggy streams and topics.
+    #[must_use]
+    pub const fn topic_mapping(&self) -> &crate::bridge::TopicMapping {
+        &self.config.topic_mapping
+    }
+
     /// The Iggy stream unmapped Kafka topics live in.
     #[must_use]
     pub fn default_stream(&self) -> &str {

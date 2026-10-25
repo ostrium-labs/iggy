@@ -812,7 +812,23 @@ pub fn describe_acls_outcome(
     permissions: &PrincipalPermissions,
     filter: &AclFilter,
 ) -> HandleOutcome {
-    let selected: Vec<AclBinding> = acl::bindings_for(permissions)
+    describe_bindings_outcome(
+        api_version,
+        principal,
+        acl::bindings_for(permissions),
+        filter,
+    )
+}
+
+/// Answers `DescribeAcls` for `principal` from `bindings`.
+#[must_use]
+pub fn describe_bindings_outcome(
+    api_version: i16,
+    principal: &str,
+    bindings: Vec<AclBinding>,
+    filter: &AclFilter,
+) -> HandleOutcome {
+    let selected: Vec<AclBinding> = bindings
         .into_iter()
         .filter(|binding| filter.matches(binding, principal))
         .collect();
