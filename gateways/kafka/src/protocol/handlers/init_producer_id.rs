@@ -23,11 +23,14 @@
 //! Iggy session: delivery stays at-least-once, and no retry is deduplicated. See
 //! `docs/IDEMPOTENCE.md`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use kafka_protocol::messages::{InitProducerIdRequest, InitProducerIdResponse, ProducerId};
+use kafka_protocol::messages::{
+    InitProducerIdRequest, InitProducerIdResponse, ProducerId, TransactionalId,
+};
 
 use crate::error::Result;
 use crate::protocol::api::{
@@ -36,8 +39,9 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_init_producer_id_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, handle_versioned_request, is_transactional,
+    decode_guarded, decode_request, encode_message, is_transactional, respond_or_close,
 };
+use crate::transactions::{TransactionCoordinator, codes};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_INIT_PRODUCER_ID,
@@ -109,20 +113,54 @@ impl ProducerIdAllocator {
     }
 }
 
-#[expect(
-    clippy::unused_async,
-    reason = "the shared handler signature, kept until a handler awaits the bridge"
-)]
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
-    handle_versioned_request(
+    let request = match decode_request(
         API_KEY_INIT_PRODUCER_ID,
         api_version,
         body,
         |v, b| decode_guarded::<InitProducerIdRequest>(v, b, validate_init_producer_id_shape),
-        |v, req| encode_response(v, req, &state.producer_ids),
         encode_error_response,
         "InitProducerId",
-    )
+    ) {
+        Ok(request) => request,
+        Err(outcome) => return outcome,
+    };
+    let encoded = match (&state.transactions, &request.transactional_id) {
+        (Some(coordinator), Some(transactional_id)) if is_transactional(Some(transactional_id)) => {
+            transactional(coordinator, api_version, &request, transactional_id).await
+        }
+        _ => encode_response(api_version, &request, &state.producer_ids),
+    };
+    respond_or_close(encoded, "InitProducerId")
+}
+
+/// The first version whose clients know `PRODUCER_FENCED` (KIP-588).
+const PRODUCER_FENCED_VERSION: i16 = 4;
+
+/// `InitProducerId` with a transactional id, on a gateway with transactions on (KW-T): the
+/// coordinator gives the id its producer id and bumps its epoch, fencing an older producer.
+async fn transactional(
+    coordinator: &Arc<TransactionCoordinator>,
+    version: i16,
+    request: &InitProducerIdRequest,
+    transactional_id: &TransactionalId,
+) -> Result<Bytes> {
+    // v3 and later name the producer's own id and epoch (KIP-360); both or neither.
+    let expected = match (request.producer_id.0, request.producer_epoch) {
+        (-1, -1) => None,
+        (-1, _) | (_, -1) => return encode_error_response(version, codes::INVALID_REQUEST),
+        (id, epoch) => Some((id, epoch)),
+    };
+    match coordinator
+        .init_producer_id(transactional_id, request.transaction_timeout_ms, expected)
+        .await
+    {
+        Ok((producer_id, epoch)) => encode_with_epoch(version, ERROR_NONE, producer_id, epoch),
+        Err(code) => encode_error_response(
+            version,
+            codes::fenced_for(code, version >= PRODUCER_FENCED_VERSION),
+        ),
+    }
 }
 
 /// `InitProducerId` response carrying `error_code` and no usable producer id.
@@ -169,10 +207,15 @@ fn clock_counter() -> u64 {
 }
 
 fn encode_inner(version: i16, error_code: i16, producer_id: i64) -> Result<Bytes> {
+    let epoch = if producer_id < 0 { -1 } else { PRODUCER_EPOCH };
+    encode_with_epoch(version, error_code, producer_id, epoch)
+}
+
+fn encode_with_epoch(version: i16, error_code: i16, producer_id: i64, epoch: i16) -> Result<Bytes> {
     let resp = InitProducerIdResponse::default()
         .with_error_code(error_code)
         .with_producer_id(ProducerId(producer_id))
-        .with_producer_epoch(PRODUCER_EPOCH);
+        .with_producer_epoch(epoch);
     encode_message(&resp, version, 32)
 }
 

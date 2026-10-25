@@ -226,6 +226,16 @@ Two consequences worth stating before they surprise someone:
   header; every other record stays at 1, so a build that reads only version 1 still reads all of
   them but the marked ones. Fetch reads 1 and 2 alike and never shows `kafka.p` as a Kafka header.
   A gateway rebuilds producer state from these marks (`docs/IDEMPOTENCE.md`).
+- Transactions (Ostrium fork, KW-T, `docs/TRANSACTIONS.md`): every record of a transactional batch
+  carries `kafka.t`, 15 bytes big-endian: a layout byte (1), producer id (`i64`), epoch (`i16`)
+  and the record's own sequence (`i32`); the batch's first record also carries `kafka.p` with flag
+  bit 0 set. Fetch serves such records in transactional batches with that producer, epoch and
+  sequence, also when a read starts inside the producer's batch. A transaction's end is one
+  message per partition with `kafka.v` 3 (a control record): `kafka.ctl` holds the control type
+  (`i16`, 0 abort, 1 commit), `kafka.t` the producer and epoch with sequence -1, and the payload
+  Kafka's `EndTransactionMarker` value (version `i16` 0, coordinator epoch `i32`). Fetch serves it
+  as a control batch of one record, with key version 0 and the type. A build without KW-T refuses a
+  version 3 message rather than serve it as data.
 - The bytes a consumer receives are not the bytes the producer sent, so anything comparing
   batches byte for byte across the gateway will differ.
 

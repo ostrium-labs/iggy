@@ -181,6 +181,13 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 
 ### Transactions
 
+> **Ostrium fork (KW-T):** with `IGGY_KAFKA_TRANSACTIONS_ENABLED=true` the gateway serves
+> transactions instead: `FindCoordinator` for a transactional id, `InitProducerId` with one,
+> `AddPartitionsToTxn` (24) and `EndTxn` (26) are advertised and answered, transactional Produce is
+> written with its markers, and Fetch serves control batches. `read_committed`, `AddOffsetsToTxn`
+> (25) and `TxnOffsetCommit` (28) are later steps. [`TRANSACTIONS.md`](TRANSACTIONS.md) has what is
+> built. What follows is the behaviour with the switch off, the default.
+
 Transactions are not supported and are not planned. There is no last stable offset, no abort
 marker, and nothing that could make `read_committed` mean anything, so accepting a transactional
 write would deliver an aborted transaction's records to every consumer.

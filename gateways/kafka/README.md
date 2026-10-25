@@ -287,6 +287,10 @@ Produce request carrying a `transactional_id` gets `UNSUPPORTED_VERSION` (35) on
 rather than having its records stored as if they were ordinary ones. None of those closes the
 connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
+In the Ostrium fork, `IGGY_KAFKA_TRANSACTIONS_ENABLED=true` turns on a transaction coordinator
+instead (KW-T, in steps; `read_committed` is not served yet). `docs/TRANSACTIONS.md` has what is
+built and what is not.
+
 ## Consumer groups ([#3544](https://github.com/apache/iggy/issues/3544))
 
 A stock consumer with a `group.id` joins, takes the partitions its own assignor hands it, commits,

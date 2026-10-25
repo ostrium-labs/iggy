@@ -79,6 +79,7 @@ pub async fn handle(
                 &state.membership.snapshot(),
                 connection.security_protocol(),
                 &connection.broker,
+                state.transactions.is_some(),
             ),
             "FindCoordinator",
         ),
@@ -107,6 +108,7 @@ pub fn encode_response(
     version: i16,
     request: &FindCoordinatorRequest,
     broker: &BrokerAdvertise,
+    transactions: bool,
 ) -> Result<Bytes> {
     encode_shared_response(
         version,
@@ -114,6 +116,7 @@ pub fn encode_response(
         &Snapshot::single(crate::membership::SINGLE_NODE_ID),
         SecurityProtocol::Plaintext,
         broker,
+        transactions,
     )
 }
 
@@ -133,6 +136,7 @@ pub fn encode_shared_response(
     snapshot: &Snapshot,
     protocol: SecurityProtocol,
     own: &BrokerAdvertise,
+    transactions: bool,
 ) -> Result<Bytes> {
     let keys = if version >= 4 {
         request.coordinator_keys.clone()
@@ -165,7 +169,21 @@ pub fn encode_shared_response(
                 .collect();
             return encode_answers(version, &answers);
         }
-        // Transactions are out of scope for good, so the producer must fail rather than retry.
+        // KW-T: with transactions on, this gateway coordinates every transactional id (one
+        // gateway per Iggy stream until KW-T step 5 shares them out).
+        COORDINATOR_TYPE_TRANSACTION if transactions => {
+            let answers: Vec<Answer> = keys
+                .iter()
+                .map(|key| Answer {
+                    key: key.clone(),
+                    error_code: ERROR_NONE,
+                    error_message: None,
+                    coordinator: Some((snapshot.node_id(), own.clone())),
+                })
+                .collect();
+            return encode_answers(version, &answers);
+        }
+        // Transactions are off, so the producer must fail rather than retry.
         COORDINATOR_TYPE_TRANSACTION => ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
         _ => ERROR_INVALID_REQUEST,
     };

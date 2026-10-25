@@ -133,9 +133,9 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 22 | **InitProducerId** | 2 | 5 | v2 | 🟠 Required Stub |
 | 23 | **OffsetForLeaderEpoch** | 1 | 5 | v4 | 🟡 Optional Stub |
-| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | ❌ Unadvertised |
+| 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | ❌ Unadvertised (Ostrium fork: v0-3 served with `IGGY_KAFKA_TRANSACTIONS_ENABLED`, `TRANSACTIONS.md`) |
 | 25 | **AddOffsetsToTxn** | 1 | 4 | v3 | ❌ Unadvertised |
-| 26 | **EndTxn** | 1 | 4 | v3 | ❌ Unadvertised |
+| 26 | **EndTxn** | 1 | 4 | v3 | ❌ Unadvertised (Ostrium fork: v0-4 served with `IGGY_KAFKA_TRANSACTIONS_ENABLED`, `TRANSACTIONS.md`) |
 | 27 | **WriteTxnMarkers** | 0 | 1 | v1 | 🟡 Optional Stub |
 | 28 | **TxnOffsetCommit** | 2 | 5 | v3 | ❌ Unadvertised |
 

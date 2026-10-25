@@ -50,6 +50,11 @@ impl TestGateway {
     /// Spawns `iggy-gateway-kafka` with the bridge enabled against `server`, then blocks until
     /// its listener is ready or the startup budget is exhausted.
     pub async fn spawn(server: &TestServer) -> Self {
+        Self::spawn_with(server, &[]).await
+    }
+
+    /// [`Self::spawn`] with `extra` environment variables set on the gateway.
+    pub async fn spawn_with(server: &TestServer, extra: &[(&str, &str)]) -> Self {
         let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
         let config = server.test_config();
@@ -74,6 +79,9 @@ impl TestGateway {
                 "IGGY_KAFKA_IGGY_PASSWORD",
                 secrecy::ExposeSecret::expose_secret(&config.password),
             );
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         let child = command.spawn().expect("spawn iggy-gateway-kafka");
 
         let mut gateway = Self {

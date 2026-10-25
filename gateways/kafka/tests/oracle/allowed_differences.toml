@@ -53,19 +53,6 @@ fact = "after_reset.p0.metadata"
 issue = "apache/iggy#3542"
 reason = "OFFSET_STORAGE.md: the metadata string is dropped"
 
-# Transactions are refused (planned, not built).
-[[difference]]
-scenario = "init_producer_id"
-fact = "find_transaction_coordinator.error"
-issue = "apache/iggy#4522"
-reason = "FindCoordinator for a transaction answers TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53)"
-
-[[difference]]
-scenario = "init_producer_id"
-fact = "transactional.error"
-issue = "apache/iggy#4522"
-reason = "InitProducerId with a transactional id answers UNSUPPORTED_VERSION (35)"
-
 # Topic configs: an Iggy topic never expires by default.
 [[difference]]
 scenario = "describe_configs"

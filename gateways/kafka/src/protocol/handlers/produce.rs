@@ -33,7 +33,9 @@ use crate::bridge::{
     BridgeError, IggyBridge, InDoubt, ProduceTurn, Producer, Resolution, SendEnd, TopicTarget,
 };
 use crate::error::Result;
-use crate::producer_state::{BatchKey, Landing, ProducerStates, Verdict, idempotence};
+use crate::producer_state::{
+    BatchKey, Landing, ProducerStates, Verdict, idempotence, last_sequence,
+};
 use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_PRODUCER_EPOCH,
     ERROR_INVALID_RECORD, ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE,
@@ -49,10 +51,11 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
-    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
-    is_compressed, producer_id, record_slots, to_iggy_with,
+    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Transactional, Zstd,
+    decode_batch_as, is_compressed, producer_id, record_slots, to_iggy_with,
 };
-use crate::records::{ProducerMark, mark_producer};
+use crate::records::{ProducerMark, TxnMark, mark_producer, mark_transactional};
+use crate::transactions::{TransactionCoordinator, codes};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_PRODUCE,
@@ -97,6 +100,7 @@ const RESPONSE_BASE_BYTES: usize = 512;
 /// spec-compliant client can legitimately send Produce v0-2 with `acks=0`. Rejecting those
 /// versions before reading `acks` would send an error response the client never expects,
 /// desyncing the next correlation id it reads.
+#[allow(clippy::too_many_lines)]
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
@@ -148,7 +152,15 @@ pub async fn handle(
     // marker, so an aborted transaction's records would reach every consumer. 35 is fatal for the
     // producer. acks=0 has no response to carry it, so the refusal is a close, which is what a
     // Kafka broker does on an acks=0 produce error.
-    if is_transactional(request.transactional_id.as_ref()) {
+    // KW-T: with transactions on, a transactional request is served against its transaction.
+    let txn = match (&state.transactions, &request.transactional_id) {
+        (Some(coordinator), Some(id)) if is_transactional(Some(id)) => Some(Txn {
+            coordinator: Arc::clone(coordinator),
+            id: id.to_string(),
+        }),
+        _ => None,
+    };
+    if txn.is_none() && is_transactional(request.transactional_id.as_ref()) {
         return if request.acks == ACKS_NONE {
             HandleOutcome::Close
         } else {
@@ -212,7 +224,15 @@ pub async fn handle(
     let (board, held) = (&state.probe_board, (turn, admission));
     let states = &state.producer_states;
     let mut responses = write_request(
-        bridge, held, board, states, &request, budget, zstd, deadline,
+        bridge,
+        held,
+        board,
+        states,
+        &request,
+        budget,
+        zstd,
+        deadline,
+        txn.as_ref(),
     )
     .await;
     responses.extend(unnamed);
@@ -400,7 +420,13 @@ fn producer_of(
         .flat_map(|topic| &topic.partition_data)
         .find_map(|partition| partition.records.as_deref())
         .and_then(producer_id)
-        .filter(|id| state.producer_ids.issued(*id))
+        .filter(|id| {
+            state.producer_ids.issued(*id)
+                || state
+                    .transactions
+                    .as_ref()
+                    .is_some_and(|coordinator| coordinator.knows_producer(*id))
+        })
         .map_or_else(
             || Producer::Connection(connection.id()),
             |id| Producer::Id {
@@ -474,8 +500,14 @@ async fn write_request(
     budget: DecompressionBudget,
     zstd: Zstd,
     deadline: Deadline,
+    txn: Option<&Txn>,
 ) -> Vec<TopicProduceResponse> {
     let max_send = bridge.max_send_bytes();
+    let transactional = if txn.is_some() {
+        Transactional::Required
+    } else {
+        Transactional::Refused
+    };
     let mut held = Some(held);
     let mut topics = Vec::with_capacity(request.topic_data.len());
     for topic in &request.topic_data {
@@ -486,7 +518,7 @@ async fn write_request(
         for partition in &topic.partition_data {
             let (outcome, kept) = match (&target, held.take()) {
                 (Ok(target), Some(kept)) if !deadline.passed() => {
-                    match plan(&budget, zstd, name, partition, max_send) {
+                    match plan(&budget, zstd, transactional, name, partition, max_send) {
                         Ok((id, messages)) => {
                             let planned = Write {
                                 target,
@@ -509,8 +541,16 @@ async fn write_request(
                                         batch,
                                     )
                                 });
-                            let (sent, kept) =
-                                write_checked(bridge, kept, states, idempotent, planned).await;
+                            let (sent, kept) = match txn {
+                                Some(_) if idempotent.is_none() => {
+                                    // A transactional batch without a producer id or sequence.
+                                    (Err(ERROR_INVALID_RECORD), Some(kept))
+                                }
+                                _ => {
+                                    write_checked(bridge, kept, states, idempotent, planned, txn)
+                                        .await
+                                }
+                            };
                             (sent.map_err(Refusal::from), kept)
                         }
                         Err(refusal) => (Err(refusal), Some(kept)),
@@ -545,11 +585,21 @@ async fn write_request(
 fn plan(
     budget: &DecompressionBudget,
     zstd: Zstd,
+    transactional: Transactional,
     kafka_topic: &str,
     partition: &PartitionProduceData,
     max_send: u64,
 ) -> std::result::Result<(u32, Vec<IggyMessage>), Refusal> {
-    let run = || plan_partition(budget, zstd, kafka_topic, partition, max_send);
+    let run = || {
+        plan_partition(
+            budget,
+            zstd,
+            transactional,
+            kafka_topic,
+            partition,
+            max_send,
+        )
+    };
     // A spent budget refuses before it reads a byte, so there is nothing to move off the worker.
     let heavy = !budget.is_spent()
         && partition
@@ -582,6 +632,7 @@ fn partition_outcome(
 fn plan_partition(
     budget: &DecompressionBudget,
     zstd: Zstd,
+    transactional: Transactional,
     kafka_topic: &str,
     partition: &PartitionProduceData,
     max_send: u64,
@@ -600,7 +651,7 @@ fn plan_partition(
     };
 
     // The clone is a refcount, and `decode_batch` drains what it is given.
-    let batch = decode_batch(&mut blob.clone(), budget, zstd).map_err(refuse)?;
+    let batch = decode_batch_as(&mut blob.clone(), budget, zstd, transactional).map_err(refuse)?;
     let records = &batch.records;
     // An empty blob decodes to no batch rather than to an error, so this rules on it.
     if records.is_empty() {
@@ -661,15 +712,36 @@ async fn write_checked(
     states: &Arc<ProducerStates>,
     idempotent: Option<(BatchKey, (i64, i16, i32, i32))>,
     write: Write<'_>,
+    txn: Option<&Txn>,
 ) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
     let Some((key, (_, epoch, first, last))) = idempotent else {
         return send_by(bridge, held, write, |_| {}).await;
     };
+    // KW-T: the batch must belong to its producer's open transaction, on a partition the
+    // transaction added. Checked under the producer's turn, so a marker the coordinator writes
+    // after this lands after the batch.
+    if let Some(txn) = txn
+        && let Err(code) = txn.coordinator.verify_write(
+            &txn.id,
+            key.producer_id,
+            epoch,
+            &(key.topic.clone(), key.partition),
+        )
+    {
+        tracing::debug!(
+            producer_id = key.producer_id,
+            kafka_topic = write.kafka_topic,
+            code,
+            "refused a transactional batch its transaction does not allow"
+        );
+        return (Err(verification_code(code)), Some(held));
+    }
     let batch = Batch {
         key,
         epoch,
         first,
         last,
+        txn: txn.map(|txn| Arc::clone(&txn.coordinator)),
     };
     if states.needs_restore(&batch.key.topic, batch.key.partition)
         && let Err(code) = restore(bridge, states, &batch.key, &write).await
@@ -736,6 +808,26 @@ struct Batch {
     epoch: i16,
     first: i32,
     last: i32,
+    /// The coordinator of its transaction, when the batch is transactional (KW-T).
+    txn: Option<Arc<TransactionCoordinator>>,
+}
+
+/// A transactional Produce request's transaction (KW-T).
+struct Txn {
+    coordinator: Arc<TransactionCoordinator>,
+    id: String,
+}
+
+/// The Produce code for a coordinator's refusal of a transactional batch, as Kafka's partition
+/// leader maps its verification errors (`ReplicaManager`, `AddPartitionsToTxnManager`):
+/// `PRODUCER_FENCED` reads as `INVALID_PRODUCER_EPOCH`, and a coordinator that cannot answer yet
+/// as retriable `NOT_ENOUGH_REPLICAS`, which older clients retry without a metadata refresh.
+const fn verification_code(code: i16) -> i16 {
+    match code {
+        codes::PRODUCER_FENCED => codes::INVALID_PRODUCER_EPOCH,
+        codes::INVALID_PRODUCER_ID_MAPPING | codes::INVALID_TXN_STATE => code,
+        _ => codes::NOT_ENOUGH_REPLICAS,
+    }
 }
 
 impl Batch {
@@ -848,10 +940,17 @@ async fn append(
     batch: Batch,
     mut write: Write<'_>,
 ) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
-    // The mark on the first record is what a restarted gateway rebuilds this state from.
-    if let Some(first) = write.messages.first_mut()
+    if batch.txn.is_some() {
+        // Every record says whose transaction it is in, or Fetch would serve it as committed
+        // whatever the outcome. A batch that cannot carry it is refused, never sent unmarked.
+        if let Err(error) = mark_transaction(&mut write.messages, &batch) {
+            tracing::debug!(%error, "refused a transactional batch that cannot carry its marks");
+            return (Err(ERROR_INVALID_RECORD), Some(held));
+        }
+    } else if let Some(first) = write.messages.first_mut()
         && let Err(error) = mark_producer(first, batch.mark())
     {
+        // The mark on the first record is what a restarted gateway rebuilds this state from.
         tracing::debug!(%error, "sent an idempotent batch without its producer mark");
     }
     let Batch {
@@ -859,10 +958,18 @@ async fn append(
         epoch,
         first,
         last,
+        txn,
     } = batch;
     states.begin(&key, epoch, first, last);
     let states = Arc::clone(states);
     send_by(bridge, held, write, move |end| {
+        if let (Some(coordinator), SendEnd::Landed(Some(offset))) = (&txn, &end) {
+            coordinator.written(
+                &(key.topic.clone(), key.partition),
+                key.producer_id,
+                *offset,
+            );
+        }
         let landing = match end {
             SendEnd::Landed(offset) => Some(Landing::Landed(offset)),
             SendEnd::InDoubt(in_doubt) => Some(Landing::InDoubt(in_doubt)),
@@ -872,6 +979,24 @@ async fn append(
         states.finish(&key, epoch, first, landing);
     })
     .await
+}
+
+/// Marks every record of a transactional batch with its producer, epoch and sequence, and the
+/// first with `kafka.p` too.
+fn mark_transaction(
+    messages: &mut [IggyMessage],
+    batch: &Batch,
+) -> std::result::Result<(), RecordCodecError> {
+    for (index, message) in messages.iter_mut().enumerate() {
+        let delta = i32::try_from(index).unwrap_or(i32::MAX);
+        let mark = TxnMark {
+            producer_id: batch.key.producer_id,
+            epoch: batch.epoch,
+            sequence: last_sequence(batch.first, delta),
+        };
+        mark_transactional(message, mark, (index == 0).then(|| batch.mark()))?;
+    }
+    Ok(())
 }
 
 /// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
@@ -973,7 +1098,10 @@ const fn record_error_code(error: &RecordCodecError) -> i16 {
         | RecordCodecError::HeaderCountTooLarge { .. }
         | RecordCodecError::RecordTruncated
         | RecordCodecError::RecordFieldLength(_)
+        // KW-T: a plain batch in a transactional request.
+        | RecordCodecError::NotTransactional
         // Raised by `from_iggy` only, so Fetch is what actually answers for these.
+        | RecordCodecError::ControlRecord(_)
         | RecordCodecError::UserHeadersUnreadable(_)
         | RecordCodecError::MappingVersion(_)
         | RecordCodecError::ValueMarker(_)
@@ -1117,7 +1245,8 @@ mod tests {
         zstd: Zstd,
         entry: &PartitionProduceData,
     ) -> std::result::Result<(u32, Vec<IggyMessage>), i16> {
-        plan_partition(budget, zstd, TOPIC, entry, u64::MAX).map_err(|refusal| refusal.code)
+        plan_partition(budget, zstd, Transactional::Refused, TOPIC, entry, u64::MAX)
+            .map_err(|refusal| refusal.code)
     }
 
     fn planned(entry: &PartitionProduceData) -> std::result::Result<(u32, Vec<IggyMessage>), i16> {
@@ -1746,8 +1875,15 @@ mod tests {
     fn given_a_partition_past_the_send_cap_when_planned_should_answer_too_large() {
         let batch = encode_batch(&mut [record(0, b"value")]).unwrap();
         let budget = partition_budget(TEST_BUDGET, usize::MAX);
-        let refusal =
-            plan_partition(&budget, Zstd::Allowed, TOPIC, &entry(0, Some(batch)), 8).unwrap_err();
+        let refusal = plan_partition(
+            &budget,
+            Zstd::Allowed,
+            Transactional::Refused,
+            TOPIC,
+            &entry(0, Some(batch)),
+            8,
+        )
+        .unwrap_err();
         assert_eq!(refusal.code, ERROR_MESSAGE_TOO_LARGE);
     }
 }

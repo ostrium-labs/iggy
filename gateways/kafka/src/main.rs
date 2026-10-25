@@ -38,6 +38,7 @@ use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::protocol::sasl::{EnabledMechanisms, SaslMechanism};
 use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
 use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
+use iggy_gateway_kafka::transactions::TransactionConfig;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[tokio::main]
@@ -192,6 +193,9 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS",
     "IGGY_KAFKA_SASL_MECHANISMS",
     "IGGY_KAFKA_CONNECTIONS_MAX_REAUTH_MS",
+    "IGGY_KAFKA_TRANSACTIONS_ENABLED",
+    "IGGY_KAFKA_TRANSACTION_MAX_TIMEOUT_MS",
+    "IGGY_KAFKA_TRANSACTION_ABORT_INTERVAL_MS",
 ];
 
 /// The variables of the single-listener form, which `IGGY_KAFKA_LISTENERS` replaces as a whole.
@@ -366,6 +370,7 @@ fn load_config() -> Result<GatewayConfig, String> {
     }
     config.membership = load_membership(bridge_enabled()?)?;
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
+    config.transactions = load_transactions(bridge_enabled()?)?;
     if config.auto_topic_creation.enabled {
         info!(
             partitions = config.auto_topic_creation.partitions,
@@ -712,6 +717,45 @@ fn load_auto_topic_creation(bridge_enabled: bool) -> Result<AutoTopicCreationCon
         enabled,
         partitions,
     })
+}
+
+/// The transaction coordinator's settings (`IGGY_KAFKA_TRANSACTIONS_ENABLED`, KW-T), `None` when
+/// transactions are off, which is the default.
+fn load_transactions(bridge_enabled: bool) -> Result<Option<TransactionConfig>, String> {
+    let enabled = match env_var("IGGY_KAFKA_TRANSACTIONS_ENABLED") {
+        Some(raw) => parse_bool("IGGY_KAFKA_TRANSACTIONS_ENABLED", &raw)?,
+        None => false,
+    };
+    let max_timeout = env_var("IGGY_KAFKA_TRANSACTION_MAX_TIMEOUT_MS");
+    let abort_interval = env_var("IGGY_KAFKA_TRANSACTION_ABORT_INTERVAL_MS");
+    if !enabled {
+        if max_timeout.is_some() || abort_interval.is_some() {
+            return Err("IGGY_KAFKA_TRANSACTION_* is set but \
+                 IGGY_KAFKA_TRANSACTIONS_ENABLED is not true"
+                .to_string());
+        }
+        return Ok(None);
+    }
+    if !bridge_enabled {
+        return Err(
+            "IGGY_KAFKA_TRANSACTIONS_ENABLED needs IGGY_KAFKA_BRIDGE_ENABLED=true".to_string(),
+        );
+    }
+    let mut config = TransactionConfig::default();
+    if let Some(raw) = max_timeout {
+        let millis: u64 = parse_positive("IGGY_KAFKA_TRANSACTION_MAX_TIMEOUT_MS", &raw)?;
+        config.max_timeout = Duration::from_millis(millis);
+    }
+    // Kafka's transaction.abort.timed.out.transaction.cleanup.interval.ms.
+    if let Some(raw) = abort_interval {
+        let millis: u64 = parse_positive("IGGY_KAFKA_TRANSACTION_ABORT_INTERVAL_MS", &raw)?;
+        config.abort_interval = Duration::from_millis(millis);
+    }
+    info!(
+        max_timeout_ms = config.max_timeout.as_millis(),
+        "Kafka transactions are on (KW-T)"
+    );
+    Ok(Some(config))
 }
 
 /// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM (`docker stop`).

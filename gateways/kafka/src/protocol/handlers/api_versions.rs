@@ -28,6 +28,7 @@ use crate::protocol::api::{
     is_supported_version, sasl_advertised_ranges, scram_advertised_ranges, supported_api_ranges,
 };
 use crate::protocol::bounds_guard::validate_api_versions_shape;
+use crate::protocol::handlers::txn::TXN_ADVERTISED_RANGES;
 use crate::protocol::handlers::{decode_guarded, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -38,6 +39,7 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 
 /// Which of the listener-dependent keys one connection is told about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // one flag per listener-dependent key set
 pub struct Advertisement {
     /// `SaslHandshake` and `SaslAuthenticate`.
     pub sasl: bool,
@@ -46,6 +48,8 @@ pub struct Advertisement {
     /// `DescribeUserScramCredentials` and `AlterUserScramCredentials`: SCRAM is enabled, the
     /// bridge keeps the credentials, and the listener names the principal that asks.
     pub scram: bool,
+    /// `AddPartitionsToTxn` and `EndTxn`: transactions are on (KW-T).
+    pub transactions: bool,
 }
 
 impl Advertisement {
@@ -54,6 +58,7 @@ impl Advertisement {
         sasl: false,
         acls: false,
         scram: false,
+        transactions: false,
     };
 
     /// Both: a listener that runs SASL always names a principal.
@@ -61,6 +66,7 @@ impl Advertisement {
         sasl: true,
         acls: true,
         scram: false,
+        transactions: false,
     };
 }
 
@@ -129,11 +135,17 @@ pub fn encode_response(
     } else {
         &[][..]
     };
+    let transactions = if advertisement.transactions {
+        TXN_ADVERTISED_RANGES
+    } else {
+        &[][..]
+    };
     let mut rows: Vec<&ApiVersionRange> = supported_api_ranges()
         .iter()
         .chain(sasl)
         .chain(acls)
         .chain(scram)
+        .chain(transactions)
         .collect();
     rows.sort_unstable_by_key(|r| r.api_key);
     let api_keys = rows

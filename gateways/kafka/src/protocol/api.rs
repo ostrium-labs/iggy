@@ -57,6 +57,7 @@ use crate::protocol::sasl::{
     EnabledMechanisms, encode_sasl_authenticate_response, encode_sasl_handshake_response,
 };
 use crate::topic_id::TopicIds;
+use crate::transactions::TransactionCoordinator;
 
 pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
@@ -362,7 +363,7 @@ pub struct GatewayState {
     pub max_frame_size: usize,
     /// Shared across every connection this gateway serves: a producer id has to be unique for
     /// the process, not for the connection that asked for it.
-    pub producer_ids: ProducerIdAllocator,
+    pub producer_ids: Arc<ProducerIdAllocator>,
     /// Idempotent producer state, per producer id and partition: what lets Produce answer a
     /// retried batch instead of writing it twice. Shared across connections, since a producer
     /// retries on whichever connection it has.
@@ -401,6 +402,9 @@ pub struct GatewayState {
     /// The other gateways in front of the same Iggy cluster, and which groups and partitions
     /// this one owns. A gateway that runs alone owns all of them, as node 1.
     pub membership: Arc<Membership>,
+    /// The transaction coordinator, present only while `IGGY_KAFKA_TRANSACTIONS_ENABLED` is on
+    /// (KW-T). Without it, transactions are refused as `docs/IDEMPOTENCE.md` describes.
+    pub transactions: Option<Arc<TransactionCoordinator>>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -424,7 +428,7 @@ impl GatewayState {
         Self {
             bridge,
             max_frame_size,
-            producer_ids: ProducerIdAllocator::new(instance_id),
+            producer_ids: Arc::new(ProducerIdAllocator::new(instance_id)),
             producer_states: Arc::default(),
             produce_memory: Arc::new(Semaphore::new(
                 PRODUCE_CAPS
@@ -441,6 +445,7 @@ impl GatewayState {
             auto_topic_creation: None,
             topic_ids: TopicIds::default(),
             membership: Arc::default(),
+            transactions: None,
         }
     }
 
@@ -449,6 +454,13 @@ impl GatewayState {
     pub fn with_membership(mut self, membership: Arc<Membership>) -> Self {
         self.groups.set_membership(Arc::clone(&membership));
         self.membership = membership;
+        self
+    }
+
+    /// Serves transactions through `coordinator` (KW-T).
+    #[must_use]
+    pub fn with_transactions(mut self, coordinator: Arc<TransactionCoordinator>) -> Self {
+        self.transactions = Some(coordinator);
         self
     }
 
@@ -521,6 +533,7 @@ impl GatewayState {
 /// listeners answers Metadata and `ApiVersions` differently on each: a client is pointed back at
 /// the port it used, and the SASL keys are advertised only where the exchange is run.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // one flag per listener-dependent key set
 pub struct ConnectionState {
     /// The broker address this connection's listener advertises.
     pub broker: BrokerAdvertise,
@@ -535,6 +548,8 @@ pub struct ConnectionState {
     pub acls_enabled: bool,
     /// Whether the SCRAM credential keys are advertised and answered.
     pub scram_admin: bool,
+    /// Whether the transaction keys are advertised and answered (KW-T).
+    pub transactions: bool,
     /// Partitions that answered -1 to this connection's Fetches, per Kafka topic.
     pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
     /// Offsets this connection's Fetches cannot place, per Kafka topic.
@@ -579,7 +594,15 @@ impl ConnectionState {
             sasl: self.sasl_enabled,
             acls: self.acls_enabled,
             scram: self.scram_admin,
+            transactions: self.transactions,
         }
+    }
+
+    /// Serves the transaction keys on this connection (KW-T).
+    #[must_use]
+    pub const fn with_transactions(mut self, transactions: bool) -> Self {
+        self.transactions = transactions;
+        self
     }
 
     /// Serves `DescribeUserScramCredentials` and `AlterUserScramCredentials` on this connection.

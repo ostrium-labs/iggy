@@ -19,9 +19,10 @@
 //! record, so the state of a producer can be rebuilt from the log (KW-3 part 3).
 //!
 //! The value is 20 bytes, big-endian: a layout byte (1), the producer id (`i64`), the epoch
-//! (`i16`), the first and the last sequence (`i32` each), and a flags byte. No flag is set today;
-//! bit 0 is kept for a transactional batch (KW-T). A message that carries the marker says
-//! `kafka.v` 2: mapping version 1 plus this header. Every other message stays at version 1.
+//! (`i16`), the first and the last sequence (`i32` each), and a flags byte. Bit 0
+//! ([`FLAG_TRANSACTIONAL`]) marks a transactional batch (KW-T); no other bit is set. A message that
+//! carries the marker says `kafka.v` 2: mapping version 1 plus this header. Every other message
+//! stays at version 1.
 
 use iggy::prelude::IggyMessage;
 
@@ -32,11 +33,14 @@ pub const PRODUCER_HEADER: &str = "kafka.p";
 /// The mapping version of a message that carries [`PRODUCER_HEADER`].
 pub const PRODUCER_MAPPING_VERSION: u8 = 2;
 
+/// Flag bit of a transactional batch's marker (KW-T). Its records also carry `kafka.t`.
+pub const FLAG_TRANSACTIONAL: u8 = 0b1;
+
 /// Layout version of the marker value.
 const MARK_LAYOUT: u8 = 1;
 const MARK_BYTES: usize = 20;
 
-static PRODUCER_KEY: std::sync::LazyLock<iggy::prelude::HeaderKey> =
+pub(super) static PRODUCER_KEY: std::sync::LazyLock<iggy::prelude::HeaderKey> =
     std::sync::LazyLock::new(|| header_key(PRODUCER_HEADER));
 
 /// Which producer wrote a batch, and its sequences.
@@ -50,13 +54,17 @@ pub struct ProducerMark {
 
 impl ProducerMark {
     fn encode(self) -> [u8; MARK_BYTES] {
+        self.encode_flagged(0)
+    }
+
+    pub(super) fn encode_flagged(self, flags: u8) -> [u8; MARK_BYTES] {
         let mut value = [0; MARK_BYTES];
         value[0] = MARK_LAYOUT;
         value[1..9].copy_from_slice(&self.producer_id.to_be_bytes());
         value[9..11].copy_from_slice(&self.epoch.to_be_bytes());
         value[11..15].copy_from_slice(&self.first_sequence.to_be_bytes());
         value[15..19].copy_from_slice(&self.last_sequence.to_be_bytes());
-        // value[19]: flags, none set.
+        value[19] = flags;
         value
     }
 

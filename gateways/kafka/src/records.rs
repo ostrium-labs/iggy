@@ -50,9 +50,15 @@ pub const VERSION_HEADER: &str = "kafka.v";
 pub const MAPPING_VERSION: u8 = 1;
 
 mod producer_mark;
+mod txn_mark;
 
 pub use producer_mark::{
-    PRODUCER_HEADER, PRODUCER_MAPPING_VERSION, ProducerMark, mark as mark_producer, mark_of,
+    FLAG_TRANSACTIONAL, PRODUCER_HEADER, PRODUCER_MAPPING_VERSION, ProducerMark,
+    mark as mark_producer, mark_of,
+};
+pub use txn_mark::{
+    CONTROL_HEADER, CONTROL_MAPPING_VERSION, ControlType, TXN_HEADER, TxnMark, control_message,
+    control_of, mark_transactional, txn_mark_of,
 };
 
 /// Iggy header carrying the Kafka record key.
@@ -129,7 +135,9 @@ pub enum RecordCodecError {
     TimestampOutOfRange(i64),
     #[error("{0} bytes of stored user headers did not parse")]
     UserHeadersUnreadable(u32),
-    #[error("stored mapping version {0} is not {MAPPING_VERSION} or {PRODUCER_MAPPING_VERSION}")]
+    #[error(
+        "stored mapping version {0} is not {MAPPING_VERSION}, {PRODUCER_MAPPING_VERSION} or {CONTROL_MAPPING_VERSION}"
+    )]
     MappingVersion(u8),
     #[error("value marker {0:?} is neither null nor empty")]
     ValueMarker(Bytes),
@@ -167,6 +175,10 @@ pub enum RecordCodecError {
     TransactionalBatch,
     #[error("control batches are not supported")]
     ControlBatch,
+    #[error("a transactional Produce request carries a batch that is not transactional")]
+    NotTransactional,
+    #[error("stored control record at offset {0} does not parse")]
+    ControlRecord(i64),
     #[error("partition decompresses to at least {size} bytes, over its {limit} byte cap")]
     BudgetExceeded { size: usize, limit: usize },
     #[error("partition needs {count} record slots, over its {limit} slot cap")]
@@ -329,14 +341,25 @@ pub fn from_iggy_with(message: &IggyMessage, offset: i64) -> Result<(Record, Opt
     }
     let stored = user_headers(message)?;
     let timestamp = stored_timestamp(message, &stored)?;
-    let (key, value, headers, list) = if !stored.contains_key(&VERSION_KEY) {
-        foreign_fields(message, &stored)
-    } else if let Some(envelope) = stored.get(&ENVELOPE_KEY) {
+    if !stored.contains_key(&VERSION_KEY) {
+        let (key, value, headers, list) = foreign_fields(message, &stored);
+        return Ok((record(key, value, headers, offset, timestamp), list));
+    }
+    // KW-T: a control record ends a transaction, and a transactional record says whose it is.
+    if txn_mark::is_control(&stored) {
+        let control = txn_mark::control_record(message, &stored, offset, timestamp)?;
+        return Ok((control, None));
+    }
+    let (key, value, headers, list) = if let Some(envelope) = stored.get(&ENVELOPE_KEY) {
         decode_envelope(envelope.as_bytes(), &message.payload)?
     } else {
         gateway_fields(message, &stored)?
     };
-    Ok((record(key, value, headers, offset, timestamp), list))
+    let mut record = record(key, value, headers, offset, timestamp);
+    if let Some(mark) = txn_mark::txn_mark_in(&stored) {
+        txn_mark::apply(&mut record, mark);
+    }
+    Ok((record, list))
 }
 
 /// The timestamp [`from_iggy`] reports for `message`, read from its headers alone.
@@ -361,8 +384,16 @@ fn stored_timestamp(
     let Some(version) = stored.get(&VERSION_KEY) else {
         return Ok(timestamp_out(message));
     };
-    // Version 2 is version 1 plus the `kafka.p` marker, which no Kafka field reads.
-    if version.as_bytes() != [MAPPING_VERSION] && version.as_bytes() != [PRODUCER_MAPPING_VERSION] {
+    // Version 2 is version 1 plus the `kafka.p` marker, which no Kafka field reads. Version 3 is
+    // a control record (KW-T).
+    if ![
+        MAPPING_VERSION,
+        PRODUCER_MAPPING_VERSION,
+        CONTROL_MAPPING_VERSION,
+    ]
+    .iter()
+    .any(|known| version.as_bytes() == [*known])
+    {
         let version = version.as_bytes().first().copied().unwrap_or_default();
         return Err(RecordCodecError::MappingVersion(version));
     }
@@ -1021,8 +1052,34 @@ pub fn decode_batch(
     budget: &DecompressionBudget,
     zstd: Zstd,
 ) -> Result<DecodedBatch> {
+    decode_batch_as(buf, budget, zstd, Transactional::Refused)
+}
+
+/// Whether a Produce partition may carry a transactional batch: only in a request that names a
+/// transactional id, on a gateway that serves transactions (KW-T).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transactional {
+    /// Refused with [`RecordCodecError::TransactionalBatch`].
+    Refused,
+    /// Required: a batch that is not transactional is refused with
+    /// [`RecordCodecError::NotTransactional`].
+    Required,
+}
+
+/// [`decode_batch`], taking a transactional batch when `transactional` requires one.
+///
+/// # Errors
+///
+/// As [`decode_batch`], and [`RecordCodecError::NotTransactional`] for a plain batch where a
+/// transactional one is required.
+pub fn decode_batch_as(
+    buf: &mut Bytes,
+    budget: &DecompressionBudget,
+    zstd: Zstd,
+    transactional: Transactional,
+) -> Result<DecodedBatch> {
     budget.start_entry()?;
-    preflight(buf, budget, zstd)?;
+    preflight(buf, budget, zstd, transactional)?;
     if !buf.has_remaining() {
         return Ok(DecodedBatch::default());
     }
@@ -1062,7 +1119,12 @@ pub fn decode_batch(
 /// - Control and transactional batches are refused: a stored message cannot carry their flags.
 ///   An idempotent batch passes, its producer id, epoch and sequence ignored, because a stock
 ///   Java producer is idempotent. `IDEMPOTENCE.md` has why a retry is then not deduplicated.
-fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()> {
+fn preflight(
+    buf: &Bytes,
+    budget: &DecompressionBudget,
+    zstd: Zstd,
+    transactional: Transactional,
+) -> Result<()> {
     let mut rest = buf.clone();
     let infos = RecordBatchDecoder::decode_batch_info(&mut rest)
         .map_err(|error| RecordCodecError::Batch(error.to_string()))?;
@@ -1076,11 +1138,13 @@ fn preflight(buf: &Bytes, budget: &DecompressionBudget, zstd: Zstd) -> Result<()
     if rest.has_remaining() {
         return Err(RecordCodecError::BatchTrailingBytes(rest.remaining()));
     }
-    if info.transactional {
-        return Err(RecordCodecError::TransactionalBatch);
-    }
     if info.control {
         return Err(RecordCodecError::ControlBatch);
+    }
+    match (transactional, info.transactional) {
+        (Transactional::Refused, true) => return Err(RecordCodecError::TransactionalBatch),
+        (Transactional::Required, false) => return Err(RecordCodecError::NotTransactional),
+        _ => {}
     }
     if zstd == Zstd::Refused && info.compression == Compression::Zstd {
         return Err(RecordCodecError::ZstdTooEarly);
@@ -1128,10 +1192,70 @@ pub fn encode_batch(records: &mut [Record]) -> Result<Bytes> {
 ///
 /// As [`encode_batch`].
 pub fn encode_batch_with(records: &mut [Record], repeated: &RepeatedHeaders) -> Result<Bytes> {
+    if records.is_empty() {
+        return Ok(Bytes::new());
+    }
+    // One batch per run of records that share a producer (KW-T): a transactional run keeps its
+    // producer id, epoch and sequences, a control record stands alone, and everything else is one
+    // batch as before. Without transactional records the whole slice is one run.
+    let mut out: Option<BytesMut> = None;
+    let mut start = 0;
+    while start < records.len() {
+        let end = start + run_length(&records[start..]);
+        let run_repeated: RepeatedHeaders = repeated
+            .iter()
+            .filter(|(at, _)| (start..end).contains(at))
+            .map(|(at, list)| (at - start, list.clone()))
+            .collect();
+        let batch = encode_one_batch(&mut records[start..end], &run_repeated)?;
+        if start == 0 && end == records.len() {
+            return Ok(batch);
+        }
+        out.get_or_insert_with(BytesMut::new).put_slice(&batch);
+        start = end;
+    }
+    Ok(out.map_or_else(Bytes::new, BytesMut::freeze))
+}
+
+/// How many records from the start of `records` share its first record's batch.
+fn run_length(records: &[Record]) -> usize {
+    if records.is_empty() {
+        return 0;
+    }
+    1 + records
+        .windows(2)
+        .take_while(|pair| continues_batch(&pair[0], &pair[1]))
+        .count()
+}
+
+/// Whether `next` goes in the same encoded batch as `previous`, the record before it (KW-T): two
+/// records without a producer do, a control record never shares one, and a producer's records do
+/// while the producer, epoch and transactional flag hold and their sequences follow their offsets.
+#[must_use]
+pub(crate) fn continues_batch(previous: &Record, next: &Record) -> bool {
+    if previous.control || next.control {
+        return false;
+    }
+    if previous.producer_id == NO_PRODUCER_ID || next.producer_id == NO_PRODUCER_ID {
+        return previous.producer_id == next.producer_id;
+    }
+    let gap = |record: &Record| record.offset.wrapping_sub(i64::from(record.sequence));
+    previous.producer_id == next.producer_id
+        && previous.producer_epoch == next.producer_epoch
+        && previous.transactional == next.transactional
+        && gap(previous) == gap(next)
+}
+
+/// Encodes one run as one batch. A run without a producer gets the sequences that make its
+/// `base_sequence` come out at `NO_SEQUENCE`; a producer's run keeps its own.
+fn encode_one_batch(records: &mut [Record], repeated: &RepeatedHeaders) -> Result<Bytes> {
     let Some(base) = records.first().map(|record| record.offset) else {
         return Ok(Bytes::new());
     };
-    for record in records.iter_mut() {
+    for record in records
+        .iter_mut()
+        .filter(|record| record.producer_id == NO_PRODUCER_ID)
+    {
         let delta = record.offset.saturating_sub(base);
         record.sequence = i32::try_from(delta)
             .unwrap_or(i32::MAX)
@@ -1649,10 +1773,10 @@ mod tests {
 
     #[test]
     fn given_an_unknown_mapping_version_when_read_should_fail() {
-        let message = message_with(b"v", &[(VERSION_HEADER, &[PRODUCER_MAPPING_VERSION + 1])]);
+        let message = message_with(b"v", &[(VERSION_HEADER, &[CONTROL_MAPPING_VERSION + 1])]);
         assert!(matches!(
             from_iggy(&message, 0),
-            Err(RecordCodecError::MappingVersion(3))
+            Err(RecordCodecError::MappingVersion(4))
         ));
     }
 
@@ -1837,7 +1961,7 @@ mod tests {
             message_with(b"v", &[("trace", b"abc")]),
             foreign_with_ts,
             gateway_message(b"v", &[(TIMESTAMP_HEADER, b"epoch")]),
-            message_with(b"v", &[(VERSION_HEADER, &[PRODUCER_MAPPING_VERSION + 1])]),
+            message_with(b"v", &[(VERSION_HEADER, &[CONTROL_MAPPING_VERSION + 1])]),
             unreadable,
         ];
         for (index, message) in messages.iter_mut().enumerate() {

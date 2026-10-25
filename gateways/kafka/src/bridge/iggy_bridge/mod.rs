@@ -47,6 +47,7 @@ mod produce;
 mod producer_log;
 mod scram_store;
 mod topics;
+mod txn_log;
 
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
@@ -66,6 +67,7 @@ pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad, kafka_topic_details_id, kafka_topic_id,
 };
+pub use txn_log::{IggyTxnLog, TXN_STATE_TOPIC};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
 ///
