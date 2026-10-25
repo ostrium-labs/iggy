@@ -88,6 +88,7 @@ fn text(value: &str) -> StrBytes {
 const CLIENT_QUOTAS_MAX_VERSION: i16 = 1;
 
 /// Answers `DescribeClientQuotas` (48): no entity has a quota, since the gateway enforces none.
+///
 /// Served with the SCRAM keys, for `kafka-configs --describe --entity-type users`, and gated as
 /// Kafka gates it, on describing the cluster (here Iggy's `read_users`).
 #[must_use]
