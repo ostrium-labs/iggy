@@ -112,7 +112,7 @@ async fn send_values(server: &TestServer, count: usize) {
     send(server, &mut messages).await;
 }
 
-async fn call<Req: Encodable, Resp: Decodable>(
+async fn call<Req: Encodable + Sync, Resp: Decodable>(
     state: &GatewayState,
     api_key: i16,
     version: i16,
