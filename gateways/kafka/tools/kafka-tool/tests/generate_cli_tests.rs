@@ -114,3 +114,28 @@ fn generate_above_max_writes_the_next_version_with_the_newest_body() {
     assert_eq!(newest[12..], above[12..]);
     assert!(!has_file_with_prefix(&output.0, "000_Produce_v15"));
 }
+
+#[test]
+fn generate_above_max_follows_the_newest_version_that_builds() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let output = TempOutputDir(std::env::temp_dir().join(format!("kafka-gen-lo-{nanos}")));
+    let status = Command::new(env!("CARGO_BIN_EXE_kafka-message-gen"))
+        .arg("generate")
+        .arg("--output")
+        .arg(&output.0)
+        .arg("--api-key")
+        .arg("2")
+        .arg("--above-max")
+        .status()
+        .expect("run kafka-message-gen generate --above-max");
+    assert!(status.success(), "generate --above-max: {status:?}");
+    // The schema reaches ListOffsets v11, but `kafka-protocol` 0.18 encodes up to v10, so the
+    // version after the newest that builds is v11, carrying v10's body.
+    assert!(output.0.join("002_ListOffsets_v10.bin").is_file());
+    let above = std::fs::read(output.0.join("002_ListOffsets_v11.bin")).expect("v11 written");
+    assert_eq!(i16::from_be_bytes([above[6], above[7]]), 11);
+    assert!(!has_file_with_prefix(&output.0, "002_ListOffsets_v12"));
+}
