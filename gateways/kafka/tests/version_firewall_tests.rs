@@ -72,8 +72,8 @@ use wire::{
 };
 
 #[test]
-fn supported_ranges_table_has_twenty_four_entries() {
-    assert_eq!(supported_api_ranges().len(), 24);
+fn supported_ranges_table_has_twenty_five_entries() {
+    assert_eq!(supported_api_ranges().len(), 25);
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn is_supported_version_matches_scope_table() {
 /// `ListGroups`, `ApiVersions`, `CreateTopics`, `DeleteTopics`, `InitProducerId`,
 /// `DescribeConfigs`, `AlterConfigs`, `CreatePartitions`, `DeleteGroups`,
 /// `IncrementalAlterConfigs`, `OffsetDelete`, `DescribeCluster`).
-/// `supported_ranges_table_has_twenty_four_entries` and `is_supported_version_matches_scope_table`
+/// `supported_ranges_table_has_twenty_five_entries` and `is_supported_version_matches_scope_table`
 /// pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
