@@ -793,8 +793,12 @@ derive group access from topic read access, and record that one tenant can disru
 membership (not read its data) as an open question. CreateAcls/DeleteAcls map only the exact cases
 (TOPIC literal READ→poll, WRITE→send, ALL→manage_topic; DESCRIBE only alongside READ/WRITE; TOPIC
 `*`→default-stream permissions) and refuse the rest with a message; topics must exist (Iggy keys
-grants by id). Quotas (48, 49) stay on request. This needs an owner decision before building,
-since it replaces the plan's default.
+grants by id). Quotas (48, 49) stay on request.
+
+**Ruling (owner, 2026-10-25; section 9, item 7).** Approved as above, with one change to the group
+rule: group ids are scoped per principal, so a principal sees, joins and deletes only the groups in
+its own namespace. One tenant can no longer disrupt another's group membership, which closes the
+open question above.
 
 ### KW-11. Repeated header names and header order
 
@@ -1168,12 +1172,22 @@ recommendations").
    stored as a topic option at creation and minted once for existing topics on
    first read.
 
+### Approved (owner, 2026-10-25)
+
+7. **KW-10: the gateway enforces each Kafka principal's own Iggy permissions.**
+   SCRAM, OAUTHBEARER and PLAIN principals map to Iggy users, and the bridge's
+   Iggy user is the ceiling (replacing the plan's one-Iggy-session-per-principal
+   default, which cannot work for SCRAM, OAUTHBEARER and certificate principals).
+   Kafka consumer groups have no Iggy equivalent, so group access follows topic
+   read access, **and group ids are scoped per principal**: a principal can only
+   see, join or delete groups in its own namespace, so tenants cannot disrupt
+   each other's groups. The ACL admin APIs map onto that. Quota admin (48, 49)
+   stays "on request". Built after KW-9, KW-8 and KW-5 land (it builds on KW-9's
+   SASL).
+
 ### Still open
 
 1. Upstream: may the fork's tasks be offered upstream as they finish (one PR
    per issue, after assignment), starting with KW-1/KW-2 (#4531) and KW-3
    (#4513)? Default: no posting until the owner says so. **Not approved on
    2026-10-24; stays open.** This includes the KW-6 design note.
-2. KW-10: enforce each principal's Iggy permissions in the gateway (the bridge's user as the
-   ceiling), instead of the plan's one-Iggy-session-per-principal default, which cannot work for
-   OAUTHBEARER, SCRAM and certificate principals? See KW-10's status note.
