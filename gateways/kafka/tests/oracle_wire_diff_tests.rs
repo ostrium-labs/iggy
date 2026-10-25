@@ -855,9 +855,14 @@ async fn delete_records(
     let (at_start, records) = fetch(client, &name, 2).await?;
     facts.set("fetch_at_start.error", at_start.error_code);
     facts.set("fetch_at_start.log_start_offset", at_start.log_start_offset);
+    // Kafka answers with whole batches, so its reply starts at the batch's base offset and the
+    // client drops the records below the one it asked for. Compare what the client keeps.
     facts.set(
         "fetch_at_start.first_offset",
-        records.first().map_or(-1, |record| record.offset),
+        records
+            .iter()
+            .find(|record| record.offset >= 2)
+            .map_or(-1, |record| record.offset),
     );
 
     let (error, low) = delete_records_to(client, &name, 0, 1).await?;
