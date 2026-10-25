@@ -148,7 +148,7 @@ async fn transactional(
     // v3 and later name the producer's own id and epoch (KIP-360); both or neither.
     let expected = match (request.producer_id.0, request.producer_epoch) {
         (-1, -1) => None,
-        (-1, _) | (_, -1) => return encode_error_response(version, codes::INVALID_REQUEST),
+        (-1, _) | (_, -1) => return encode_with_epoch(version, codes::INVALID_REQUEST, -1, -1),
         (id, epoch) => Some((id, epoch)),
     };
     match coordinator
@@ -156,9 +156,12 @@ async fn transactional(
         .await
     {
         Ok((producer_id, epoch)) => encode_with_epoch(version, ERROR_NONE, producer_id, epoch),
-        Err(code) => encode_error_response(
+        // Kafka's `initTransactionError`: no producer id, no epoch.
+        Err(code) => encode_with_epoch(
             version,
             codes::fenced_for(code, version >= PRODUCER_FENCED_VERSION),
+            -1,
+            -1,
         ),
     }
 }
@@ -207,8 +210,7 @@ fn clock_counter() -> u64 {
 }
 
 fn encode_inner(version: i16, error_code: i16, producer_id: i64) -> Result<Bytes> {
-    let epoch = if producer_id < 0 { -1 } else { PRODUCER_EPOCH };
-    encode_with_epoch(version, error_code, producer_id, epoch)
+    encode_with_epoch(version, error_code, producer_id, PRODUCER_EPOCH)
 }
 
 fn encode_with_epoch(version: i16, error_code: i16, producer_id: i64, epoch: i16) -> Result<Bytes> {
