@@ -205,7 +205,7 @@ breadth. Status is `Planned` unless noted.
 | KW-2 | Client compatibility matrix: smoke on PRs, full nightly | #4531 | **Built** (smoke green locally; nightly first run pending in fork CI) | KW-1 | Yes |
 | KW-3 | Idempotent producer: dedup, ordering, restart safety | #4513 | **Built** (parts 1–3); Java/franz-go e2e under injected timeouts open | KW-1 | Yes |
 | KW-4 | Topic configurations frameworks send | #4508 | **Built, in review** (fork PR #13): unit tests and clippy pass locally; real-server, Java and oracle suites not yet run (local memlock limit); framework exit criteria wait on the KW-2 nightly matrix | KW-1 | Only if krishvishal has not landed it |
-| KW-5 | Several gateways behind one bootstrap | #4515 | **Built** (fork PR #8; local CI fixes: a dropped gateway stops heartbeating, membership tests wait for a settled view; producer-state handover waits for KW-3 state in Iggy, see As built) | KW-3 | Yes (design first) |
+| KW-5 | Several gateways behind one bootstrap | #4515 | **Built** (fork PR #8; local CI fixes: a dropped gateway stops heartbeating, membership tests wait for a settled view; producer-state handover on a leadership move still open, see As built) | KW-3 | Yes (design first) |
 | KW-6 | Log compaction | #4521 | Planned; design note drafted (`docs/loams/compaction-design.md`, PR #13), nothing built | KW-4 | Design discussion first |
 | KW-7 | Real log start offset and DeleteRecords | #4525 | **Built** (gateway side; disk reclaim below the watermark planned) | KW-1 | Yes |
 | KW-8 | Newer protocol versions and topic ids | #4527 | **Built** (fork PR #10; full suite and oracle green in local CI; see As built) | KW-1 | Yes |
@@ -572,8 +572,13 @@ part 3: today the new leader accepts the producer at any sequence, at-least-once
 and CreatePartitions still validate a replication factor of 1 and assignments naming node 1
 (#4508 owns replication factor semantics); librdkafka in the failover scenario (nightly matrix,
 KW-2).
-Verified locally: clippy clean on the library, 866 library tests pass (10 of them for
-membership). Not yet run anywhere: `membership_real_bridge_tests.rs` and
+Local CI fixes (2026-10-25): `KafkaGateway::run` now owns what it starts, so a dropped (aborted)
+gateway stops heartbeating, without a goodbye, as a crash does; before, the spawned heartbeat task
+outlived it and the "crashed" gateway's lease never expired. The membership tests wait until an
+agreement holds for a join delay plus two heartbeats: the first agreement can come while the newest
+gateway is still in its join delay, and the leaders captured then move once it is over.
+Earlier status, superseded by the local CI run on the PR: clippy clean on the library, 866 library
+tests pass (10 of them for membership). Not yet run anywhere: `membership_real_bridge_tests.rs` and
 `multi_gateway_oracle_tests.rs` (the shared build target was cleared mid-run and fork Actions
 are disabled); they must pass in `Kafka gateway required` before PR #8 merges.
 
