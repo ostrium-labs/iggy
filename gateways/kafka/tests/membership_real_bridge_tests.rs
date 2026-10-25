@@ -52,7 +52,7 @@ mod iggy_server;
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use gateways::{Gateway, HEARTBEAT, LEASE};
+use gateways::{Gateway, HEARTBEAT, JOIN_DELAY, LEASE};
 use iggy_server::TestServer;
 use oracle::WireClient;
 
@@ -66,6 +66,12 @@ const ERROR_MEMBER_ID_REQUIRED: i16 = 79;
 
 /// How long a test waits for the gateways to agree.
 const CONVERGE: Duration = Duration::from_secs(20);
+
+/// How long an agreement must hold before a test relies on it. Every gateway can list a node as
+/// a broker while it is still in its join delay and leads nothing; it takes the partitions it
+/// leads once the delay is over, and the others hear that within a heartbeat. An agreement seen
+/// earlier can be the one before that move.
+const SETTLE: Duration = JOIN_DELAY.saturating_add(HEARTBEAT.saturating_mul(2));
 
 async fn client(gateway: &Gateway) -> WireClient {
     WireClient::connect(&gateway.addr.to_string())
@@ -159,9 +165,11 @@ async fn coordinators(gateway: &Gateway, groups: &[String]) -> Vec<(i32, u16)> {
 }
 
 /// Waits until every gateway of `gateways` reports exactly `expected` as its brokers, and all
-/// agree on the controller and the leaders. Returns what they agreed on.
-async fn converge(gateways: &[&Gateway], expected: &[i32]) -> Reported {
+/// agree on the controller and the leaders, and keep agreeing for [`SETTLE`]. Returns what they
+/// agreed on, and when they first did.
+async fn converge(gateways: &[&Gateway], expected: &[i32]) -> (Reported, tokio::time::Instant) {
     let deadline = tokio::time::Instant::now() + CONVERGE;
+    let mut agreed: Option<(Reported, tokio::time::Instant)> = None;
     loop {
         let mut reports = Vec::new();
         for gateway in gateways {
@@ -175,7 +183,18 @@ async fn converge(gateways: &[&Gateway], expected: &[i32]) -> Reported {
                     .all(|leader| expected.contains(leader))
         });
         if ids_match && reports.windows(2).all(|pair| pair[0] == pair[1]) {
-            return reports.swap_remove(0);
+            let report = reports.swap_remove(0);
+            match agreed.take() {
+                Some((previous, since)) if previous == report => {
+                    if since.elapsed() >= SETTLE {
+                        return (report, since);
+                    }
+                    agreed = Some((previous, since));
+                }
+                _ => agreed = Some((report, tokio::time::Instant::now())),
+            }
+        } else {
+            agreed = None;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -320,7 +339,7 @@ async fn given_three_gateways_should_agree_on_brokers_coordinators_and_leaders()
     let gateways = start_three(&server).await;
     let all: Vec<&Gateway> = gateways.iter().collect();
 
-    let reported = converge(&all, &[1, 2, 3]).await;
+    let (reported, _) = converge(&all, &[1, 2, 3]).await;
     for gateway in &gateways {
         assert_eq!(
             reported.brokers.get(&gateway.node_id),
@@ -415,18 +434,18 @@ async fn given_a_gateway_that_leaves_should_move_only_its_groups_and_partitions(
     let [one, two, three] = start_three(&server).await;
     let groups = groups();
 
-    let before = converge(&[&one, &two, &three], &[1, 2, 3]).await;
+    let (before, _) = converge(&[&one, &two, &three], &[1, 2, 3]).await;
     let owners_before = converge_coordinators(&[&one, &two, &three], &groups, &[1, 2, 3]).await;
 
     // A goodbye moves its share at once, well inside the lease.
     three.stop().await;
     let started = tokio::time::Instant::now();
-    let after = converge(&[&one, &two], &[1, 2]).await;
+    let (after, moved) = converge(&[&one, &two], &[1, 2]).await;
     let owners_after = converge_coordinators(&[&one, &two], &groups, &[1, 2]).await;
     assert!(
-        started.elapsed() < LEASE + HEARTBEAT * 4,
+        moved - started < LEASE + HEARTBEAT * 4,
         "a goodbye is heard before the lease runs out: {:?}",
-        started.elapsed()
+        moved - started
     );
     for (before, after) in owners_before.iter().zip(&owners_after) {
         if *before != 3 {
@@ -447,7 +466,7 @@ async fn given_a_gateway_that_leaves_should_move_only_its_groups_and_partitions(
 
     // A crash moves its share once its lease runs out.
     two.crash();
-    let after_crash = converge(&[&one], &[1]).await;
+    let (after_crash, _) = converge(&[&one], &[1]).await;
     assert!(after_crash.leaders.iter().all(|leader| *leader == 1));
     let owners = converge_coordinators(&[&one], &groups, &[1]).await;
     assert!(owners.iter().all(|owner| *owner == 1));
