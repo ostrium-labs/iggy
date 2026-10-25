@@ -26,6 +26,11 @@
 //! Apache Kafka runs on every pull request. Redpanda runs when `KAFKA_ORACLE_REDPANDA=1` (the
 //! nightly job). Missing Docker, images or the `iggy-server` binary skip the suite, unless
 //! `KAFKA_E2E_REQUIRED=1` turns the skip into a failure, as for the real-client suite.
+//!
+//! Confluent Cloud, a managed multi-broker Kafka, runs when its scoped-key env file is present
+//! (local only, never in CI; `docs/loams/confluent-oracle.md`). It is report-only: its
+//! differences and failures are listed in the report and never fail the run, and every topic the
+//! run created on it is deleted at the end, also when the run panics.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -78,8 +83,8 @@ mod oracle;
 
 use facts::{Allowed, Difference, Facts, compare, judge, parse_allowed};
 use oracle::{
-    KafkaOracle, RESOURCE_PREFIX, RedpandaOracle, Target, TargetKind, Unavailable, WireClient,
-    env_flag, run_id,
+    ConfluentOracle, KafkaOracle, RESOURCE_PREFIX, RedpandaOracle, Target, TargetKind, Unavailable,
+    WireClient, env_flag, run_id,
 };
 
 const ALLOWED_DIFFERENCES: &str = include_str!("oracle/allowed_differences.toml");
@@ -159,8 +164,13 @@ impl Scenario {
         }
     }
 
+    /// Whether the scenario restarts the target's broker, which only a local target allows.
+    const fn restarts_a_broker(self) -> bool {
+        matches!(self, Self::IdempotentRestart)
+    }
+
     async fn run(self, cx: &Context) -> Result<Facts, String> {
-        let mut client = WireClient::connect(&cx.target.address).await?;
+        let mut client = WireClient::connect_target(&cx.target).await?;
         let mut facts = Facts::default();
         match self {
             Self::ApiVersions => api_versions(cx, &client, &mut facts),
@@ -1643,24 +1653,26 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
         Err(Unavailable::Skipped(reason)) => eprintln!("Redpanda oracle skipped: {reason}"),
         Err(Unavailable::Failed(reason)) => panic!("Redpanda oracle: {reason}"),
     }
+    let run = run_id();
+    // Report-only and shared between runs: a broken Confluent Cloud is noted, never fatal.
+    let mut confluent_notes: Vec<String> = Vec::new();
+    let mut confluent_cleanup = start_confluent(&run, &mut confluent_notes).await;
+    if let Some(cleanup) = &confluent_cleanup {
+        oracles.push(cleanup.oracle.target.clone());
+    }
 
     let gateway = Arc::new(start_gateway().await);
     let held = (held.0.map(Arc::new), held.1.map(Arc::new));
     let restarts = restarts(&gateway, held.0.as_ref(), held.1.as_ref());
-    let gateway_target = Target {
-        kind: TargetKind::Gateway,
-        address: gateway.address.clone(),
-    };
+    let gateway_target = Target::plain(TargetKind::Gateway, gateway.address.clone());
     let gateway_versions = WireClient::connect(&gateway.address)
         .await
         .expect("the gateway answers ApiVersions")
         .advertised()
         .clone();
     let allowed = parse_allowed(ALLOWED_DIFFERENCES).expect("allowed_differences.toml parses");
-    let run = run_id();
 
-    let mut differences: Vec<Difference> = Vec::new();
-    let mut disagreements: Vec<Difference> = Vec::new();
+    let mut sorted = Sorted::default();
     let mut ran = Vec::new();
     for scenario in Scenario::ALL {
         let context = |target: &Target| Context {
@@ -1675,32 +1687,29 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
             .unwrap_or_else(|error| panic!("{} on the gateway: {error}", scenario.name()));
         let mut kafka_facts: Option<Facts> = None;
         for oracle in &oracles {
-            let theirs = scenario
-                .run(&context(oracle))
-                .await
-                .unwrap_or_else(|error| panic!("{} on {}: {error}", scenario.name(), oracle.kind));
-            if env_flag("KAFKA_ORACLE_DUMP") {
-                for (fact, value) in theirs.inner() {
-                    let gateway_value = ours.get(fact).unwrap_or("<absent>");
-                    eprintln!(
-                        "{}/{fact}: {} {value} | gateway {gateway_value}",
-                        scenario.name(),
-                        oracle.kind
-                    );
+            if oracle.kind == TargetKind::Confluent && scenario.restarts_a_broker() {
+                confluent_notes.push(format!(
+                    "{} skipped: a managed cluster's brokers cannot be restarted",
+                    scenario.name()
+                ));
+                continue;
+            }
+            let theirs = match scenario.run(&context(oracle)).await {
+                Ok(theirs) => theirs,
+                Err(error) if oracle.kind == TargetKind::Confluent => {
+                    confluent_notes.push(format!("{} failed: {error}", scenario.name()));
+                    continue;
                 }
+                Err(error) => panic!("{} on {}: {error}", scenario.name(), oracle.kind),
+            };
+            if env_flag("KAFKA_ORACLE_DUMP") {
+                dump(scenario.name(), oracle.kind, &ours, &theirs);
             }
             for difference in compare(scenario.name(), &ours, oracle.kind, &theirs) {
-                // Apache Kafka is the reference: where the gateway agrees with it and another
-                // oracle does not, the other oracle is the odd one out, not the gateway.
-                let kafka_agrees = kafka_facts.as_ref().is_some_and(|kafka| {
-                    oracle.kind != TargetKind::Kafka
-                        && kafka.get(&difference.fact) == difference.gateway.as_deref()
-                });
-                if kafka_agrees {
-                    disagreements.push(difference);
-                } else {
-                    differences.push(difference);
-                }
+                sorted.add(difference, kafka_facts.as_ref());
+            }
+            if oracle.kind == TargetKind::Confluent {
+                continue;
             }
             ran.push((scenario.name().to_string(), oracle.kind));
             if oracle.kind == TargetKind::Kafka {
@@ -1709,13 +1718,11 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
         }
     }
 
-    let verdict = judge(&differences, &allowed, &ran);
+    let verdict = judge(&sorted.differences, &allowed, &ran);
     let mut report = verdict.report();
-    for difference in &disagreements {
-        let _ = writeln!(
-            report,
-            "oracles disagree (gateway matches kafka) {difference}"
-        );
+    sorted.report(&mut report, &confluent_notes);
+    if let Some(cleanup) = confluent_cleanup.take() {
+        let _ = writeln!(report, "confluent (report-only) {}", cleanup.finish().await);
     }
     eprintln!("oracle wire diff ({} oracles):\n{report}", oracles.len());
     if let Some(path) = std::env::var_os("KAFKA_ORACLE_REPORT") {
@@ -1726,6 +1733,148 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
         "the gateway differs from the oracles:\n{report}"
     );
     drop(held);
+}
+
+/// Differences by what they mean for the run.
+#[derive(Default)]
+struct Sorted {
+    /// Judged against `allowed_differences.toml`.
+    differences: Vec<Difference>,
+    /// The gateway agrees with Apache Kafka and another oracle does not: reported only.
+    disagreements: Vec<Difference>,
+    /// Confluent Cloud's, where Apache Kafka does not settle them: reported only.
+    confluent: Vec<Difference>,
+    /// Confluent Cloud's that equal Apache Kafka's answer: already judged against Kafka.
+    confluent_as_kafka: usize,
+}
+
+impl Sorted {
+    fn add(&mut self, difference: Difference, kafka_facts: Option<&Facts>) {
+        // Apache Kafka is the reference: where the gateway agrees with it and another oracle
+        // does not, the other oracle is the odd one out, not the gateway.
+        let kafka_agrees = kafka_facts.is_some_and(|kafka| {
+            difference.oracle != TargetKind::Kafka
+                && kafka.get(&difference.fact) == difference.gateway.as_deref()
+        });
+        if kafka_agrees {
+            self.disagreements.push(difference);
+        } else if difference.oracle == TargetKind::Confluent {
+            let as_kafka = kafka_facts
+                .is_some_and(|kafka| kafka.get(&difference.fact) == difference.expected.as_deref());
+            if as_kafka {
+                self.confluent_as_kafka += 1;
+            } else {
+                self.confluent.push(difference);
+            }
+        } else {
+            self.differences.push(difference);
+        }
+    }
+
+    fn report(&self, report: &mut String, confluent_notes: &[String]) {
+        for difference in &self.disagreements {
+            let _ = writeln!(
+                report,
+                "oracles disagree (gateway matches kafka) {difference}"
+            );
+        }
+        if self.confluent_as_kafka > 0 {
+            let _ = writeln!(
+                report,
+                "confluent (report-only) answered as kafka on {} differences judged above",
+                self.confluent_as_kafka
+            );
+        }
+        for difference in &self.confluent {
+            let _ = writeln!(report, "confluent (report-only) {difference}");
+        }
+        for note in confluent_notes {
+            let _ = writeln!(report, "confluent (report-only) {note}");
+        }
+    }
+}
+
+fn dump(scenario: &str, oracle: TargetKind, ours: &Facts, theirs: &Facts) {
+    for (fact, value) in theirs.inner() {
+        let gateway_value = ours.get(fact).unwrap_or("<absent>");
+        eprintln!("{scenario}/{fact}: {oracle} {value} | gateway {gateway_value}");
+    }
+}
+
+/// Confluent Cloud when its env file is present, after sweeping topics earlier runs left; its
+/// trouble goes to `notes`, never to a panic.
+async fn start_confluent(run: &str, notes: &mut Vec<String>) -> Option<ConfluentCleanup> {
+    match ConfluentOracle::start().await {
+        Ok(confluent) => {
+            match confluent.sweep_stale().await {
+                Ok(swept) if !swept.is_empty() => {
+                    notes.push(format!("swept {} topics left by earlier runs", swept.len()));
+                }
+                Ok(_) => {}
+                Err(error) => notes.push(format!("stale sweep failed: {error}")),
+            }
+            Some(ConfluentCleanup {
+                oracle: confluent,
+                prefix: format!("{RESOURCE_PREFIX}{run}-"),
+                done: false,
+            })
+        }
+        Err(Unavailable::Skipped(reason)) => {
+            eprintln!("Confluent Cloud oracle skipped: {reason}");
+            None
+        }
+        Err(Unavailable::Failed(reason)) => {
+            eprintln!("Confluent Cloud oracle unavailable: {reason}");
+            notes.push(format!("unavailable: {reason}"));
+            None
+        }
+    }
+}
+
+/// Deletes the run's topics on Confluent Cloud: by [`Self::finish`] at the end of the run, or on
+/// drop while a panic unwinds, so a failed run does not leave topics on the shared cluster.
+struct ConfluentCleanup {
+    oracle: ConfluentOracle,
+    prefix: String,
+    /// Set once [`Self::finish`] ran, so drop does not delete twice.
+    done: bool,
+}
+
+impl ConfluentCleanup {
+    async fn finish(mut self) -> String {
+        self.done = true;
+        match self.oracle.delete_topics(&self.prefix).await {
+            Ok(deleted) => format!("deleted the run's {} topics", deleted.len()),
+            Err(error) => format!("cleanup failed: {error}"),
+        }
+    }
+}
+
+impl Drop for ConfluentCleanup {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let target = self.oracle.target.clone();
+        let prefix = self.prefix.clone();
+        // A fresh runtime on its own thread: drop may run inside the test's runtime or a panic.
+        let outcome = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(ConfluentOracle { target }.delete_topics(&prefix))
+        })
+        .join();
+        match outcome {
+            Ok(Ok(deleted)) => eprintln!(
+                "Confluent Cloud: deleted the run's {} topics",
+                deleted.len()
+            ),
+            Ok(Err(error)) => eprintln!("Confluent Cloud: cleanup failed: {error}"),
+            Err(_) => eprintln!("Confluent Cloud: cleanup panicked"),
+        }
+    }
 }
 
 fn planted(scenario: &str, fact: &str, oracle: TargetKind) -> Difference {
@@ -1855,4 +2004,16 @@ fn every_allowed_difference_should_name_a_scenario_and_an_issue() {
             );
         }
     }
+}
+
+#[test]
+fn given_a_confluent_env_file_the_parser_should_read_keys_quotes_and_exports() {
+    let env = oracle::parse_env_file(
+        "# comment\nexport CONFLUENT_ORACLE_BOOTSTRAP=\"host:9092\"\nCONFLUENT_ORACLE_API_KEY='k'\n\
+         CONFLUENT_ORACLE_API_SECRET=a=b\n",
+    );
+    assert_eq!(env["CONFLUENT_ORACLE_BOOTSTRAP"], "host:9092");
+    assert_eq!(env["CONFLUENT_ORACLE_API_KEY"], "k");
+    assert_eq!(env["CONFLUENT_ORACLE_API_SECRET"], "a=b");
+    assert_eq!(env.len(), 3);
 }

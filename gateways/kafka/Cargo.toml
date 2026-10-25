@@ -94,6 +94,8 @@ tokio = { workspace = true, features = [
     "time",
     "test-util",
 ] }
+# Public CA roots for the Confluent Cloud oracle's TLS (`tests/common/oracle.rs`).
+webpki-roots = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"
