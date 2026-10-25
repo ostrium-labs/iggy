@@ -111,12 +111,15 @@ that there are none; it needs `read_users`, like describing credentials.
 RFC 5802 and RFC 7677, as Kafka's `ScramSaslServer` runs them, over two `SaslAuthenticate` rounds.
 The cryptography is RustCrypto's (`hmac`, `sha2`, `pbkdf2`), the proof comparison is constant time
 (`subtle`), and nonces come from the operating system (`getrandom`). Three differences from Kafka,
-each stricter and none visible to a conformant client:
+each stricter and none visible to a conformant client, and one of Kafka's leniencies kept:
 
 - The channel binding `c=` of the client-final message must be the base64 of the client's own GS2
   header (`biws` for `n,,`), as the RFC requires. Kafka accepts any value.
 - A mandatory extension (`m=`) and Kafka's delegation-token extension (`tokenauth=true`) are refused:
   there are no delegation tokens here.
+- The client-final nonce must end with the agreed one, as Kafka checks it, rather than equal it:
+  librdkafka 1.x (kcat 1.7.1) sends its own nonce again in front of the server's. This one is
+  Kafka's leniency, matched; the server's part of the nonce must still be there.
 - **An unknown user is not refused at the first message.** Kafka answers it with 58 at once, which
   tells anyone who asks which accounts exist. The gateway answers with a salt derived from the name and
   a per-process secret (stable across attempts) and 4096 iterations, and fails the proof like a wrong

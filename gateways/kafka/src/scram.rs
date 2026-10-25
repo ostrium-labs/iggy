@@ -33,6 +33,9 @@
 //!   iteration count derived from the name and a per-process secret, and fails at the proof like
 //!   a wrong password (RFC 5802, section 9's advice), so the exchange does not reveal which
 //!   accounts exist. Kafka refuses it at once.
+//!
+//! One leniency of Kafka's is kept: the client-final nonce only has to end with the agreed one,
+//! because librdkafka 1.x sends its own nonce twice.
 
 use std::fmt;
 
@@ -446,7 +449,14 @@ impl ScramServer {
         if binding != self.first.gs2_header.as_bytes() {
             return Err(ScramError::Mismatch("channel binding"));
         }
-        if !bool::from(nonce.as_bytes().ct_eq(self.nonce.as_bytes())) {
+        // Kafka's `ScramSaslServer` checks only that the final nonce ends with the agreed one,
+        // and librdkafka 1.x needs that: it sends its own nonce again in front of the server's
+        // (kcat 1.7.1 does). Matched, since the proof covers the message as sent and the
+        // server's part, which is what keeps the exchange fresh, must still be there.
+        let (sent, agreed) = (nonce.as_bytes(), self.nonce.as_bytes());
+        let ends_with_agreed = sent.len() >= agreed.len()
+            && bool::from(sent[sent.len() - agreed.len()..].ct_eq(agreed));
+        if !ends_with_agreed {
             return Err(ScramError::Mismatch("nonce"));
         }
         let mut proof = BASE64
@@ -513,8 +523,28 @@ mod tests {
         server_first: &str,
         gs2_header: &str,
     ) -> String {
+        client_final_echoing(
+            mechanism,
+            password,
+            client_first_bare,
+            server_first,
+            gs2_header,
+            "",
+        )
+    }
+
+    /// [`client_final`], sending `echo` in front of the server's nonce, as librdkafka 1.x
+    /// sends its own nonce again.
+    fn client_final_echoing(
+        mechanism: ScramMechanism,
+        password: &str,
+        client_first_bare: &str,
+        server_first: &str,
+        gs2_header: &str,
+        echo: &str,
+    ) -> String {
         let fields: Vec<&str> = server_first.split(',').collect();
-        let nonce = fields[0].strip_prefix("r=").expect("nonce");
+        let nonce = format!("{echo}{}", fields[0].strip_prefix("r=").expect("nonce"));
         let salt = BASE64
             .decode(fields[1].strip_prefix("s=").expect("salt"))
             .expect("salt is base64");
@@ -603,6 +633,39 @@ mod tests {
             start(),
             start(),
             "a varying salt would mark the user as unknown"
+        );
+    }
+
+    #[test]
+    fn given_the_client_nonce_sent_again_before_the_agreed_one_should_authenticate_as_kafka_does() {
+        let mechanism = ScramMechanism::Sha256;
+        let credential =
+            ScramCredential::from_password(mechanism, "pw", ScramCredential::random_salt(), 4096);
+        let first = parse_client_first(b"n,,n=alice,r=abc").expect("first");
+        let (server, server_first) =
+            ScramServer::start(mechanism, first, Some(credential), &DecoySecret::default());
+        let server_first = String::from_utf8(server_first).expect("utf-8");
+        let doubled = client_final_echoing(
+            mechanism,
+            "pw",
+            "n=alice,r=abc",
+            &server_first,
+            "n,,",
+            "abc",
+        );
+        assert!(doubled.starts_with("c=biws,r=abcabc"));
+        let server_final = server.finish(doubled.as_bytes()).expect("verifies");
+        assert!(server_final.starts_with(b"v="));
+
+        // The server's part must still be there: a nonce cut short of it is refused.
+        let first = parse_client_first(b"n,,n=alice,r=abc").expect("first");
+        let credential =
+            ScramCredential::from_password(mechanism, "pw", ScramCredential::random_salt(), 4096);
+        let (server, _) =
+            ScramServer::start(mechanism, first, Some(credential), &DecoySecret::default());
+        assert_eq!(
+            server.finish(b"c=biws,r=abc,p=AAAA").err(),
+            Some(ScramError::Mismatch("nonce"))
         );
     }
 
