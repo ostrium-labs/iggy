@@ -150,7 +150,7 @@ fn decode_all_results(body: Bytes) -> Vec<(Option<String>, i16)> {
 
 async fn send(state: &GatewayState, topics: &[TopicSpec<'_>], validate_only: bool) -> (i16, i32) {
     let body = build_request(topics, validate_only);
-    let outcome = create_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_first_result(resp_body)
 }
@@ -161,7 +161,7 @@ async fn send_all(
     validate_only: bool,
 ) -> Vec<(Option<String>, i16)> {
     let body = build_request(topics, validate_only);
-    let outcome = create_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -387,7 +387,7 @@ async fn create_topics_v3_accepts_broker_default_sentinels() {
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
 
-    let outcome = create_topics::handle(&state, 3, build_v3_request("orders", -1, -1)).await;
+    let outcome = create_topics::handle(&state, None, 3, build_v3_request("orders", -1, -1)).await;
     let mut d = Decoder::new(outcome.expect_response("CreateTopics request always answers"));
     let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
     assert_eq!(d.read_i32().expect("topics array count"), 1);
@@ -514,7 +514,7 @@ async fn create_topics_error_message_does_not_repeat_the_topic_name() {
     let bad_name = "has a space";
     let topic = TopicSpec::new(bad_name, 1);
     let body = build_request(&[topic], false);
-    let outcome = create_topics::handle(&state, REQUEST_VERSION, body).await;
+    let outcome = create_topics::handle(&state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
 
     let mut d = Decoder::new(resp_body);

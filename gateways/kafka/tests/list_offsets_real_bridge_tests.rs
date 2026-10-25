@@ -104,7 +104,7 @@ async fn send_at(
     timestamp: i64,
 ) -> (i16, i64, i64) {
     let body = build_request(topic, partition_index, timestamp);
-    let outcome = list_offsets::handle(state, version, body).await;
+    let outcome = list_offsets::handle(state, None, version, body).await;
     decode_first_entry(outcome.expect_response("ListOffsets request always answers"))
 }
 
@@ -115,7 +115,7 @@ async fn send(
     timestamp: i64,
 ) -> (i16, i64) {
     let body = build_request(topic, partition_index, timestamp);
-    let outcome = list_offsets::handle(state, REQUEST_VERSION, body).await;
+    let outcome = list_offsets::handle(state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("ListOffsets request always answers");
     decode_first_result(resp_body)
 }
@@ -182,7 +182,7 @@ async fn send_multi(
     topics: &[TopicRequest<'_>],
 ) -> Vec<(String, i32, i16, i64)> {
     let body = build_multi_request(topics);
-    let outcome = list_offsets::handle(state, REQUEST_VERSION, body).await;
+    let outcome = list_offsets::handle(state, None, REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("ListOffsets request always answers");
     decode_all(resp_body)
 }

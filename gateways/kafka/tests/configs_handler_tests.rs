@@ -78,6 +78,7 @@ async fn describe_configs_without_a_bridge_returns_not_controller() {
         .with_include_documentation(false);
     let outcome = describe_configs::handle(
         &state_without_bridge(),
+        None,
         DESCRIBE_VERSION,
         encode(&request, DESCRIBE_VERSION),
     )
@@ -256,6 +257,7 @@ async fn describe_configs_over_the_cap_is_rejected_even_with_the_bridge_off() {
         .with_include_documentation(false);
     let outcome = describe_configs::handle(
         &state_without_bridge(),
+        None,
         DESCRIBE_VERSION,
         encode(&request, DESCRIBE_VERSION),
     )

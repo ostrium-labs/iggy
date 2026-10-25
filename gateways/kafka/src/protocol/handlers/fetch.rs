@@ -36,6 +36,8 @@ use kafka_protocol::records::Record;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::iggy_bridge::{FetchSlot, PartitionProbe, TopicProbe};
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{BridgeError, IggyBridge};
@@ -50,7 +52,7 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_fetch_shape;
 use crate::protocol::handlers::{
     CODEC_OFF_WORKER_BYTES, COPY_OFF_WORKER_BYTES, decode_guarded, decode_request, encode_message,
-    learn_topic_ids, off_worker, respond_or_close,
+    learn_topic_ids, may_topic, off_worker, respond_or_close,
 };
 use crate::protocol::probe_board::{PROBE_INTERVAL, Snapshot, recent};
 use crate::records::{
@@ -108,6 +110,7 @@ const FINAL_EPOCH: i32 = -1;
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -139,11 +142,12 @@ pub async fn handle(
         );
     }
 
-    let unnamed = if api_version >= TOPIC_ID_MIN_VERSION {
+    let mut unnamed = if api_version >= TOPIC_ID_MIN_VERSION {
         name_topics(state, bridge, &mut request).await
     } else {
         Vec::new()
     };
+    unnamed.extend(deny_unreadable(state, principal, &mut request));
     let (mut responses, slot) = fetch(bridge, state, connection, &request).await;
     responses.extend(unnamed);
     let record_bytes: usize = responses
@@ -158,6 +162,37 @@ pub async fn handle(
     // The slot covers the read and the encode. A slow socket must not hold it.
     drop(slot);
     respond_or_close(encoded, "Fetch")
+}
+
+/// Takes out the topics `principal` may not read (`crate::authz`), answered here with
+/// `TOPIC_AUTHORIZATION_FAILED` on each partition, as Kafka answers them while it reads the others.
+fn deny_unreadable(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    request: &mut FetchRequest,
+) -> Vec<FetchableTopicResponse> {
+    let mut denied = Vec::new();
+    request.topics.retain(|topic| {
+        if may_topic(state, principal, topic.topic.as_str(), TopicOp::Read) {
+            return true;
+        }
+        denied.push(
+            FetchableTopicResponse::default()
+                .with_topic(topic.topic.clone())
+                .with_topic_id(topic.topic_id)
+                .with_partitions(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|partition| {
+                            refused(partition.partition, ERROR_TOPIC_AUTHORIZATION_FAILED)
+                        })
+                        .collect(),
+                ),
+        );
+        false
+    });
+    denied
 }
 
 /// From v13 a request names its topics by id. Gives each topic the name its id belongs to, and

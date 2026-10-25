@@ -37,6 +37,7 @@ use kafka_protocol::messages::{DeleteRecordsRequest, DeleteRecordsResponse};
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::iggy_bridge::{OffsetCalls, PartitionProbe};
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
@@ -48,7 +49,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_delete_records_shape;
 use crate::protocol::handlers::{
-    clamp_request_timeout, decode_guarded, decode_request, encode_message, respond_or_close,
+    clamp_request_timeout, decode_guarded, decode_request, encode_message, may_topic_on,
+    respond_or_close,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -82,41 +84,46 @@ pub async fn handle(
         encode_error_response,
         "DeleteRecords",
     );
-    let request = match decoded {
+    let mut request = match decoded {
         Ok(request) => request,
         Err(outcome) => return outcome,
     };
-    let topics = if let Some(code) = refusal(principal) {
-        answer_all(&request.topics, code)
-    } else if let Some(bridge) = &state.bridge {
+    let bridge = state.bridge.as_deref();
+    let (allowed, refused_topics): (Vec<_>, Vec<_>) = std::mem::take(&mut request.topics)
+        .into_iter()
+        .partition(|topic| refusal(bridge, principal, topic.name.as_str()).is_none());
+    let mut denied = answer_all(&refused_topics, ERROR_TOPIC_AUTHORIZATION_FAILED);
+    request.topics = allowed;
+    let mut topics = if let Some(bridge) = &state.bridge {
         let deadline = Instant::now() + clamp_request_timeout(request.timeout_ms);
         delete_all(bridge, &request.topics, deadline).await
     } else {
         // Without a bridge there is no partition to lead, as in Produce and Fetch.
         answer_all(&request.topics, ERROR_NOT_LEADER_OR_FOLLOWER)
     };
+    topics.append(&mut denied);
     let response = DeleteRecordsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&response, api_version, 256), "DeleteRecords")
 }
 
-/// The code that refuses the whole request to `principal`, if any.
+/// The code that refuses `topic` to `principal`, if any.
 ///
-/// Kafka asks for `DELETE` on the topic. The gateway's mapping of Iggy permissions gives that to
-/// `manage_topics` (`docs/ACL_MAPPING.md`), as for `DeleteTopics`. `None` means no listener of
-/// this gateway names principals. A principal whose permissions were never read is refused: a
-/// deletion must not rest on a value nothing read.
-fn refusal(principal: Option<&AuthenticatedPrincipal>) -> Option<i16> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
-        return None;
-    }
-    if !principal.permissions_known {
+/// Kafka asks for `DELETE` on the topic, which the gateway maps to Iggy's `manage_topic` on it
+/// (`crate::authz`), as for `DeleteTopics`. `None` means no listener of this gateway names
+/// principals. A principal whose permissions were never read is refused: a deletion must not rest
+/// on a value nothing read.
+fn refusal(
+    bridge: Option<&IggyBridge>,
+    principal: Option<&AuthenticatedPrincipal>,
+    topic: &str,
+) -> Option<i16> {
+    if principal.is_some_and(|principal| !principal.permissions_known) {
         tracing::warn!(
-            principal = %principal.username,
             "DeleteRecords asked on a connection whose permissions were never read; denying"
         );
     }
-    Some(ERROR_TOPIC_AUTHORIZATION_FAILED)
+    (!may_topic_on(bridge, principal, topic, TopicOp::Manage))
+        .then_some(ERROR_TOPIC_AUTHORIZATION_FAILED)
 }
 
 /// Each topic and partition of `topics`, all answered `code`.
@@ -395,11 +402,11 @@ mod tests {
 
     #[test]
     fn given_a_principal_without_manage_topics_the_request_should_be_refused() {
-        assert_eq!(refusal(None), None);
-        assert_eq!(refusal(Some(&principal(true, true))), None);
+        assert_eq!(refusal(None, None, "orders"), None);
+        assert_eq!(refusal(None, Some(&principal(true, true)), "orders"), None);
         for denied in [principal(false, true), principal(true, false)] {
             assert_eq!(
-                refusal(Some(&denied)),
+                refusal(None, Some(&denied), "orders"),
                 Some(ERROR_TOPIC_AUTHORIZATION_FAILED)
             );
         }

@@ -543,8 +543,11 @@ async fn given_v6_a_topic_deleted_by_id_should_be_gone_and_its_id_unknown() {
                 .with_num_partitions(1)
                 .with_replication_factor(-1),
         ]);
-    let created: CreateTopicsResponse =
-        round_trip(7, create_topics::handle(&state, 7, encoded(&create, 7))).await;
+    let created: CreateTopicsResponse = round_trip(
+        7,
+        create_topics::handle(&state, None, 7, encoded(&create, 7)),
+    )
+    .await;
     assert_eq!(created.topics[0].error_code, ERROR_NONE);
     let id = created.topics[0].topic_id;
     assert!(!id.is_nil());

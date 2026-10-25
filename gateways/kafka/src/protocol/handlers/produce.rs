@@ -29,6 +29,7 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{
     BridgeError, IggyBridge, InDoubt, ProduceTurn, Producer, Resolution, SendEnd, TopicTarget,
 };
@@ -40,14 +41,14 @@ use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_PRODUCER_EPOCH,
     ERROR_INVALID_RECORD, ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE,
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_REQUEST_TIMED_OUT,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
     ERROR_UNSUPPORTED_COMPRESSION_TYPE, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
     REQUEST_DEADLINE, UNKNOWN_OFFSET, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
     CODEC_OFF_WORKER_BYTES, decode_guarded, encode_message, is_transactional, learn_topic_ids,
-    off_worker, respond_or_close, unsupported_version_response,
+    may_topic, off_worker, respond_or_close, unsupported_version_response,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
@@ -189,11 +190,14 @@ pub async fn handle(
 
     // Before planning, not after: the client waits through decompression too.
     let deadline = Deadline::new(request.timeout_ms);
-    let unnamed = if api_version >= TOPIC_ID_MIN_VERSION {
+    let mut unnamed = if api_version >= TOPIC_ID_MIN_VERSION {
         name_topics(state, bridge, &mut request).await
     } else {
         Vec::new()
     };
+    // Kafka authorizes before it asks who leads, and answers each topic the principal may not
+    // write with `TOPIC_AUTHORIZATION_FAILED` while it writes the others.
+    unnamed.extend(deny_unwritable(state, principal, &mut request));
     // After the naming: from v13 a topic has no name until its id is looked up, and leadership is
     // decided by name.
     if let Some(refused) = refuse_if_led_elsewhere(state, api_version, &request, &unnamed) {
@@ -282,6 +286,37 @@ async fn name_topics(
         false
     });
     unnamed
+}
+
+/// Takes out the topics `principal` may not write (`crate::authz`), answered here with
+/// `TOPIC_AUTHORIZATION_FAILED` on each partition.
+fn deny_unwritable(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    request: &mut ProduceRequest,
+) -> Vec<TopicProduceResponse> {
+    let mut denied = Vec::new();
+    request.topic_data.retain(|topic| {
+        if may_topic(state, principal, topic.name.as_str(), TopicOp::Write) {
+            return true;
+        }
+        denied.push(
+            TopicProduceResponse::default()
+                .with_name(topic.name.clone())
+                .with_topic_id(topic.topic_id)
+                .with_partition_responses(
+                    topic
+                        .partition_data
+                        .iter()
+                        .map(|partition| {
+                            partition_response(partition.index, ERROR_TOPIC_AUTHORIZATION_FAILED)
+                        })
+                        .collect(),
+                ),
+        );
+        false
+    });
+    denied
 }
 
 /// Among several gateways, a partition's batches go to its leader only, so one gateway holds its

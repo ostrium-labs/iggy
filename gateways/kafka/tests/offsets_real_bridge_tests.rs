@@ -84,7 +84,7 @@ async fn commit(state: &GatewayState, topic: &str, offset: i64) -> i16 {
 async fn commit_as(state: &GatewayState, group: &str, topic: &str, offset: i64) -> i16 {
     let body = build_offset_commit_request(COMMIT_VERSION, group, topic, offset);
     let connection = ConnectionState::default();
-    let response = offset_commit::handle(state, &connection, COMMIT_VERSION, body)
+    let response = offset_commit::handle(state, &connection, None, COMMIT_VERSION, body)
         .await
         .expect_response("OffsetCommit answers");
     let codes = decode_commit_codes(response);
@@ -96,7 +96,7 @@ async fn commit_as(state: &GatewayState, group: &str, topic: &str, offset: i64) 
 async fn fetch(state: &GatewayState, group: &str, topic: &str) -> (i16, i64, i16) {
     let body = build_offset_fetch_request(FETCH_VERSION, group, Some(topic));
     let connection = ConnectionState::default();
-    let response = offset_fetch::handle(state, &connection, FETCH_VERSION, body)
+    let response = offset_fetch::handle(state, &connection, None, FETCH_VERSION, body)
         .await
         .expect_response("OffsetFetch answers");
     let (group_error, partitions) = decode_fetch(response);
@@ -304,7 +304,7 @@ async fn given_a_null_topic_list_fetch_should_answer_every_committed_partition()
 
     let body = build_offset_fetch_request(FETCH_VERSION, GROUP, None);
     let connection = ConnectionState::default();
-    let response = offset_fetch::handle(&state, &connection, FETCH_VERSION, body)
+    let response = offset_fetch::handle(&state, &connection, None, FETCH_VERSION, body)
         .await
         .expect_response("OffsetFetch answers");
     let (group_error, mut partitions) = decode_fetch(response);
@@ -340,7 +340,7 @@ async fn given_several_groups_in_one_request_fetch_should_answer_each_its_own_of
     let groups = ["first-app", "second-app", "never-committed"];
     let body = build_offset_fetch_groups_request(FETCH_VERSION, &groups, "orders");
     let connection = ConnectionState::default();
-    let response = offset_fetch::handle(&state, &connection, FETCH_VERSION, body)
+    let response = offset_fetch::handle(&state, &connection, None, FETCH_VERSION, body)
         .await
         .expect_response("OffsetFetch answers");
 

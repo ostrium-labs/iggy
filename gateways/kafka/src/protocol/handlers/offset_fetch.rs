@@ -30,18 +30,21 @@ use kafka_protocol::messages::{GroupId, OffsetFetchRequest, OffsetFetchResponse,
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
     API_KEY_OFFSET_FETCH, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-    ERROR_INVALID_GROUP_ID, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, UNKNOWN_OFFSET,
-    is_supported_version,
+    ERROR_INVALID_GROUP_ID, ERROR_NONE, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
+    UNKNOWN_OFFSET, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_offset_fetch_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, offset_deadline, offset_refusal_cause, respond_or_close,
+    decode_guarded, encode_message, may_topic, offset_deadline, offset_refusal_cause,
+    respond_or_close,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -128,6 +131,7 @@ struct PartitionAnswer {
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -150,16 +154,48 @@ pub async fn handle(
     let queries = GroupQuery::all(api_version, &request);
     let calls = OffsetCalls::new(offset_deadline(state, connection).await);
     // The groups read at once, so a slow group cannot spend the time of the others.
-    let answers = join_all(
+    let mut answers = join_all(
         queries
             .iter()
             .map(|query| answer(state.bridge.as_deref(), query, &calls)),
     )
     .await;
+    for (query, answer) in queries.iter().zip(&mut answers) {
+        deny_unreadable(state, principal, query, answer);
+    }
     respond_or_close(
         encode_response(api_version, &queries, answers),
         "OffsetFetch",
     )
+}
+
+/// Kafka's READ on each topic (Iggy's `get_consumer_offset`, which is `poll_messages`): a named
+/// topic the principal may not read answers `TOPIC_AUTHORIZATION_FAILED` on each partition, and
+/// an every-topic query leaves such topics out, as Kafka does.
+fn deny_unreadable(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    query: &GroupQuery,
+    answer: &mut GroupAnswer,
+) {
+    if principal.is_none() {
+        return;
+    }
+    let readable = |name: &TopicName| may_topic(state, principal, name.as_str(), TopicOp::Read);
+    if query.topics.is_none() {
+        answer.topics.retain(|topic| readable(&topic.name));
+        return;
+    }
+    for topic in answer
+        .topics
+        .iter_mut()
+        .filter(|topic| !readable(&topic.name))
+    {
+        for partition in &mut topic.partitions {
+            partition.offset = -1;
+            partition.error = ERROR_TOPIC_AUTHORIZATION_FAILED;
+        }
+    }
 }
 
 /// One failed read fails the whole group, so a client never reads a lost answer as "nothing
@@ -469,7 +505,7 @@ mod tests {
         let connection = ConnectionState::default();
         let mut body = BytesMut::new();
         request.encode(&mut body, version).unwrap();
-        let mut response = handle(&state, &connection, version, body.freeze())
+        let mut response = handle(&state, &connection, None, version, body.freeze())
             .await
             .expect_response("OffsetFetch answers");
         OffsetFetchResponse::decode(&mut response, version).unwrap()
@@ -554,10 +590,10 @@ mod tests {
         let body = body.freeze();
 
         assert!(
-            handle(&state, &connection, 6, body.slice(..3))
+            handle(&state, &connection, None, 6, body.slice(..3))
                 .await
                 .is_close()
         );
-        assert!(handle(&state, &connection, 10, body).await.is_close());
+        assert!(handle(&state, &connection, None, 10, body).await.is_close());
     }
 }

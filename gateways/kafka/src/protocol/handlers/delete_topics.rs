@@ -41,6 +41,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
@@ -51,7 +52,8 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_delete_topics_shape;
 use crate::protocol::handlers::{
     clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
-    is_supported_version, learn_topic_ids, respond_or_close, unsupported_version_response,
+    is_supported_version, learn_topic_ids, may_topic_on, respond_or_close,
+    unsupported_version_response,
 };
 
 /// v1 to v6. v1 is the crate's own floor (`kafka_protocol` does not implement v0 for this message).
@@ -119,15 +121,19 @@ pub async fn handle(
 
     // From v6 each topic is a name or an id. Those that resolve to a name go through the same
     // path as a v1-v5 name list; the rest are answered here.
-    let (topic_names, mut answered) = if api_version >= TOPIC_ID_MIN_VERSION {
+    let (mut topic_names, mut answered) = if api_version >= TOPIC_ID_MIN_VERSION {
         name_topics(state, bridge, &req.topics).await
     } else {
         (req.topic_names.clone(), Vec::new())
     };
 
-    if let Some(mut results) = authorize(principal, &topic_names) {
-        results.append(&mut answered);
-        let resp = DeleteTopicsResponse::default().with_responses(results);
+    answered.extend(authorize(
+        Some(bridge.as_ref()),
+        principal,
+        &mut topic_names,
+    ));
+    if topic_names.is_empty() && !answered.is_empty() {
+        let resp = DeleteTopicsResponse::default().with_responses(answered);
         return respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics");
     }
 
@@ -249,39 +255,38 @@ async fn topic_ids(bridge: &IggyBridge, names: &[TopicName]) -> HashMap<String, 
     }
 }
 
-/// Denies every requested topic when `principal` is not allowed to delete topic data, or when
-/// its permissions could not be read. `None` means no listener of this gateway names principals,
-/// so there is nothing to enforce against; once one does, a connection that proved no identity
-/// carries [`AuthenticatedPrincipal::anonymous`] instead and is denied here.
+/// Takes out of `topic_names`, and answers, each topic `principal` may not delete: Kafka's
+/// `DELETE` on the topic, Iggy's `delete_topic`, which is `manage_topic` (`crate::authz`). `None`
+/// means no listener of this gateway names principals, so there is nothing to enforce against;
+/// once one does, a connection that proved no identity carries
+/// [`AuthenticatedPrincipal::anonymous`] instead and is denied here. Permissions that were never
+/// read deny every topic: granting would authorize an irreversible delete off a value nothing
+/// ever actually read.
 fn authorize(
+    bridge: Option<&IggyBridge>,
     principal: Option<&AuthenticatedPrincipal>,
-    topic_names: &[TopicName],
-) -> Option<Vec<DeletableTopicResult>> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
-        return None;
-    }
-    if !principal.permissions_known {
-        // The permission read failed after a successful login, so this connection holds no real
-        // answer. Denying is the fail-closed choice: granting would authorize an irreversible
-        // delete off a value nothing ever actually read.
+    topic_names: &mut Vec<TopicName>,
+) -> Vec<DeletableTopicResult> {
+    if principal.is_some_and(|principal| !principal.permissions_known) {
         tracing::warn!(
-            principal = %principal.username,
             "DeleteTopics asked on a connection whose permissions were never read; denying"
         );
     }
     let message = StrBytes::from_static_str("the principal is not authorized to delete topics");
-    Some(
-        topic_names
-            .iter()
-            .map(|name| {
-                DeletableTopicResult::default()
-                    .with_name(Some(name.clone()))
-                    .with_error_code(ERROR_TOPIC_AUTHORIZATION_FAILED)
-                    .with_error_message(Some(message.clone()))
-            })
-            .collect(),
-    )
+    let mut denied = Vec::new();
+    topic_names.retain(|name| {
+        if may_topic_on(bridge, principal, name.as_str(), TopicOp::Manage) {
+            return true;
+        }
+        denied.push(
+            DeletableTopicResult::default()
+                .with_name(Some(name.clone()))
+                .with_error_code(ERROR_TOPIC_AUTHORIZATION_FAILED)
+                .with_error_message(Some(message.clone())),
+        );
+        false
+    });
+    denied
 }
 
 /// Every topic name that appears more than once in `topic_names` - mirrors
