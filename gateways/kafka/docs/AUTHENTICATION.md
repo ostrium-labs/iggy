@@ -305,12 +305,17 @@ Notes that decide the implementation.
 ## Error mapping
 
 At authentication time a rejected credential becomes `SASL_AUTHENTICATION_FAILED` (58) with a generic
-message. An Iggy that cannot be reached, an overloaded gateway, or a peer still inside the delay a previous
-rejection earned, closes the connection without a body instead: Kafka clients treat 58 as fatal and raise it to the application, so borrowing it for a transient
+message. An Iggy that cannot be reached, an overloaded gateway, or a PLAIN login from a peer still inside the
+delay a previous PLAIN rejection earned, closes the connection without a body instead: Kafka clients treat 58 as fatal and raise it to the application, so borrowing it for a transient
 condition turns a blip into a permanent failure for credentials that were always correct. A close reads as
 a transport failure, which is retriable, and still says nothing about whether the account exists. Iggy's login path already runs a dummy hash for unknown users to avoid a user-enumeration oracle,
 so the gateway must not reintroduce one by distinguishing unknown user from wrong password in the message
 or by returning early.
+
+The delay exists because every PLAIN guess costs an Argon2id hash on an Iggy shard. SCRAM proofs and
+OAUTHBEARER tokens are checked in the gateway for a few HMACs or one signature, with `Hi()` left to the
+client, so they are not delayed: like Kafka, every SCRAM or OAUTHBEARER attempt is answered on its
+merits, including a right password straight after a wrong one.
 
 ### Planned: authorization errors
 

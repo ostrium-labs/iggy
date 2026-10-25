@@ -350,6 +350,8 @@ struct SharedAuth {
     /// Certificate user lookups, kept apart from `slots` so a burst of either kind cannot starve
     /// the other of its budget.
     lookup_slots: Semaphore,
+    /// Delays a peer's next PLAIN login after a rejected one. PLAIN only: see
+    /// `authenticate_scram` for why SCRAM and OAUTHBEARER are not throttled.
     failed_logins: FailedLoginThrottle,
 }
 
@@ -1628,7 +1630,6 @@ async fn resolve_mechanism_principal(
             // warn!: the credential checked out, so the account missing from Iggy is a
             // provisioning gap or a wrong principal mapping, not a client mistake.
             warn!(%peer, username, what, "the authenticated principal names no active Iggy user");
-            ctx.failed_logins.record_rejection(peer.ip());
             Err(auth_failed(api_version))
         }
         Err(AuthError::Unavailable) => {
@@ -1640,6 +1641,12 @@ async fn resolve_mechanism_principal(
 
 /// SCRAM: two `SaslAuthenticate` rounds, client-first then client-final, against the salted keys
 /// the gateway stores (`scram`).
+///
+/// Not subject to the failed-login throttle. The throttle exists because each PLAIN guess costs
+/// an Argon2id hash on an Iggy shard; a SCRAM proof is checked here with a few HMACs, and the
+/// expensive `Hi()` is the client's to compute. Kafka does not hold a failed SCRAM login against
+/// the peer's next one either, and clients (and the Kafka tools) try a wrong password and then
+/// the right one on fresh connections without waiting.
 async fn authenticate_scram(
     ctx: &ConnectionContext<'_>,
     session: &mut SaslSession,
@@ -1657,7 +1664,6 @@ async fn authenticate_scram(
             Ok(server_final) => server_final,
             Err(error) => {
                 debug!(%peer, ?error, "SCRAM proof refused");
-                ctx.failed_logins.record_rejection(peer.ip());
                 return auth_failed(api_version);
             }
         };
@@ -1669,14 +1675,11 @@ async fn authenticate_scram(
         )
         .await
         {
-            Ok(principal) => {
-                ctx.failed_logins.record_success(peer.ip());
-                AuthStep::Done {
-                    principal,
-                    auth_bytes: Bytes::from(server_final),
-                    credential_expiry: None,
-                }
-            }
+            Ok(principal) => AuthStep::Done {
+                principal,
+                auth_bytes: Bytes::from(server_final),
+                credential_expiry: None,
+            },
             Err(step) => step,
         };
     }
@@ -1692,10 +1695,6 @@ async fn authenticate_scram(
             return auth_failed(api_version);
         }
     };
-    if ctx.failed_logins.is_blocked(peer.ip()) {
-        debug!(%peer, "SCRAM refused: peer is throttled after a rejected login");
-        return AuthStep::Fail(HandleOutcome::Close);
-    }
     let username = first.username.clone();
     let looked_up = verify_in_slot(ctx, ctx.lookup_slots, "SCRAM credential lookup", |slot| {
         let username = username.as_str();
@@ -1818,6 +1817,9 @@ const OAUTH_INVALID_TOKEN: &str = r#"{"status":"invalid_token"}"#;
 /// A refused token is answered the way Kafka answers it: `NONE` with the JSON error status as the
 /// server challenge, then, once the client acknowledges with `^A`, 58 with that status as the
 /// message. Every refusal looks the same from the client's side.
+///
+/// Like SCRAM, not subject to the failed-login throttle: a token is checked here against cached
+/// signing keys, at no cost to Iggy, and Kafka answers every token on its merits.
 async fn authenticate_oauthbearer(
     ctx: &ConnectionContext<'_>,
     session: &mut SaslSession,
@@ -1846,10 +1848,6 @@ async fn authenticate_oauthbearer(
         debug!(%peer, "malformed OAUTHBEARER initial response");
         return auth_failed(api_version);
     };
-    if ctx.failed_logins.is_blocked(peer.ip()) {
-        debug!(%peer, "OAUTHBEARER refused: peer is throttled after a rejected token");
-        return AuthStep::Fail(HandleOutcome::Close);
-    }
     let validated = {
         use secrecy::ExposeSecret;
         let token = response.token.expose_secret();
@@ -1871,7 +1869,6 @@ async fn authenticate_oauthbearer(
         }
         Some(Err(TokenError::Invalid(reason))) => {
             debug!(%peer, reason, "OAUTHBEARER token refused");
-            ctx.failed_logins.record_rejection(peer.ip());
             session.exchange = Some(Exchange::OAuthRefused);
             return AuthStep::Continue(sasl_authenticate_reply(
                 api_version,
@@ -1896,14 +1893,11 @@ async fn authenticate_oauthbearer(
     )
     .await
     {
-        Ok(principal) => {
-            ctx.failed_logins.record_success(peer.ip());
-            AuthStep::Done {
-                principal,
-                auth_bytes: Bytes::new(),
-                credential_expiry: Some(token.expires_at),
-            }
-        }
+        Ok(principal) => AuthStep::Done {
+            principal,
+            auth_bytes: Bytes::new(),
+            credential_expiry: Some(token.expires_at),
+        },
         Err(step) => step,
     }
 }
