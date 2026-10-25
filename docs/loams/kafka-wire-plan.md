@@ -120,16 +120,25 @@ authorization so Loams namespaces cannot read each other (KW-10).
 ## 3. Oracles and the test strategy
 
 Every task proves its behaviour against a real Kafka, not only against
-hand-built frames. Two oracles, both containers, used as black boxes:
+hand-built frames. Three oracles, all used as black boxes: two containers and
+one managed service:
 
 | Oracle | How it runs | Licence and rule | Used for |
 | --- | --- | --- | --- |
 | **Apache Kafka** | `apache/kafka` container, KRaft single node, pinned (the suite uses 3.9.0 for client tools today; KW-1 adds `apache/kafka:4.3.1` as the broker oracle) | Apache-2.0. Reading its source is fine | The default oracle for every task, in fork CI |
 | **Redpanda** | `redpandadata/redpanda:v26.1.18` container (Docker Hub), single node, pinned | BSL. **Black box only**: never read or copy its source; only its container and public docs | The second transactions oracle (approved by the owner earlier); a second opinion where Kafka and the gateway disagree |
+| **Confluent Cloud** | Managed Kafka: one Basic cluster (`lkc-120zwvj`, AWS `ap-south-1`, single zone) on the Confluent for Startups credits, reached over `SASL_SSL` with a scoped service-account key. Multi-broker, so the harness routes partition and coordinator requests to their owners | A service, used only through the Kafka wire. **Local only**: its key never goes into CI or the repo, and CI never runs it | The managed-Kafka oracle: what a multi-broker production Kafka answers (leader routing, coordinators, transactions on a real cluster). Report-only (below) |
 
-A managed Kafka (for example Confluent Cloud) is a possible later oracle, once
-startup credits come through; nothing in this plan or the harness uses one
-today.
+The Confluent Cloud oracle runs when `~/confluent-oracle.env` (or the file
+`KAFKA_ORACLE_CONFLUENT_ENV` names) exists; `KAFKA_ORACLE_CONFLUENT=0` turns it
+off, and it is skipped whenever `CI` or `GITHUB_ACTIONS` is set. It is
+report-only: its differences, and any scenario that fails on it, are listed in
+the report under `confluent (report-only)` and never fail the run; a
+difference where it answers as Apache Kafka does is only counted. Each run
+creates its topics under `loams-oracle-<run-id>-` and deletes them at the end,
+also when the run panics; topics older than 6 hours from a run that could not
+clean up are swept at the next start. Setup, cost and teardown:
+[`confluent-oracle.md`](confluent-oracle.md).
 
 ### 3.1 The differential harness (KW-1)
 
@@ -159,6 +168,8 @@ normalisation:
   the wire-level diffs against Apache Kafka, in `Kafka gateway required`.
 - **Nightly** (fork workflow, schedule): the full container matrix and the
   Redpanda diffs.
+- **Local, on demand**: the Confluent Cloud diffs, report-only, on a machine
+  that has the oracle's env file. Never in CI.
 
 ## 4. Rules for every task
 
@@ -273,6 +284,17 @@ Kafka and that Loams' clients can notice:
 Fetch past the high watermark answers retriable 6 for 30 s before
 `OFFSET_OUT_OF_RANGE` (1), on purpose (README, Fetch error mapping); declared
 against #3536.
+
+**Confluent Cloud oracle (2026-10-25).** Added as a third, report-only
+oracle ([`confluent-oracle.md`](confluent-oracle.md)). On the first runs it
+answered as Apache Kafka on 16 of the 17 declared differences, so those gaps
+are Kafka behaviour, not single-node artefacts. Where it differs from both
+Kafka and the gateway: ListOffsets answers the requested timestamp in the
+`timestamp` field for EARLIEST, LATEST, MAX_TIMESTAMP and lookups before the
+first or after the last record (Kafka answers -1 or the found record's
+timestamp), and a sequence gap from an idempotent producer answers 56
+(`KAFKA_STORAGE_ERROR`) rather than 45 (`OUT_OF_ORDER_SEQUENCE_NUMBER`).
+Neither changes what the gateway should do: Apache Kafka stays the reference.
 
 ### KW-2. Client compatibility matrix
 
@@ -917,7 +939,12 @@ DescribeTransactions (65), ListTransactions (66), DescribeProducers (61) for
 Conformance oracles: **Apache Kafka 4.x** (container) and **Redpanda**
 (container, black box, owner-approved as the transactions oracle). A behaviour
 both oracles agree on is the contract; where they differ, Apache Kafka wins and
-the difference is recorded.
+the difference is recorded. **Confluent Cloud** (managed Kafka, section 3) is
+the third, report-only oracle for transactions: it is the one target with a
+transaction coordinator, transaction log and partition leaders on separate
+brokers, so items 1–4 also run against it locally before KW-T is called done,
+and any difference from it is recorded with its cause. Its transactional ids
+use the harness prefix, which its key is scoped to.
 
 1. **Wire diffs** (KW-1 harness): the full handshake sequence (FindCoordinator
    TXN → InitProducerId → AddPartitionsToTxn → Produce → AddOffsetsToTxn →
@@ -945,7 +972,8 @@ the difference is recorded.
 
 Exit, when built: #4522's acceptance criteria (Streams `exactly_once_v2` runs
 and `read_committed` never sees an aborted record; ksqlDB starts), plus items
-1–6 green against Apache Kafka and Redpanda.
+1–6 green against Apache Kafka and Redpanda, and items 1–4 run against
+Confluent Cloud with every difference from it explained.
 
 ### 6.8 Size and order, if approved
 
