@@ -17,31 +17,46 @@
 
 //! Real Kafka brokers as oracles for the gateway, and a wire client that talks to all of them.
 //!
-//! Two oracles, each a black box behind the Kafka wire:
+//! Three oracles, each a black box behind the Kafka wire:
 //!
 //! - Apache Kafka in its official container, `KRaft` single node ([`KafkaOracle`]). The default,
 //!   and the one fork CI runs on every pull request.
 //! - Redpanda in its official container ([`RedpandaOracle`]). Opt-in with
 //!   `KAFKA_ORACLE_REDPANDA=1`, which the nightly job sets. Redpanda's source is BSL: only its
 //!   container is used, never its code.
+//! - Confluent Cloud, a managed multi-broker Kafka ([`ConfluentOracle`]), over `SASL_SSL` with
+//!   a scoped API key. Local only: it runs when `~/confluent-oracle.env` (or the file
+//!   `KAFKA_ORACLE_CONFLUENT_ENV` names) exists, never in CI. See `docs/loams/confluent-oracle.md`.
 //!
 //! [`WireClient`] encodes requests with `kafka-protocol`'s client half and negotiates each API's
 //! version down to what the target advertises, so one scenario runs unchanged on every target.
+//! On a multi-broker target it also sends each partition and coordinator request to the broker
+//! that owns it, as a real client does.
 #![allow(dead_code)]
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::{
-    ApiKey, ApiVersionsRequest, MetadataRequest, RequestHeader, ResponseHeader,
+    ApiKey, ApiVersionsRequest, DeleteTopicsRequest, FetchRequest, FindCoordinatorRequest,
+    HeartbeatRequest, InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest,
+    ListOffsetsRequest, MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
+    RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslHandshakeRequest, SyncGroupRequest,
+    TopicName,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, Request, StrBytes};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 /// The Apache Kafka oracle image. Pinned; CI pulls every `*_IMAGE` constant under `tests/`.
 pub const KAFKA_ORACLE_IMAGE: &str = "apache/kafka:4.3.1";
@@ -73,6 +88,7 @@ pub enum TargetKind {
     Gateway,
     Kafka,
     Redpanda,
+    Confluent,
 }
 
 impl TargetKind {
@@ -82,6 +98,7 @@ impl TargetKind {
             Self::Gateway => "gateway",
             Self::Kafka => "kafka",
             Self::Redpanda => "redpanda",
+            Self::Confluent => "confluent",
         }
     }
 }
@@ -92,11 +109,39 @@ impl fmt::Display for TargetKind {
     }
 }
 
-/// One broker the scenarios run against, at a plaintext loopback `host:port`.
+/// One broker the scenarios run against: a plaintext loopback `host:port`, or a managed
+/// cluster's bootstrap `host:port` reached over `SASL_SSL`.
 #[derive(Debug, Clone)]
 pub struct Target {
     pub kind: TargetKind,
     pub address: String,
+    /// TLS and SASL/PLAIN for a managed cluster; `None` for a plaintext loopback broker.
+    pub secure: Option<Arc<Secure>>,
+}
+
+impl Target {
+    /// A plaintext broker at `address`.
+    #[must_use]
+    pub const fn plain(kind: TargetKind, address: String) -> Self {
+        Self {
+            kind,
+            address,
+            secure: None,
+        }
+    }
+}
+
+/// TLS settings and SASL/PLAIN credentials for a managed cluster. `Debug` never shows them.
+pub struct Secure {
+    tls: Arc<rustls::ClientConfig>,
+    username: String,
+    password: String,
+}
+
+impl fmt::Debug for Secure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secure { SASL_SSL PLAIN, credentials redacted }")
+    }
 }
 
 /// Why a target is not available, and whether that is fatal.
@@ -333,10 +378,7 @@ impl KafkaOracle {
             .await
             .map_err(Unavailable::Failed)?;
         Ok(Self {
-            target: Target {
-                kind: TargetKind::Kafka,
-                address,
-            },
+            target: Target::plain(TargetKind::Kafka, address),
             container,
         })
     }
@@ -403,13 +445,229 @@ impl RedpandaOracle {
             .await
             .map_err(Unavailable::Failed)?;
         Ok(Self {
-            target: Target {
-                kind: TargetKind::Redpanda,
-                address,
-            },
+            target: Target::plain(TargetKind::Redpanda, address),
             container,
         })
     }
+}
+
+/// Confluent Cloud: a managed, multi-broker Apache Kafka, reached over `SASL_SSL` with SASL/PLAIN.
+///
+/// Opt-in by presence: it runs when the env file exists (`KAFKA_ORACLE_CONFLUENT_ENV`, else
+/// `~/confluent-oracle.env`) and holds `CONFLUENT_ORACLE_BOOTSTRAP`, `CONFLUENT_ORACLE_API_KEY`
+/// and `CONFLUENT_ORACLE_API_SECRET`. It never runs in CI (`CI` or `GITHUB_ACTIONS` set), and
+/// `KAFKA_ORACLE_CONFLUENT=0` turns it off. The cluster is shared and lives between runs, so
+/// every resource a run creates carries the run's prefix and [`Self::delete_topics`] removes it.
+pub struct ConfluentOracle {
+    pub target: Target,
+}
+
+/// Topics older than this, left by a run that could not clean up, are swept at the next start.
+const CONFLUENT_STALE_AFTER: Duration = Duration::from_hours(6);
+
+impl ConfluentOracle {
+    pub async fn start() -> Result<Self, Unavailable> {
+        if std::env::var_os("CI").is_some() || std::env::var_os("GITHUB_ACTIONS").is_some() {
+            return Err(Unavailable::Skipped(
+                "the Confluent Cloud oracle never runs in CI".to_string(),
+            ));
+        }
+        if std::env::var("KAFKA_ORACLE_CONFLUENT").as_deref() == Ok("0") {
+            return Err(Unavailable::Skipped(
+                "KAFKA_ORACLE_CONFLUENT=0 turns it off".to_string(),
+            ));
+        }
+        let path = std::env::var_os("KAFKA_ORACLE_CONFLUENT_ENV")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join("confluent-oracle.env"))
+            })
+            .ok_or_else(|| {
+                Unavailable::Skipped("no HOME to find confluent-oracle.env".to_string())
+            })?;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Err(Unavailable::Skipped(format!(
+                "{} is absent (see docs/loams/confluent-oracle.md)",
+                path.display()
+            )));
+        };
+        let env = parse_env_file(&text);
+        let get = |key: &str| {
+            env.get(key)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .ok_or_else(|| Unavailable::Failed(format!("{} has no {key}", path.display())))
+        };
+        let address = get("CONFLUENT_ORACLE_BOOTSTRAP")?;
+        let address = address
+            .strip_prefix("SASL_SSL://")
+            .map_or_else(|| address.clone(), ToString::to_string);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| Unavailable::Failed(format!("TLS versions: {error}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let target = Target {
+            kind: TargetKind::Confluent,
+            address,
+            secure: Some(Arc::new(Secure {
+                tls: Arc::new(tls),
+                username: get("CONFLUENT_ORACLE_API_KEY")?,
+                password: get("CONFLUENT_ORACLE_API_SECRET")?,
+            })),
+        };
+        let mut client = WireClient::connect_target(&target)
+            .await
+            .map_err(|error| Unavailable::Failed(format!("Confluent Cloud: {error}")))?;
+        let version = client.version(ApiKey::Metadata, 9).unwrap_or(1);
+        let metadata = client
+            .send(
+                &MetadataRequest::default().with_topics(Some(Vec::new())),
+                version,
+            )
+            .await
+            .map_err(|error| Unavailable::Failed(format!("Confluent Cloud: {error}")))?;
+        if metadata.brokers.is_empty() {
+            return Err(Unavailable::Failed(
+                "Confluent Cloud: Metadata lists no broker".to_string(),
+            ));
+        }
+        Ok(Self { target })
+    }
+
+    /// Deletes every topic whose name starts with `prefix`; answers the names it deleted.
+    pub async fn delete_topics(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.delete_where(|name| name.starts_with(prefix)).await
+    }
+
+    /// Deletes topics a run left behind more than [`CONFLUENT_STALE_AFTER`] ago: names are
+    /// `{RESOURCE_PREFIX}{unix seconds}-...` (see [`run_id`]).
+    pub async fn sweep_stale(&self) -> Result<Vec<String>, String> {
+        let cutoff = unix_now().saturating_sub(CONFLUENT_STALE_AFTER.as_secs());
+        self.delete_where(|name| {
+            name.strip_prefix(RESOURCE_PREFIX)
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|started| started.parse::<u64>().ok())
+                .is_some_and(|started| started < cutoff)
+        })
+        .await
+    }
+
+    /// Deletes matching topics until a listing shows none. A topic created moments ago can be
+    /// missing from one broker's Metadata, so one pass is not enough.
+    async fn delete_where<F: Fn(&str) -> bool + Sync>(
+        &self,
+        wanted: F,
+    ) -> Result<Vec<String>, String> {
+        let mut client = WireClient::connect_target(&self.target).await?;
+        let mut deleted = Vec::new();
+        for pass in 0..6 {
+            let names = Self::listed(&mut client, &wanted).await?;
+            if names.is_empty() && pass > 0 {
+                return Ok(deleted);
+            }
+            if !names.is_empty() {
+                Self::delete_names(&mut client, &names).await?;
+                for name in names {
+                    if !deleted.contains(&name) {
+                        deleted.push(name);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let left = Self::listed(&mut client, &wanted).await?;
+        if left.is_empty() {
+            Ok(deleted)
+        } else {
+            Err(format!(
+                "topics still listed after deleting: {}",
+                left.join(", ")
+            ))
+        }
+    }
+
+    /// The topics Metadata lists that carry [`RESOURCE_PREFIX`] and match `wanted`.
+    async fn listed<F: Fn(&str) -> bool + Sync>(
+        client: &mut WireClient,
+        wanted: &F,
+    ) -> Result<Vec<String>, String> {
+        let version = client.version(ApiKey::Metadata, 9).unwrap_or(1);
+        // `None` lists every topic; the scoped key only sees its own prefix.
+        let metadata = client
+            .send(&MetadataRequest::default().with_topics(None), version)
+            .await?;
+        Ok(metadata
+            .topics
+            .iter()
+            .filter_map(|topic| topic.name.as_ref().map(|name| name.0.to_string()))
+            .filter(|name| name.starts_with(RESOURCE_PREFIX) && wanted(name))
+            .collect())
+    }
+
+    async fn delete_names(client: &mut WireClient, names: &[String]) -> Result<(), String> {
+        let version = client
+            .version(ApiKey::DeleteTopics, 5)
+            .ok_or("Confluent Cloud does not serve DeleteTopics")?;
+        let response = client
+            .send(
+                &DeleteTopicsRequest::default()
+                    .with_topic_names(
+                        names
+                            .iter()
+                            .map(|name| TopicName(StrBytes::from_string(name.clone())))
+                            .collect(),
+                    )
+                    .with_timeout_ms(30_000),
+                version,
+            )
+            .await?;
+        let failed: Vec<String> = response
+            .responses
+            .iter()
+            .filter(|result| result.error_code != 0 && result.error_code != 3)
+            .map(|result| {
+                format!(
+                    "{}: error {}",
+                    result.name.as_ref().map_or("?", |name| name.0.as_str()),
+                    result.error_code
+                )
+            })
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("DeleteTopics failed for {}", failed.join(", ")))
+        }
+    }
+}
+
+/// `KEY=VALUE` lines, `export ` and surrounding quotes allowed, `#` comments skipped.
+pub fn parse_env_file(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+                .unwrap_or(value);
+            Some((key.trim().to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 #[must_use]
@@ -428,28 +686,86 @@ pub fn run_id() -> String {
     format!("{}-{:x}", unix_now(), nanos ^ std::process::id())
 }
 
+/// A byte stream to a broker: plaintext TCP, or TLS over TCP.
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
 /// One Kafka connection that speaks to any target.
 pub struct WireClient {
-    io: TcpStream,
+    io: Box<dyn Stream>,
     next_correlation: i32,
     /// `(min, max)` per API key, from the target's `ApiVersions`.
     versions: BTreeMap<i16, (i16, i16)>,
+    /// On a multi-broker target, where partition and coordinator requests go.
+    router: Option<Router>,
+}
+
+/// The brokers of a multi-broker target, and one connection to each that a request needed.
+struct Router {
+    secure: Arc<Secure>,
+    /// `host:port` per node id, from Metadata and `FindCoordinator`.
+    brokers: BTreeMap<i32, String>,
+    connections: BTreeMap<i32, WireClient>,
+}
+
+/// Where a request must go on a multi-broker target.
+enum Route {
+    Leader(String, i32),
+    /// `(key type, key)`: 0 a group, 1 a transactional id.
+    Coordinator(i8, String),
 }
 
 impl WireClient {
-    /// Connects to `address` and reads the target's versions.
+    /// Connects to the plaintext broker at `address` and reads its versions.
     pub async fn connect(address: &str) -> Result<Self, String> {
-        let io = tokio::time::timeout(RESPONSE_TIMEOUT, TcpStream::connect(address))
+        Self::open(address, None).await
+    }
+
+    /// Connects to `target`; over `SASL_SSL` and routed per broker when it is a managed cluster.
+    pub async fn connect_target(target: &Target) -> Result<Self, String> {
+        let Some(secure) = &target.secure else {
+            return Self::connect(&target.address).await;
+        };
+        let mut client = Self::open(&target.address, Some(secure)).await?;
+        client.router = Some(Router {
+            secure: Arc::clone(secure),
+            brokers: BTreeMap::new(),
+            connections: BTreeMap::new(),
+        });
+        Ok(client)
+    }
+
+    /// One connection to `address`, authenticated when `secure` is given; never routed.
+    async fn open(address: &str, secure: Option<&Arc<Secure>>) -> Result<Self, String> {
+        let tcp = tokio::time::timeout(RESPONSE_TIMEOUT, TcpStream::connect(address))
             .await
             .map_err(|_| format!("connect {address}: timed out"))?
             .map_err(|error| format!("connect {address}: {error}"))?;
+        let io: Box<dyn Stream> = match secure {
+            None => Box::new(tcp),
+            Some(secure) => {
+                let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+                let server_name = ServerName::try_from(host.to_string())
+                    .map_err(|error| format!("server name {host}: {error}"))?;
+                let tls = tokio::time::timeout(
+                    RESPONSE_TIMEOUT,
+                    TlsConnector::from(Arc::clone(&secure.tls)).connect(server_name, tcp),
+                )
+                .await
+                .map_err(|_| format!("TLS to {address}: timed out"))?
+                .map_err(|error| format!("TLS to {address}: {error}"))?;
+                Box::new(tls)
+            }
+        };
         let mut client = Self {
             io,
             next_correlation: 1,
             versions: BTreeMap::new(),
+            router: None,
         };
         let response = client
-            .send(
+            .send_direct(
                 &ApiVersionsRequest::default()
                     .with_client_software_name(StrBytes::from_static_str(CLIENT_ID))
                     .with_client_software_version(StrBytes::from_static_str("1")),
@@ -464,7 +780,45 @@ impl WireClient {
             .iter()
             .map(|key| (key.api_key, (key.min_version, key.max_version)))
             .collect();
+        if let Some(secure) = secure {
+            client.sasl_plain(secure).await?;
+        }
         Ok(client)
+    }
+
+    /// SASL/PLAIN over `SaslHandshake` v1 and `SaslAuthenticate`. Errors never carry the secret.
+    async fn sasl_plain(&mut self, secure: &Secure) -> Result<(), String> {
+        let handshake = self
+            .send_direct(
+                &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
+                1,
+            )
+            .await?;
+        if handshake.error_code != 0 {
+            return Err(format!("SaslHandshake answered {}", handshake.error_code));
+        }
+        let mut token = BytesMut::new();
+        token.put_u8(0);
+        token.put_slice(secure.username.as_bytes());
+        token.put_u8(0);
+        token.put_slice(secure.password.as_bytes());
+        let version = self
+            .version(ApiKey::SaslAuthenticate, 2)
+            .ok_or("the target does not serve SaslAuthenticate")?;
+        let answer = self
+            .send_direct(
+                &SaslAuthenticateRequest::default().with_auth_bytes(token.freeze()),
+                version,
+            )
+            .await?;
+        if answer.error_code != 0 {
+            return Err(format!(
+                "SASL/PLAIN refused with {}: {}",
+                answer.error_code,
+                answer.error_message.as_deref().unwrap_or("")
+            ));
+        }
+        Ok(())
     }
 
     /// The advertised `(min, max)` of every key.
@@ -481,8 +835,122 @@ impl WireClient {
         (version >= min).then_some(version)
     }
 
-    /// Sends `request` at `version` and decodes its response.
-    pub async fn send<R: Request + Sync>(
+    /// Sends `request` at `version` and decodes its response. On a multi-broker target a
+    /// partition request goes to the partition's leader and a group or transactional request to
+    /// its coordinator; everything else, and anything whose owner is unknown, to the bootstrap.
+    pub async fn send<R: Request + Sync + 'static>(
+        &mut self,
+        request: &R,
+        version: i16,
+    ) -> Result<R::Response, String> {
+        if self.router.is_some()
+            && let Some(route) = route_of(request)
+            && let Some(node) = self.owner(route).await?
+        {
+            let connection = self.connection(node).await?;
+            return connection.send_direct(request, version).await;
+        }
+        self.send_direct(request, version).await
+    }
+
+    /// The node that owns `route`, asked of the bootstrap; `None` when none does yet.
+    async fn owner(&mut self, route: Route) -> Result<Option<i32>, String> {
+        match route {
+            Route::Leader(topic, partition) => {
+                let version = self.version(ApiKey::Metadata, 9).unwrap_or(1);
+                let request = MetadataRequest::default()
+                    .with_topics(Some(vec![
+                        MetadataRequestTopic::default()
+                            .with_name(Some(TopicName(StrBytes::from_string(topic)))),
+                    ]))
+                    .with_allow_auto_topic_creation(false);
+                let response = self.send_direct(&request, version).await?;
+                let router = self.router.as_mut().ok_or("not routed")?;
+                for broker in &response.brokers {
+                    router
+                        .brokers
+                        .insert(broker.node_id.0, format!("{}:{}", broker.host, broker.port));
+                }
+                Ok(response
+                    .topics
+                    .first()
+                    .and_then(|found| {
+                        found
+                            .partitions
+                            .iter()
+                            .find(|candidate| candidate.partition_index == partition)
+                    })
+                    .map(|found| found.leader_id.0)
+                    .filter(|leader| *leader >= 0))
+            }
+            Route::Coordinator(key_type, key) => {
+                let Some(version) = self.version(ApiKey::FindCoordinator, 4) else {
+                    return Ok(None);
+                };
+                let request = if version >= 4 {
+                    FindCoordinatorRequest::default()
+                        .with_key_type(key_type)
+                        .with_coordinator_keys(vec![StrBytes::from_string(key)])
+                } else {
+                    FindCoordinatorRequest::default()
+                        .with_key_type(key_type)
+                        .with_key(StrBytes::from_string(key))
+                };
+                for _ in 0..40 {
+                    let response = self.send_direct(&request, version).await?;
+                    let (error, node, host, port) = response.coordinators.first().map_or_else(
+                        || {
+                            (
+                                response.error_code,
+                                response.node_id.0,
+                                response.host.to_string(),
+                                response.port,
+                            )
+                        },
+                        |found| {
+                            (
+                                found.error_code,
+                                found.node_id.0,
+                                found.host.to_string(),
+                                found.port,
+                            )
+                        },
+                    );
+                    if error == 0 && node >= 0 {
+                        let router = self.router.as_mut().ok_or("not routed")?;
+                        router.brokers.insert(node, format!("{host}:{port}"));
+                        return Ok(Some(node));
+                    }
+                    if error != 14 && error != 15 {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// The connection to `node`, opened on first use.
+    async fn connection(&mut self, node: i32) -> Result<&mut Self, String> {
+        let router = self.router.as_mut().ok_or("not routed")?;
+        if !router.connections.contains_key(&node) {
+            let address = router
+                .brokers
+                .get(&node)
+                .cloned()
+                .ok_or_else(|| format!("node {node} has no known address"))?;
+            let opened = Self::open(&address, Some(&router.secure)).await?;
+            router.connections.insert(node, opened);
+        }
+        router
+            .connections
+            .get_mut(&node)
+            .ok_or_else(|| format!("node {node} has no connection"))
+    }
+
+    /// Sends `request` on this connection, whatever owns it.
+    async fn send_direct<R: Request + Sync>(
         &mut self,
         request: &R,
         version: i16,
@@ -538,7 +1006,61 @@ impl WireClient {
     }
 }
 
-async fn read_frame(io: &mut TcpStream) -> Result<Bytes, String> {
+/// Which broker owns `request`: its first partition's leader, or its group's or transactional
+/// id's coordinator. `None` for a request any broker answers.
+fn route_of<R: 'static>(request: &R) -> Option<Route> {
+    let any = request as &dyn Any;
+    let group = |id: &str| Some(Route::Coordinator(0, id.to_string()));
+    if let Some(produce) = any.downcast_ref::<ProduceRequest>() {
+        let topic = produce.topic_data.first()?;
+        let partition = topic.partition_data.first()?;
+        return Some(Route::Leader(topic.name.0.to_string(), partition.index));
+    }
+    if let Some(fetch) = any.downcast_ref::<FetchRequest>() {
+        let topic = fetch.topics.first()?;
+        let partition = topic.partitions.first()?;
+        return Some(Route::Leader(
+            topic.topic.0.to_string(),
+            partition.partition,
+        ));
+    }
+    if let Some(list) = any.downcast_ref::<ListOffsetsRequest>() {
+        let topic = list.topics.first()?;
+        let partition = topic.partitions.first()?;
+        return Some(Route::Leader(
+            topic.name.0.to_string(),
+            partition.partition_index,
+        ));
+    }
+    if let Some(join) = any.downcast_ref::<JoinGroupRequest>() {
+        return group(&join.group_id.0);
+    }
+    if let Some(sync) = any.downcast_ref::<SyncGroupRequest>() {
+        return group(&sync.group_id.0);
+    }
+    if let Some(heartbeat) = any.downcast_ref::<HeartbeatRequest>() {
+        return group(&heartbeat.group_id.0);
+    }
+    if let Some(leave) = any.downcast_ref::<LeaveGroupRequest>() {
+        return group(&leave.group_id.0);
+    }
+    if let Some(commit) = any.downcast_ref::<OffsetCommitRequest>() {
+        return group(&commit.group_id.0);
+    }
+    if let Some(fetch) = any.downcast_ref::<OffsetFetchRequest>() {
+        if fetch.group_id.0.is_empty() {
+            return group(&fetch.groups.first()?.group_id.0);
+        }
+        return group(&fetch.group_id.0);
+    }
+    if let Some(init) = any.downcast_ref::<InitProducerIdRequest>() {
+        let id = init.transactional_id.as_ref()?;
+        return Some(Route::Coordinator(1, id.0.to_string()));
+    }
+    None
+}
+
+async fn read_frame(io: &mut Box<dyn Stream>) -> Result<Bytes, String> {
     let mut length = [0u8; 4];
     io.read_exact(&mut length)
         .await

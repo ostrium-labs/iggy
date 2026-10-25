@@ -140,10 +140,7 @@ async fn start_gateway() -> Gateway {
         let _ = gateway.run(vec![listener], receiver).await;
     });
     Gateway {
-        target: Target {
-            kind: TargetKind::Gateway,
-            address,
-        },
+        target: Target::plain(TargetKind::Gateway, address),
         _shutdown: shutdown,
         _server: server,
         _data_dir: data_dir,
