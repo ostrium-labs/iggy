@@ -87,6 +87,7 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
+| `IGGY_KAFKA_GROUP_*`, `IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST`, `IGGY_KAFKA_OFFSET_METADATA_MAX_BYTES`, `IGGY_KAFKA_PRODUCER_*` | see [Limits that differ from Kafka](#limits-that-differ-from-kafka-4530) | Consumer group caps and timeouts, the topics one admin request may name, the longest commit metadata string, and the idempotent producer state |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` | `false` | Kafka's `auto.create.topics.enable`: a `Metadata` lookup of a missing topic creates it ([Auto topic creation](#auto-topic-creation)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Off by default, unlike Kafka |
 | `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` | `1` | Partitions of an auto-created topic, at most 1000. Only read while auto-creation is on, and refused otherwise |
 
@@ -847,6 +848,39 @@ instead of -1, because the Java `AdminClient` fails a partition on any non-retri
 (`to_list_offsets_error_code`). `HistoryUnavailable` refuses a read routed to an older
 incarnation of the partition, as after a delete and recreate; the retry probes again and answers 3
 if the topic is gone. ListOffsets reads do not get `RequestTooOld` today, so that arm is defensive.
+
+### Limits that differ from Kafka ([#4530](https://github.com/apache/iggy/issues/4530))
+
+A request Kafka accepts can be refused here when it passes one of these. Each one an operator can
+move has a variable; a value that does not parse, or a 0 where 0 would refuse everything, stops the
+gateway at startup with the variable named.
+
+| Variable | Default | Kafka setting (default) | Past it |
+| --- | --- | --- | --- |
+| `IGGY_KAFKA_MAX_FRAME_SIZE` | 8 MiB | `socket.request.max.bytes` (100 MiB) | The connection closes |
+| `IGGY_KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS` | `6000` | `group.min.session.timeout.ms` (6000) | `INVALID_SESSION_TIMEOUT` (26) |
+| `IGGY_KAFKA_GROUP_MAX_SESSION_TIMEOUT_MS` | `1800000` | `group.max.session.timeout.ms` (1800000) | `INVALID_SESSION_TIMEOUT` (26) |
+| `IGGY_KAFKA_GROUP_MAX_REBALANCE_TIMEOUT_MS` | `1800000` | none: Kafka takes any `rebalance_timeout_ms` | Clamped to it, not refused |
+| `IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS` | `3000` | `group.initial.rebalance.delay.ms` (3000) | `0` completes a new group's first join at once |
+| `IGGY_KAFKA_GROUP_MAX_GROUPS` | `1000` | none | `COORDINATOR_NOT_AVAILABLE` (15, retriable) for a new group |
+| `IGGY_KAFKA_GROUP_MAX_SIZE` | `1000` | `group.max.size` (unlimited) | `GROUP_MAX_SIZE_REACHED` (81) |
+| `IGGY_KAFKA_GROUP_MAX_TOTAL_MEMBERS` | `10000` | none | `COORDINATOR_NOT_AVAILABLE` (15) |
+| `IGGY_KAFKA_GROUP_MAX_MEMBER_BYTES` | 64 KiB | none | `INVALID_REQUEST` (42). One member's subscription, or one assignment; a large Kafka Streams assignment can pass the default |
+| `IGGY_KAFKA_GROUP_MAX_ROSTER_BYTES` | 4 MiB | none | `GROUP_MAX_SIZE_REACHED` (81). The member list one leader's `JoinGroup` response carries |
+| `IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST` | `100` | none | `POLICY_VIOLATION` (44) on every topic of a `CreateTopics`, `CreatePartitions`, `DeleteTopics`, `DescribeConfigs`, `AlterConfigs` or `IncrementalAlterConfigs` that names more |
+| `IGGY_KAFKA_OFFSET_METADATA_MAX_BYTES` | `4096` | `offset.metadata.max.bytes` (4096) | `OFFSET_METADATA_TOO_LARGE` (12) on that partition. Counted as Java counts a string's length |
+| `IGGY_KAFKA_PRODUCER_ID_EXPIRATION_MS` | `86400000` | `producer.id.expiration.ms` (86400000) | An idle producer's state is forgotten; its next batch is accepted at any sequence |
+| `IGGY_KAFKA_PRODUCER_STATE_RECOVERY_RECORDS` | `10000` | none: Kafka snapshots producer state | Records at a partition's tail read to rebuild producer state after a restart ([`docs/IDEMPOTENCE.md`](docs/IDEMPOTENCE.md)); an older producer is accepted at any sequence |
+
+Fixed, with no variable:
+
+| Limit | Value | Kafka | Why |
+| --- | --- | --- | --- |
+| Partitions of one topic | 1000 | none | Iggy's own cap (`TooManyPartitions`): `CreateTopics` and `CreatePartitions` answer `INVALID_PARTITIONS` (37) past it |
+| Group id length | 246 bytes | none | The offsets live in the Iggy consumer group `kafka.cg.<group>`, and an Iggy name stops at 255 bytes: `INVALID_GROUP_ID` (24) |
+| Messages Fetch polls per partition at a time | 1000 | none | Costs round trips, not correctness |
+| Fetch sessions (KIP-227), compressed batches on Fetch | not served | served | Costs bandwidth and CPU, not correctness |
+| Member `client_id` kept for `DescribeGroups` | 1024 bytes | none | A member outlives its connection; a longer id is cut at a character boundary |
 
 ### Server limits the gateway inherits
 

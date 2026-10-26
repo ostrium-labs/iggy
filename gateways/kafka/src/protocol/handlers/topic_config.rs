@@ -50,16 +50,6 @@ pub const RESOURCE_TYPE_BROKER: i8 = 4;
 
 pub const ONLY_TOPIC_RESOURCES: &str = "only topic resources are supported";
 
-/// Distinct topic names one `CreateTopics`, `CreatePartitions`, `DescribeConfigs`, `AlterConfigs`
-/// or `IncrementalAlterConfigs` request may address through the bridge.
-///
-/// `bounds_guard`'s element ceiling is a pre-decode limit. `CreateTopics` can spend several
-/// lockstep Iggy calls per name on the shared client (`ensure_stream`, `create_topic`, and a
-/// possible race-retry read). 100 keeps that worst case small and is shared with the config
-/// APIs. Duplicate names count once toward the cap and are rejected on their own. A larger
-/// batch is `POLICY_VIOLATION` on every resource.
-pub const MAX_CONFIG_TOPICS: usize = 100;
-
 const NOT_AUTHORIZED_TO_ALTER: &str =
     "the authenticated principal is not authorized to alter topic configuration";
 
@@ -134,18 +124,16 @@ impl RequestFault {
     }
 }
 
-/// Whether `names` contains more than [`MAX_CONFIG_TOPICS`] distinct strings.
+/// Whether `names` contains more than `max` distinct strings.
 #[must_use]
-pub fn exceeds_topic_cap<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
-    names.into_iter().collect::<HashSet<_>>().len() > MAX_CONFIG_TOPICS
+pub fn exceeds_topic_cap<'a>(names: impl IntoIterator<Item = &'a str>, max: usize) -> bool {
+    names.into_iter().collect::<HashSet<_>>().len() > max
 }
 
-/// Client-facing text for a request over [`MAX_CONFIG_TOPICS`].
+/// Client-facing text for a request over a cap of `max` topics.
 #[must_use]
-pub fn topic_cap_message(api_name: &str) -> String {
-    format!(
-        "this gateway addresses at most {MAX_CONFIG_TOPICS} distinct topics per {api_name} request"
-    )
+pub fn topic_cap_message(api_name: &str, max: usize) -> String {
+    format!("this gateway addresses at most {max} distinct topics per {api_name} request")
 }
 
 /// Names in `names` that occur more than once.
@@ -207,17 +195,20 @@ impl TopicResource for IncrementalAlterConfigsResource {
 
 /// The cap/duplicate verdict shared by `DescribeConfigs` and `AlterConfigs`: both filter
 /// resources down to [`RESOURCE_TYPE_TOPIC`] before deciding whether the request exceeds
-/// [`MAX_CONFIG_TOPICS`] or repeats a name, and the business decision is identical even
+/// `max` distinct topics or repeats a name, and the business decision is identical even
 /// though the two APIs render it into different response types.
 #[must_use]
-pub fn topic_cap_and_duplicates<R: TopicResource>(resources: &[R]) -> (bool, HashSet<&str>) {
+pub fn topic_cap_and_duplicates<R: TopicResource>(
+    resources: &[R],
+    max: usize,
+) -> (bool, HashSet<&str>) {
     let names: Vec<&str> = resources
         .iter()
         .filter(|resource| resource.kafka_resource_type() == RESOURCE_TYPE_TOPIC)
         .map(TopicResource::kafka_resource_name)
         .collect();
     (
-        exceeds_topic_cap(names.iter().copied()),
+        exceeds_topic_cap(names.iter().copied(), max),
         find_duplicate_names(names.iter().copied()),
     )
 }

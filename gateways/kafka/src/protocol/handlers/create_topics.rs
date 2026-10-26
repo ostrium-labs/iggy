@@ -46,8 +46,8 @@ use crate::protocol::handlers::kafka_topic_configs::{
     TOPIC_CONFIGS, TopicConfigSnapshot, TopicWrite, plan_create, requested_set,
 };
 use crate::protocol::handlers::topic_config::{
-    CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC, MAX_CONFIG_TOPICS, fault_response,
-    find_duplicate_names, refused_option, topic_cap_message,
+    CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC, fault_response, find_duplicate_names,
+    refused_option, topic_cap_message,
 };
 use crate::protocol::handlers::{
     clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
@@ -108,15 +108,16 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         .copied()
         .filter(|name| !duplicate_names.contains(name))
         .collect();
-    if distinct_bridge_backed.len() > MAX_CONFIG_TOPICS {
+    let max_topics = state.limits.admin_topics_per_request;
+    if distinct_bridge_backed.len() > max_topics {
         tracing::warn!(
             distinct_topics = distinct_bridge_backed.len(),
-            max = MAX_CONFIG_TOPICS,
+            max = max_topics,
             "CreateTopics request addresses too many distinct topics; rejecting"
         );
         // A server-imposed limit, not a malformed request. INVALID_REQUEST would blame the
         // client for a request Kafka itself would accept.
-        let message = StrBytes::from(topic_cap_message("CreateTopics"));
+        let message = StrBytes::from(topic_cap_message("CreateTopics", max_topics));
         let results = req
             .topics
             .iter()

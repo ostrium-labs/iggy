@@ -37,6 +37,7 @@ use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::scram::{ScramCredential, ScramMechanism};
 
 mod cluster_id;
+mod commit_metadata_log;
 mod fetch;
 mod gateways;
 mod group_index;
@@ -50,6 +51,7 @@ mod topics;
 mod txn_log;
 
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
+pub use commit_metadata_log::IggyMetadataLog;
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 use group_index::GroupIndex;

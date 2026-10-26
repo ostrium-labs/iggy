@@ -52,6 +52,7 @@ use kafka_protocol::protocol::StrBytes;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{BridgeError, IggyBridge, OffsetCalls};
+use crate::commit_metadata::MetadataRecord;
 use crate::error::Result;
 use crate::group::{GroupRemoval, is_valid_group_id};
 use crate::protocol::api::{
@@ -230,6 +231,7 @@ async fn delete(
             found
         }
     };
+    forget_metadata(state, &names, &found).await;
     for (&at, found) in deletable.iter().zip(found) {
         let Plan::Delete { held } = plans[at] else {
             continue;
@@ -241,6 +243,30 @@ async fn delete(
         };
     }
     codes
+}
+
+/// Clears the commit metadata of each group of `names` whose offsets went (KW-12). Best effort:
+/// a string is only ever reported with the offset it was committed with, so one left behind
+/// shows only if a later commit stores that very offset without a string.
+async fn forget_metadata(
+    state: &GatewayState,
+    names: &[&str],
+    found: &[core::result::Result<bool, i16>],
+) {
+    let Some(store) = &state.commit_metadata else {
+        return;
+    };
+    let records: Vec<MetadataRecord> = names
+        .iter()
+        .zip(found)
+        .filter(|(_, found)| found.is_ok())
+        .map(|(group, _)| MetadataRecord::GroupDeleted {
+            group: (*group).to_string(),
+        })
+        .collect();
+    if let Err(error) = store.append(&records).await {
+        tracing::warn!(%error, "could not clear the commit metadata of deleted Kafka groups");
+    }
 }
 
 /// Removes from the coordinator each group of `deletable` that it holds and whose offsets went,
@@ -371,6 +397,7 @@ mod tests {
             protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
             require_known_member_id,
             supports_skip_assignment: false,
+            client: crate::group::ClientIdentity::default(),
         }
     }
 

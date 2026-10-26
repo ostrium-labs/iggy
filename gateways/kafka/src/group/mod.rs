@@ -151,6 +151,59 @@ impl Default for GroupCoordinatorConfig {
     }
 }
 
+/// Who a member is on the wire, as `DescribeGroups` reports it: the request header's
+/// `client_id`, and `client_host`, the peer address the way Kafka prints it (`/127.0.0.1`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub client_id: StrBytes,
+    pub client_host: StrBytes,
+}
+
+/// The longest header `client_id` a member keeps. Kafka keeps any; a member outlives its
+/// connection, so this bounds what a few thousand of them retain. Stock clients send far shorter
+/// ids.
+pub const MAX_RETAINED_CLIENT_ID_BYTES: usize = 1024;
+
+impl ClientIdentity {
+    /// The identity of a connection from `peer` whose requests carry `client_id`.
+    #[must_use]
+    pub fn new(client_id: Option<&str>, peer: Option<std::net::SocketAddr>) -> Self {
+        Self {
+            client_id: client_id.map_or_else(StrBytes::new, |id| {
+                StrBytes::from_string(truncate_at_char(id, MAX_RETAINED_CLIENT_ID_BYTES).to_owned())
+            }),
+            client_host: peer.map_or_else(StrBytes::new, |peer| {
+                StrBytes::from_string(java_host(peer.ip()))
+            }),
+        }
+    }
+}
+
+/// `InetAddress.toString()` for an address with no host name, which is what Kafka reports: a
+/// slash, then the address. IPv6 in Java's long form, each group in lower-case hex without
+/// zero compression; an IPv4-mapped address as the IPv4 address it maps.
+fn java_host(ip: std::net::IpAddr) -> String {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => format!("/{v4}"),
+        std::net::IpAddr::V6(v6) => {
+            let groups: Vec<String> = v6.segments().iter().map(|g| format!("{g:x}")).collect();
+            format!("/{}", groups.join(":"))
+        }
+    }
+}
+
+/// The longest prefix of `value` of at most `max` bytes that ends on a character boundary.
+fn truncate_at_char(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 /// One `JoinGroup` request, normalized across wire versions.
 #[derive(Debug, Clone)]
 pub struct JoinRequest {
@@ -167,6 +220,17 @@ pub struct JoinRequest {
     /// v9+: a static leader replaced while `Stable` is told to skip the assignment it already
     /// ran, instead of being named a follower.
     pub supports_skip_assignment: bool,
+    /// The connection's client id and address, which `DescribeGroups` reports for the member.
+    pub client: ClientIdentity,
+}
+
+impl JoinRequest {
+    /// The same request, from a connection that `client` identifies.
+    #[must_use]
+    pub fn with_client(mut self, client: ClientIdentity) -> Self {
+        self.client = client;
+        self
+    }
 }
 
 /// Every field is copied out of the frame rather than cloned: a clone is a refcounted view that
@@ -200,6 +264,7 @@ impl From<(i16, &JoinGroupRequest)> for JoinRequest {
                 .collect(),
             require_known_member_id: api_version >= 4,
             supports_skip_assignment: api_version >= 9,
+            client: ClientIdentity::default(),
         }
     }
 }
@@ -382,6 +447,7 @@ impl LeaveResult {
 pub struct MemberDescription {
     pub member_id: StrBytes,
     pub group_instance_id: Option<StrBytes>,
+    pub client: ClientIdentity,
     /// Subscription metadata for the group's selected protocol. Empty until a protocol is chosen.
     pub metadata: Bytes,
     pub assignment: Bytes,
@@ -1002,6 +1068,7 @@ mod tests {
             protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
             require_known_member_id: false,
             supports_skip_assignment: false,
+            client: ClientIdentity::default(),
         }
     }
 

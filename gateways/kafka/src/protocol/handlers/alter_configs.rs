@@ -88,9 +88,13 @@ pub async fn handle(
             "AlterConfigs",
         );
     }
-    let (exceeds_cap, duplicate_names) = topic_cap_and_duplicates(&req.resources);
+    let (exceeds_cap, duplicate_names) =
+        topic_cap_and_duplicates(&req.resources, state.limits.admin_topics_per_request);
     if exceeds_cap {
-        let message = StrBytes::from(topic_cap_message("AlterConfigs"));
+        let message = StrBytes::from(topic_cap_message(
+            "AlterConfigs",
+            state.limits.admin_topics_per_request,
+        ));
         tracing::warn!("AlterConfigs request addresses too many distinct topics; rejecting");
         let responses = req
             .resources

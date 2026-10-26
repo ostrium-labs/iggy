@@ -107,9 +107,13 @@ pub async fn handle(
             API_NAME,
         );
     }
-    let (exceeds_cap, duplicate_names) = topic_cap_and_duplicates(&req.resources);
+    let (exceeds_cap, duplicate_names) =
+        topic_cap_and_duplicates(&req.resources, state.limits.admin_topics_per_request);
     if exceeds_cap {
-        let message = StrBytes::from(topic_cap_message(API_NAME));
+        let message = StrBytes::from(topic_cap_message(
+            API_NAME,
+            state.limits.admin_topics_per_request,
+        ));
         tracing::warn!(
             "IncrementalAlterConfigs request addresses too many distinct topics; rejecting"
         );

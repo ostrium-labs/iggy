@@ -29,6 +29,7 @@ use iggy_gateway_kafka::bridge::{
     DEFAULT_TOPIC_PARTITIONS, IggyBridge, IggyBridgeConfig, IggyTls, MAX_TOPIC_PARTITIONS,
 };
 use iggy_gateway_kafka::env::parse_bool;
+use iggy_gateway_kafka::limits;
 use iggy_gateway_kafka::listener::{
     ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
 };
@@ -230,6 +231,7 @@ fn reject_unknown_kafka_env_vars() -> Result<(), String> {
             && !IggyBridgeConfig::KNOWN_ENV_VARS.contains(&key.as_str())
             && !IggyAuthenticator::KNOWN_ENV_VARS.contains(&key.as_str())
             && !OAuthConfig::KNOWN_ENV_VARS.contains(&key.as_str())
+            && !limits::KNOWN_ENV_VARS.contains(&key.as_str())
         {
             return Err(format!(
                 "unknown Kafka gateway env var '{key}' (not in the recognized IGGY_KAFKA_* set - \
@@ -348,6 +350,8 @@ fn load_config() -> Result<GatewayConfig, String> {
         }
         config.max_concurrent_authentications = max_concurrent_authentications;
     }
+    limits::apply_group_env(&mut config.group, env_var)?;
+    config.limits = limits::request_limits_env(env_var)?;
     // Drain of 0 is valid: abandon in-flight connections immediately on shutdown.
     if let Some(raw) = env_var("IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS") {
         let secs: u64 = raw

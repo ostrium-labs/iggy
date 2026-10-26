@@ -39,10 +39,12 @@ use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
     ScramCredentialSource,
 };
-use crate::bridge::{IggyBridge, IggyTxnLog};
+use crate::bridge::{IggyBridge, IggyMetadataLog, IggyTxnLog};
 use crate::cluster_id::ClusterId;
+use crate::commit_metadata::{CommitMetadata, MetadataLog};
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+use crate::limits::RequestLimits;
 use crate::listener::{ListenerConfig, SecurityProtocol};
 use crate::membership::{Announcement, Endpoint, Membership, MembershipConfig, Registry};
 use crate::oauth::{TokenError, TokenValidator};
@@ -137,9 +139,11 @@ pub struct GatewayConfig {
     /// hold shutdown open past typical orchestrator grace periods (e.g. Kubernetes' default
     /// 30s `terminationGracePeriodSeconds`).
     pub shutdown_drain_timeout: Duration,
-    /// Consumer-group timeouts and capacity caps. No environment variable maps onto these yet;
-    /// Kafka's own defaults apply.
+    /// Consumer-group timeouts and capacity caps (`IGGY_KAFKA_GROUP_*`, [`crate::limits`]).
     pub group: GroupCoordinatorConfig,
+    /// Per-request caps the handlers enforce (`IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST`,
+    /// `IGGY_KAFKA_OFFSET_METADATA_MAX_BYTES`).
+    pub limits: RequestLimits,
     /// This gateway's number among the gateways fronting one Iggy cluster
     /// (`IGGY_KAFKA_INSTANCE_ID`). It is the high half of every producer id handed out by
     /// `InitProducerId`, which Kafka requires to be cluster-unique; two gateways left on the
@@ -203,6 +207,7 @@ impl Default for GatewayConfig {
             write_timeout: Duration::from_secs(10),
             shutdown_drain_timeout: Duration::from_secs(25),
             group: GroupCoordinatorConfig::default(),
+            limits: RequestLimits::default(),
             instance_id: 0,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
@@ -251,6 +256,26 @@ impl GatewayConfig {
                 .listeners
                 .iter()
                 .any(|listener| listener.protocol.authenticates_by_certificate())
+    }
+}
+
+/// How long startup waits for the commit metadata log to replay.
+const COMMIT_METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Replays the commit metadata log before any client is served (KW-12), as Kafka loads
+/// `__consumer_offsets` before it coordinates a group. A failure is not fatal: every `OffsetFetch`
+/// replays what is left first, and answers retriably while it cannot.
+async fn load_commit_metadata(store: &CommitMetadata) {
+    match tokio::time::timeout(COMMIT_METADATA_LOAD_TIMEOUT, store.replay()).await {
+        Ok(Ok(records)) => info!(records, "Kafka commit metadata loaded"),
+        Ok(Err(error)) => warn!(
+            %error,
+            "could not load the Kafka commit metadata; OffsetFetch loads it on first use"
+        ),
+        Err(_elapsed) => warn!(
+            "loading the Kafka commit metadata took longer than {COMMIT_METADATA_LOAD_TIMEOUT:?}; \
+             OffsetFetch loads the rest on first use"
+        ),
     }
 }
 
@@ -614,7 +639,7 @@ impl KafkaGateway {
         // Abandoned rather than shut down: the tasks below must not outlive this future. Declared
         // before `heartbeats`, so those are aborted (no goodbye) before this cancel fires.
         let _abandoned = cancel.clone().drop_guard();
-        let (state, heartbeats, txn_log) = self.start_state(&bound, &cancel).await?;
+        let (state, heartbeats, txn_log, metadata_log) = self.start_state(&bound, &cancel).await?;
         if let Some(coordinator) = &state.transactions {
             // Not tracked: both end on the cancel token, which the drain fires first.
             let loading = Arc::clone(coordinator);
@@ -693,6 +718,9 @@ impl KafkaGateway {
         if let Some(txn_log) = txn_log {
             txn_log.close().await;
         }
+        if let Some(metadata_log) = metadata_log {
+            metadata_log.close().await;
+        }
         outcome
     }
 
@@ -712,6 +740,7 @@ impl KafkaGateway {
             GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
         )
         .with_cluster_id(cluster_id)
+        .with_limits(self.config.limits)
         .with_auto_topic_creation(self.config.auto_topic_creation)?;
         let (Some(config), Some(bridge)) = (&self.config.transactions, &self.bridge) else {
             return Ok((state, None));
@@ -736,7 +765,12 @@ impl KafkaGateway {
         &self,
         bound: &[(Arc<Listener>, TcpListener)],
         cancel: &CancellationToken,
-    ) -> Result<(Arc<GatewayState>, Heartbeats, Option<Arc<IggyTxnLog>>)> {
+    ) -> Result<(
+        Arc<GatewayState>,
+        Heartbeats,
+        Option<Arc<IggyTxnLog>>,
+        Option<Arc<IggyMetadataLog>>,
+    )> {
         let cluster_id = self.cluster_id().await?;
         let endpoints = bound
             .iter()
@@ -751,10 +785,19 @@ impl KafkaGateway {
                     .into(),
             ));
         }
-        let (state, txn_log) = self.shared_state(cluster_id, cancel)?;
+        let (mut state, txn_log) = self.shared_state(cluster_id, cancel)?;
+        let metadata_log = if let Some(bridge) = &self.bridge {
+            let log = Arc::new(IggyMetadataLog::new(Arc::clone(bridge)));
+            let store = Arc::new(CommitMetadata::new(Arc::clone(&log) as Arc<dyn MetadataLog>));
+            load_commit_metadata(&store).await;
+            state = state.with_commit_metadata(store);
+            Some(log)
+        } else {
+            None
+        };
         let state = Arc::new(state.with_membership(Arc::clone(&membership)));
         let heartbeats = self.start_membership(&membership).await;
-        Ok((state, heartbeats, txn_log))
+        Ok((state, heartbeats, txn_log, metadata_log))
     }
 
     /// This gateway's membership: alone as node 1, or shared with the gateways that announce
@@ -1382,7 +1425,10 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let connection_state = connection.listener.connection_state();
+    let connection_state = connection
+        .listener
+        .connection_state()
+        .with_peer(connection.peer);
     let bridge = connection.state.bridge.clone();
     let served = serve_frames(stream, connection, certificate_name, &connection_state).await;
     // A producer without a producer id has its Produce session by connection, so it ends here.
@@ -1496,6 +1542,7 @@ where
         // A group request can park for a whole rebalance timeout. `client_id` and the tagged
         // fields are views into the frame, so keeping them would pin the frame for that long
         // after the handler has let go of its own copy.
+        ctx.connection.note_client_id(req.client_id.as_deref());
         req.client_id = None;
         req.unknown_tagged_fields.clear();
 

@@ -81,9 +81,13 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // Checked before the bridge-availability stub, not inside `describe_all`: the cap is a
     // request-shape policy, not a controller-availability one, and a check that only runs once
     // the bridge is up is never exercised by a serverless/stub test.
-    let (exceeds_cap, duplicate_names) = topic_cap_and_duplicates(&req.resources);
+    let (exceeds_cap, duplicate_names) =
+        topic_cap_and_duplicates(&req.resources, state.limits.admin_topics_per_request);
     if exceeds_cap {
-        let message = StrBytes::from(topic_cap_message("DescribeConfigs"));
+        let message = StrBytes::from(topic_cap_message(
+            "DescribeConfigs",
+            state.limits.admin_topics_per_request,
+        ));
         tracing::warn!("DescribeConfigs request addresses too many distinct topics; rejecting");
         let results = req
             .resources

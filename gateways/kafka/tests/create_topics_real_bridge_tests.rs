@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
+use iggy_gateway_kafka::limits::RequestLimits;
 use iggy_gateway_kafka::protocol::api::{
     ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT,
     ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_POLICY_VIOLATION,
@@ -611,6 +612,35 @@ async fn create_topics_rejects_more_than_the_topic_cap() {
     assert!(
         streams.is_empty(),
         "an over-cap request must create nothing"
+    );
+}
+
+/// `IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST` moves the cap (KW-12): at 3, four names are refused
+/// wholesale and three are created.
+#[tokio::test]
+#[serial]
+async fn create_topics_enforces_a_configured_topic_cap() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await.with_limits(RequestLimits {
+        admin_topics_per_request: 3,
+        ..RequestLimits::default()
+    });
+
+    let names: Vec<String> = (0..4).map(|i| format!("topic-{i}")).collect();
+    let four: Vec<TopicSpec> = names.iter().map(|name| TopicSpec::new(name, 1)).collect();
+    let results = send_all(&state, &four, false).await;
+    assert_eq!(results.len(), 4);
+    for (_, error_code) in &results {
+        assert_eq!(*error_code, ERROR_POLICY_VIOLATION);
+    }
+
+    let results = send_all(&state, &four[..3], false).await;
+    assert!(
+        results
+            .iter()
+            .all(|(_, error_code)| *error_code == ERROR_NONE),
+        "{results:?}"
     );
 }
 

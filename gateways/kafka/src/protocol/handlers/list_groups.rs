@@ -295,6 +295,7 @@ mod tests {
                 protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
                 require_known_member_id: false,
                 supports_skip_assignment: false,
+                client: crate::group::ClientIdentity::default(),
             })
             .await;
         assert_eq!(joined.error, ERROR_NONE);

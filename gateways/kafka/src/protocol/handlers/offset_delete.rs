@@ -59,6 +59,7 @@ use kafka_protocol::messages::{OffsetDeleteRequest, OffsetDeleteResponse};
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, ScannedGroups, TopicTarget};
+use crate::commit_metadata::{CommitMetadata, MetadataRecord};
 use crate::error::Result;
 use crate::group::{OffsetDeletion, Subscribed, is_valid_group_id};
 use crate::protocol::api::{
@@ -166,7 +167,15 @@ async fn delete_offsets(
     // Each delete keeps the group fenced until it can no longer land, also past the deadline, so
     // no commit lands while a delete can still land.
     let calls = calls.keeping(deletion);
-    delete_unsubscribed(bridge, request, &topics, &subscribed, &calls).await
+    delete_unsubscribed(
+        bridge,
+        state.commit_metadata.as_deref(),
+        request,
+        &topics,
+        &subscribed,
+        &calls,
+    )
+    .await
 }
 
 /// Whether `group`, which has no members here, holds offsets in Iggy. The last scan answers when
@@ -260,6 +269,7 @@ async fn requested_topics<'a>(
 /// subscribes to.
 async fn delete_unsubscribed(
     bridge: &IggyBridge,
+    metadata: Option<&CommitMetadata>,
     request: &OffsetDeleteRequest,
     requested: &HashMap<&str, core::result::Result<(TopicTarget, u32), i16>>,
     subscribed: &Subscribed,
@@ -296,6 +306,27 @@ async fn delete_unsubscribed(
     }
 
     let results = bridge.commit_group_offsets(group, &deletions, calls).await;
+    if let Some(store) = metadata {
+        // Best effort, as in `DeleteGroups`: a string is only reported with its own offset.
+        let records: Vec<MetadataRecord> = positions
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| result.is_ok())
+            .map(|(&(topic_at, partition_at), _)| {
+                let topic = &request.topics[topic_at];
+                MetadataRecord::Partition {
+                    group: group.to_string(),
+                    topic: topic.name.0.to_string(),
+                    partition: topic.partitions[partition_at].partition_index,
+                    offset: -1,
+                    metadata: String::new(),
+                }
+            })
+            .collect();
+        if let Err(error) = store.append(&records).await {
+            tracing::warn!(group, %error, "could not clear the commit metadata of deleted Kafka offsets");
+        }
+    }
     let mut first_refusal = None;
     for ((topic_at, partition_at), result) in positions.into_iter().zip(results) {
         let Err(error) = result else {
@@ -415,6 +446,7 @@ mod tests {
             protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
             require_known_member_id: false,
             supports_skip_assignment: false,
+            client: crate::group::ClientIdentity::default(),
         }
     }
 

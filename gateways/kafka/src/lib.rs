@@ -20,9 +20,11 @@
 pub mod auth;
 pub mod bridge;
 pub mod cluster_id;
+pub mod commit_metadata;
 pub mod env;
 pub mod error;
 pub mod group;
+pub mod limits;
 pub mod listener;
 pub mod membership;
 pub mod oauth;

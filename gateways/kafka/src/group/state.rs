@@ -36,7 +36,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::group::{
-    CONSUMER_PROTOCOL_TYPE, CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE,
+    CONSUMER_PROTOCOL_TYPE, ClientIdentity, CommitRequest, DESCRIBE_RESPONSE_TOO_LARGE,
     GROUP_STATE_COMPLETING_REBALANCE, GROUP_STATE_EMPTY, GROUP_STATE_PREPARING_REBALANCE,
     GROUP_STATE_STABLE, GroupCoordinatorConfig, GroupDescription, GroupListing, GroupMember,
     GroupRemoval, JoinRequest, JoinResult, JoinedMember, LeaveRequest, LeaveResult, LeavingMember,
@@ -86,8 +86,8 @@ const MAX_PROTOCOL_TYPE_BYTES: usize = 255;
 /// to leave this much room or the id itself will not fit a legacy string.
 const MEMBER_ID_SUFFIX_BYTES: usize = 1 + 36;
 
-/// Prefix for a generated member id when the client sent no `group_instance_id`. Kafka uses the
-/// header's `client_id`, which handlers do not receive.
+/// Prefix for a generated member id when the client sent neither a `group_instance_id` nor a
+/// header `client_id`. Kafka's prefix is then empty; a bare `-` would read as a typo in logs.
 const DEFAULT_MEMBER_PREFIX: &str = "member";
 
 /// Floor on how long a parked waiter sleeps. Every deadline a tick leaves behind is strictly in
@@ -132,6 +132,8 @@ struct Departures {
 
 pub struct Member {
     group_instance_id: Option<StrBytes>,
+    /// The client id and address of the connection that last joined as this member.
+    client: ClientIdentity,
     session_timeout: Duration,
     rebalance_timeout: Duration,
     protocols: Vec<(StrBytes, Bytes)>,
@@ -164,6 +166,7 @@ impl Member {
     fn new(request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) -> Self {
         Self {
             group_instance_id: request.group_instance_id.as_ref().map(owned_str),
+            client: request.client.clone(),
             session_timeout: request.session_timeout,
             rebalance_timeout: request.rebalance_timeout.min(max_rebalance_timeout),
             protocols: retained_protocols(&request.protocols),
@@ -178,6 +181,9 @@ impl Member {
     /// Keeps `group_instance_id`: a rejoin that names one was already checked against it, and one
     /// that names none does not make a static member dynamic, as in Kafka.
     fn rejoin(&mut self, request: &JoinRequest, now: Instant, max_rebalance_timeout: Duration) {
+        // Kafka reports the client of the latest join, which for a replaced static member is
+        // the new process.
+        self.client = request.client.clone();
         self.session_timeout = request.session_timeout;
         self.rebalance_timeout = request.rebalance_timeout.min(max_rebalance_timeout);
         self.protocols = retained_protocols(&request.protocols);
@@ -238,9 +244,8 @@ impl Member {
                 self.group_instance_id.as_ref().map(|id| id.len()),
             );
         }
-        // `client_id` and `client_host` stay empty: the coordinator does not retain them.
-        total += kafka_string_len(flexible, 0);
-        total += kafka_string_len(flexible, 0);
+        total += kafka_string_len(flexible, self.client.client_id.len());
+        total += kafka_string_len(flexible, self.client.client_host.len());
         let metadata_len = if include_blobs {
             protocol_name.map_or(0, |name| self.metadata_len(name))
         } else {
@@ -849,6 +854,7 @@ impl GroupState {
             .map(|(member_id, member)| MemberDescription {
                 member_id: member_id.clone(),
                 group_instance_id: member.group_instance_id.clone(),
+                client: member.client.clone(),
                 metadata: if summary {
                     Bytes::new()
                 } else {
@@ -1205,7 +1211,7 @@ fn join_new_member(
         );
         return reject(groups, ERROR_COORDINATOR_NOT_AVAILABLE);
     }
-    let member_id = generate_member_id(request.group_instance_id.as_ref());
+    let member_id = generate_member_id(request);
     // Checked before an id is handed out too, so a member that could never be admitted is
     // not sent round a `MEMBER_ID_REQUIRED` trip first.
     if group.roster_overflows(config, &member_id, request) {
@@ -1957,7 +1963,7 @@ fn replace_static(
     request: &JoinRequest,
     now: Instant,
 ) -> Step<JoinResult> {
-    let new_member_id = generate_member_id(request.group_instance_id.as_ref());
+    let new_member_id = generate_member_id(request);
     if group.roster_overflows_replacing(config, old_member_id, &new_member_id, request) {
         return Step::Respond(JoinResult::error(
             ERROR_GROUP_MAX_SIZE_REACHED,
@@ -2032,12 +2038,17 @@ fn park_or_respond(group: &mut GroupState, member_id: &StrBytes, now: Instant) -
     }
 }
 
-/// Kafka shapes a member id as `clientId-UUID`. Handlers never see the header's `client_id`, so
-/// the static-membership id stands in for it when present. The UUID matters on its own: a
-/// counter would repeat across a gateway restart and turn a stale client's `UNKNOWN_MEMBER_ID`
-/// into a silent identity theft.
-fn generate_member_id(group_instance_id: Option<&StrBytes>) -> StrBytes {
-    let prefix = group_instance_id.map_or(DEFAULT_MEMBER_PREFIX, StrBytes::as_str);
+/// Kafka shapes a member id as `groupInstanceId-UUID` for a static member and `clientId-UUID`
+/// otherwise (`ClassicGroup.generateMemberId`). The UUID matters on its own: a counter would
+/// repeat across a gateway restart and turn a stale client's `UNKNOWN_MEMBER_ID` into a silent
+/// identity theft. A client id is kept to at most `MAX_RETAINED_CLIENT_ID_BYTES`, so the id still
+/// fits a legacy string.
+fn generate_member_id(request: &JoinRequest) -> StrBytes {
+    let prefix = match &request.group_instance_id {
+        Some(instance_id) => instance_id.as_str(),
+        None if request.client.client_id.is_empty() => DEFAULT_MEMBER_PREFIX,
+        None => request.client.client_id.as_str(),
+    };
     StrBytes::from_string(format!("{prefix}-{}", Uuid::new_v4()))
 }
 
@@ -2208,6 +2219,7 @@ mod tests {
                 .collect(),
             require_known_member_id: false,
             supports_skip_assignment: true,
+            client: ClientIdentity::default(),
         }
     }
 

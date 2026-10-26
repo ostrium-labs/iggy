@@ -28,31 +28,6 @@ fact = "fetch_beyond_end.error"
 issue = "apache/iggy#3536"
 reason = "README Fetch error mapping: OFFSET_OUT_OF_RANGE only after 30 s of NOT_LEADER_OR_FOLLOWER, so a lagging node is not mistaken for data loss"
 
-# Documented: the commit metadata string is dropped.
-[[difference]]
-scenario = "classic_group"
-fact = "fetch_offsets.p0.metadata"
-issue = "apache/iggy#3542"
-reason = "OFFSET_STORAGE.md: the metadata string is dropped and OffsetFetch answers an empty string"
-
-[[difference]]
-scenario = "classic_group"
-fact = "fetch_offsets_after_leave.p0.metadata"
-issue = "apache/iggy#3542"
-reason = "OFFSET_STORAGE.md: the metadata string is dropped"
-
-[[difference]]
-scenario = "standalone_commit"
-fact = "after.p0.metadata"
-issue = "apache/iggy#3542"
-reason = "OFFSET_STORAGE.md: the metadata string is dropped"
-
-[[difference]]
-scenario = "standalone_commit"
-fact = "after_reset.p0.metadata"
-issue = "apache/iggy#3542"
-reason = "OFFSET_STORAGE.md: the metadata string is dropped"
-
 # Topic configs: an Iggy topic never expires by default.
 [[difference]]
 scenario = "describe_configs"

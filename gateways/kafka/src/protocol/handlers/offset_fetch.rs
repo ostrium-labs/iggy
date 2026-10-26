@@ -20,6 +20,8 @@
 //! Reads committed offsets from Iggy (`docs/OFFSET_STORAGE.md`). A failure goes at group level
 //! from v2: the Java consumer treats most partition errors as fatal, even retriable ones.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use futures::future::join_all;
 use kafka_protocol::messages::offset_fetch_response::{
@@ -28,9 +30,10 @@ use kafka_protocol::messages::offset_fetch_response::{
 };
 use kafka_protocol::messages::{GroupId, OffsetFetchRequest, OffsetFetchResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 
 use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
+use crate::commit_metadata::CommitMetadata;
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
@@ -117,12 +120,14 @@ struct TopicAnswer {
     partitions: Vec<PartitionAnswer>,
 }
 
-/// `offset` is -1 when nothing is committed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `offset` is -1 when nothing is committed. `metadata` is the string committed with `offset`,
+/// `None` for `""`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionAnswer {
     index: i32,
     offset: i64,
     error: i16,
+    metadata: Option<Arc<str>>,
 }
 
 pub async fn handle(
@@ -150,11 +155,14 @@ pub async fn handle(
     let queries = GroupQuery::all(api_version, &request);
     let calls = OffsetCalls::new(offset_deadline(state, connection).await);
     // The groups read at once, so a slow group cannot spend the time of the others.
-    let answers = join_all(
-        queries
-            .iter()
-            .map(|query| answer(state.bridge.as_deref(), query, &calls)),
-    )
+    let answers = join_all(queries.iter().map(|query| {
+        answer(
+            state.bridge.as_deref(),
+            state.commit_metadata.as_deref(),
+            query,
+            &calls,
+        )
+    }))
     .await;
     respond_or_close(
         encode_response(api_version, &queries, answers),
@@ -166,6 +174,7 @@ pub async fn handle(
 /// committed" and resets its position.
 async fn answer(
     bridge: Option<&IggyBridge>,
+    metadata: Option<&CommitMetadata>,
     query: &GroupQuery,
     calls: &OffsetCalls,
 ) -> GroupAnswer {
@@ -184,13 +193,58 @@ async fn answer(
         Some(topics) => read_topics(bridge, &query.group_id, topics, calls).await,
         None => read_every_topic(bridge, &query.group_id, calls).await,
     };
-    match read {
-        Ok(topics) => GroupAnswer {
-            error: ERROR_NONE,
-            topics,
-        },
-        Err(error) => GroupAnswer::error(refusal(&query.group_id, &error)),
+    let mut topics = match read {
+        Ok(topics) => topics,
+        Err(error) => return GroupAnswer::error(refusal(&query.group_id, &error)),
+    };
+    if let Some(store) = metadata
+        && topics
+            .iter()
+            .flat_map(|topic| &topic.partitions)
+            .any(|partition| partition.offset >= 0)
+    {
+        // Read after the offsets: a record lands before its offset is committed, so every
+        // offset read here has its string in the log already.
+        if let Err(error) = timeout_at(calls.deadline(), store.replay())
+            .await
+            .unwrap_or(Err(BridgeError::Timeout))
+        {
+            return GroupAnswer::error(refusal(&query.group_id, &error));
+        }
+        for topic in &mut topics {
+            for partition in &mut topic.partitions {
+                if partition.offset >= 0 {
+                    partition.metadata = store.metadata(
+                        &query.group_id,
+                        topic.name.0.as_str(),
+                        partition.index,
+                        partition.offset,
+                    );
+                }
+            }
+        }
     }
+    GroupAnswer {
+        error: ERROR_NONE,
+        topics,
+    }
+}
+
+/// The metadata string as the wire carries it: `""` when none was committed.
+fn wire_metadata(metadata: Option<&Arc<str>>) -> StrBytes {
+    metadata.map_or_else(StrBytes::new, |text| {
+        StrBytes::from_string(text.to_string())
+    })
+}
+
+/// Encoded bytes of `topic`'s answer, roughly: enough to size the response buffer.
+fn topic_bytes(topic: &TopicAnswer) -> usize {
+    let metadata: usize = topic
+        .partitions
+        .iter()
+        .map(|partition| partition.metadata.as_ref().map_or(0, |text| text.len()))
+        .sum();
+    topic.name.0.len() + topic.partitions.len() * PER_PARTITION_BYTES + metadata
 }
 
 /// The group code for a failed read. A -1 is logged, since the client sees no more.
@@ -232,6 +286,7 @@ async fn read_topics(
                     index,
                     offset: UNKNOWN_OFFSET,
                     error: ERROR_NONE,
+                    metadata: None,
                 })
                 .collect(),
         })
@@ -307,6 +362,7 @@ async fn read_listed_topic(
                 index: i32::try_from(partition).unwrap_or(i32::MAX),
                 offset,
                 error: ERROR_NONE,
+                metadata: None,
             });
         }
     }
@@ -343,7 +399,7 @@ fn encode_response(
     let partitions: usize = answers
         .iter()
         .flat_map(|answer| &answer.topics)
-        .map(|topic| topic.name.0.len() + topic.partitions.len() * PER_PARTITION_BYTES)
+        .map(topic_bytes)
         .sum();
     let groups: usize = queries.iter().map(|query| query.group_id.len() + 8).sum();
     let capacity = 16 + groups + partitions;
@@ -371,6 +427,9 @@ fn encode_response(
                                                 OffsetFetchResponsePartitions::default()
                                                     .with_partition_index(partition.index)
                                                     .with_committed_offset(partition.offset)
+                                                    .with_metadata(Some(wire_metadata(
+                                                        partition.metadata.as_ref(),
+                                                    )))
                                                     .with_error_code(partition.error)
                                             })
                                             .collect(),
@@ -406,6 +465,7 @@ fn encode_response(
                         index,
                         offset: UNKNOWN_OFFSET,
                         error,
+                        metadata: None,
                     })
                     .collect(),
             })
@@ -426,6 +486,7 @@ fn encode_response(
                             OffsetFetchResponsePartition::default()
                                 .with_partition_index(partition.index)
                                 .with_committed_offset(partition.offset)
+                                .with_metadata(Some(wire_metadata(partition.metadata.as_ref())))
                                 .with_error_code(partition.error)
                         })
                         .collect(),
