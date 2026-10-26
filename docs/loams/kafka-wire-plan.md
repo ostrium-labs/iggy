@@ -856,6 +856,14 @@ rules, scoped rendering, `authz_real_bridge_tests.rs` (per-topic and per-stream 
 isolation). Left: CreateAcls/DeleteAcls (Kafka bindings onto Iggy grants, exact cases only), grant
 refresh on this gateway's own ACL writes, an ACL oracle vs Kafka's StandardAuthorizer.
 
+With KW-T (rebased onto step 1, 2026-10-26): AddPartitionsToTxn takes in only partitions whose
+topic the principal may write (else 29, the rest 55, as Kafka), since a commit writes a marker to
+each; a transactional InitProducerId needs WRITE somewhere, like an idempotent one. Open: Kafka
+also authorizes the transactional id itself (`TRANSACTIONAL_ID` WRITE), and Iggy has no resource
+for it, so any principal that may write can use, and so fence, another's transactional id. Scoping
+transactional ids per principal, as groups are, is the obvious match for the ruling; it needs the
+owner's go-ahead because it changes KW-T's coordinator keys.
+
 ### KW-11. Repeated header names and header order
 
 **Why.** KafkaJS array headers, Spring trace headers; error 87 is fatal in
