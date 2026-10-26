@@ -86,7 +86,7 @@ test-group = "kafka_bridge"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::transactions_java_client_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests) + binary_id(iggy-gateway-kafka::oracle_auth_diff_tests) + binary_id(iggy-gateway-kafka::sasl_clients_e2e_tests) + binary_id(iggy-gateway-kafka::multi_gateway_oracle_tests)'
+filter = 'binary_id(iggy-gateway-kafka::kafka_client_e2e_tests) + binary_id(iggy-gateway-kafka::transactions_java_client_tests) + binary_id(iggy-gateway-kafka::transactions_fault_tests) + binary_id(iggy-gateway-kafka::oracle_wire_diff_tests) + binary_id(iggy-gateway-kafka::oracle_auth_diff_tests) + binary_id(iggy-gateway-kafka::sasl_clients_e2e_tests) + binary_id(iggy-gateway-kafka::multi_gateway_oracle_tests)'
 test-group = "kafka_client_e2e"
 
 # The client compatibility matrix (KW-2) runs real clients in containers against the gateway and
@@ -106,6 +106,11 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 # markers and coordinators.
 [[profile.default.overrides]]
 filter = 'binary_id(iggy-gateway-kafka::oracle_wire_diff_tests)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# KW-T's fault matrix (KAFKA_FAULT_TESTS=1 only): an exactly-once loop runs through gateway kills.
+[[profile.default.overrides]]
+filter = 'binary_id(iggy-gateway-kafka::transactions_fault_tests)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]

@@ -366,6 +366,12 @@ impl TestServer {
         port_guard
     }
 
+    /// The server's process id, for tests that stop and continue it.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Kills the server with SIGKILL, skipping its shutdown path the way a crash would. The data
     /// dir stays, for a new server to start on.
     pub fn crash(mut self) {
