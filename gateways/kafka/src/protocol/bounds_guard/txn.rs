@@ -183,6 +183,114 @@ pub fn validate_txn_offset_commit_shape(
     Ok(())
 }
 
+/// Mirrors the field order `DescribeTransactionsRequest::decode` walks (flexible from v0).
+/// Transactional ids are echoed.
+///
+/// # Errors
+///
+/// Returns an error when a declared array or string length cannot fit in the bytes remaining in
+/// the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_describe_transactions_shape(
+    _version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let ids = c.compact_array_count()?;
+    for _ in 0..ids {
+        c.compact_string(false)?;
+    }
+    c.tagged_fields()?;
+    Ok(())
+}
+
+/// Mirrors the field order `ListTransactionsRequest::decode` walks at v0 and v1 (flexible).
+///
+/// # Errors
+///
+/// As [`validate_describe_transactions_shape`].
+pub fn validate_list_transactions_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let states = c.compact_array_count()?;
+    for _ in 0..states {
+        c.compact_string(false)?;
+    }
+    let producers = c.compact_array_count()?;
+    for _ in 0..producers {
+        let _producer_id = c.read_i64()?;
+    }
+    if version >= 1 {
+        let _duration = c.read_i64()?;
+    }
+    if version >= 2 {
+        c.compact_string(true)?;
+    }
+    c.tagged_fields()?;
+    Ok(())
+}
+
+/// Mirrors the field order `DescribeProducersRequest::decode` walks (flexible from v0). Topic
+/// names are echoed.
+///
+/// # Errors
+///
+/// As [`validate_describe_transactions_shape`].
+pub fn validate_describe_producers_shape(
+    _version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let topics = c.compact_array_count()?;
+    for _ in 0..topics {
+        c.compact_string(false)?;
+        let partitions = c.compact_array_count()?;
+        for _ in 0..partitions {
+            let _partition = c.read_i32()?;
+        }
+        c.tagged_fields()?;
+    }
+    c.tagged_fields()?;
+    Ok(())
+}
+
+/// Mirrors the field order `WriteTxnMarkersRequest::decode` walks at v1 (flexible). Topic names
+/// are echoed.
+///
+/// # Errors
+///
+/// As [`validate_describe_transactions_shape`].
+pub fn validate_write_txn_markers_shape(
+    _version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let markers = c.compact_array_count()?;
+    for _ in 0..markers {
+        let _producer_id = c.read_i64()?;
+        let _producer_epoch = c.read_i16()?;
+        let _result = c.read_bool()?;
+        let topics = c.compact_array_count()?;
+        for _ in 0..topics {
+            c.compact_string(false)?;
+            let partitions = c.compact_array_count()?;
+            for _ in 0..partitions {
+                let _partition = c.read_i32()?;
+            }
+            c.tagged_fields()?;
+        }
+        let _coordinator_epoch = c.read_i32()?;
+        c.tagged_fields()?;
+    }
+    c.tagged_fields()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,7 +300,8 @@ mod tests {
         TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
     };
     use kafka_protocol::messages::{
-        AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, EndTxnRequest, GroupId, ProducerId,
+        AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, DescribeProducersRequest,
+        DescribeTransactionsRequest, EndTxnRequest, GroupId, ListTransactionsRequest, ProducerId,
         TopicName, TransactionalId, TxnOffsetCommitRequest,
     };
     use kafka_protocol::protocol::{Encodable, StrBytes};
@@ -250,6 +359,21 @@ mod tests {
                     ]),
             ])
         };
+        let describe = DescribeTransactionsRequest::default()
+            .with_transactional_ids(vec![TransactionalId(StrBytes::from_static_str("tx"))]);
+        validate_describe_transactions_shape(0, &encoded(&describe, 0), 1 << 20).unwrap();
+        let list = ListTransactionsRequest::default()
+            .with_state_filters(vec![StrBytes::from_static_str("Ongoing")])
+            .with_producer_id_filters(vec![ProducerId(7)]);
+        for version in 0..=1 {
+            validate_list_transactions_shape(version, &encoded(&list, version), 1 << 20).unwrap();
+        }
+        let producers = DescribeProducersRequest::default().with_topics(vec![
+            kafka_protocol::messages::describe_producers_request::TopicRequest::default()
+                .with_name(TopicName(StrBytes::from_static_str("t")))
+                .with_partition_indexes(vec![0, 1]),
+        ]);
+        validate_describe_producers_shape(0, &encoded(&producers, 0), 1 << 20).unwrap();
         for version in 0..=4 {
             validate_txn_offset_commit_shape(version, &encoded(&commit(version), version), 1 << 20)
                 .unwrap();

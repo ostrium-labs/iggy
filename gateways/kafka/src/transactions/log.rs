@@ -125,6 +125,10 @@ pub struct LogRecord {
     /// On a `CompleteCommit` or `CompleteAbort`: the range of each partition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ended: Vec<EndedRange>,
+    /// A marker written by `WriteTxnMarkers` (an operator's `kafka-transactions.sh abort`), not
+    /// by a transaction of this coordinator: only its `ended` ranges count, never its id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    admin: bool,
 }
 
 impl LogRecord {
@@ -166,6 +170,30 @@ impl LogRecord {
             start_ms: metadata.start_ms,
             update_ms: metadata.update_ms,
             ended,
+            admin: false,
+        }
+    }
+
+    /// The record of a marker an operator wrote with `WriteTxnMarkers`, outside any transaction
+    /// of this coordinator.
+    #[must_use]
+    pub fn admin(
+        producer_id: i64,
+        epoch: i16,
+        outcome_abort: bool,
+        ended: Vec<EndedRange>,
+        now_ms: i64,
+    ) -> Self {
+        let mut metadata = TxnMetadata::new("", producer_id, 0, now_ms);
+        metadata.producer_epoch = epoch;
+        metadata.state = if outcome_abort {
+            TxnState::CompleteAbort
+        } else {
+            TxnState::CompleteCommit
+        };
+        Self {
+            admin: true,
+            ..Self::of(&metadata, ended)
         }
     }
 
@@ -272,6 +300,9 @@ pub fn replay(records: Vec<LogRecord>) -> Replayed {
             replayed.aborted.extend(record.ended.iter().cloned());
         }
         replayed.ended.extend(record.ended.iter().cloned());
+        if record.admin {
+            continue;
+        }
         replayed
             .metadata
             .insert(record.tid.clone(), record.metadata());

@@ -36,6 +36,8 @@ pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;
 pub mod describe_groups;
+pub mod describe_producers;
+pub mod describe_transactions;
 pub mod end_txn;
 pub mod fetch;
 pub mod find_coordinator;
@@ -57,6 +59,7 @@ pub mod sync_group;
 pub(crate) mod topic_config;
 pub mod txn;
 pub mod txn_offset_commit;
+pub mod write_txn_markers;
 
 use std::time::Duration;
 
@@ -172,6 +175,16 @@ pub async fn dispatch(
         end_txn::API_KEY => end_txn::handle(state, api_version, body).await,
         add_offsets_to_txn::API_KEY => add_offsets_to_txn::handle(state, api_version, body).await,
         txn_offset_commit::API_KEY => txn_offset_commit::handle(state, api_version, body).await,
+        describe_producers::API_KEY => describe_producers::handle(state, api_version, body).await,
+        write_txn_markers::API_KEY => {
+            write_txn_markers::handle(state, principal, api_version, body).await
+        }
+        describe_transactions::DESCRIBE_API_KEY => {
+            describe_transactions::describe(state, api_version, body).await
+        }
+        describe_transactions::LIST_API_KEY => {
+            describe_transactions::list(state, api_version, body).await
+        }
         _ => HandleOutcome::Close,
     }
 }

@@ -49,7 +49,9 @@ use crate::error::{KafkaProtocolError, Result};
 mod txn;
 pub use txn::{
     validate_add_offsets_to_txn_shape, validate_add_partitions_to_txn_shape,
-    validate_end_txn_shape, validate_txn_offset_commit_shape,
+    validate_describe_producers_shape, validate_describe_transactions_shape,
+    validate_end_txn_shape, validate_list_transactions_shape, validate_txn_offset_commit_shape,
+    validate_write_txn_markers_shape,
 };
 
 /// Per-array cap: large enough that no single legitimate array (e.g. a topic list) is rejected,

@@ -880,3 +880,215 @@ pub async fn exactly_once(
     );
     Ok(())
 }
+
+/// `kafka-transactions.sh`'s requests on the wire (KIP-664): `DescribeTransactions`,
+/// `ListTransactions` filtered to one producer, `DescribeProducers`, and the operator's abort of a
+/// hanging transaction with `WriteTxnMarkers`, which a `read_committed` reader then honours.
+#[allow(clippy::too_many_lines)] // one scenario, read top to bottom
+pub async fn transaction_admin(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    use kafka_protocol::messages::describe_producers_request::TopicRequest;
+    use kafka_protocol::messages::write_txn_markers_request::{
+        WritableTxnMarker, WritableTxnMarkerTopic,
+    };
+    use kafka_protocol::messages::{
+        DescribeProducersRequest, DescribeTransactionsRequest, ListTransactionsRequest,
+        WriteTxnMarkersRequest,
+    };
+
+    let name = cx.name("transaction_admin", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let transactional_id = cx.name("transaction_admin", "tx");
+    find_coordinator(client, &transactional_id).await?;
+    let (error, producer_id, epoch) = init(client, &transactional_id, 600_000).await?;
+    if error != 0 {
+        return Err(format!("InitProducerId answered {error}"));
+    }
+    let mut producer = Producer {
+        id: transactional_id.clone(),
+        producer_id,
+        epoch,
+        sequence: 0,
+    };
+    add_partitions(client, &producer, &name, &[0]).await?;
+    let records = txn_batch(&mut producer, &["hanging"])?;
+    produce_txn(client, &producer, &name, 0, records).await?;
+
+    let describe_version = version(client, ApiKey::DescribeTransactions, 0)?;
+    let described = client
+        .send(
+            &DescribeTransactionsRequest::default().with_transactional_ids(vec![
+                TransactionalId(s(&transactional_id)),
+                TransactionalId(s(&cx.name("transaction_admin", "nobody"))),
+            ]),
+            describe_version,
+        )
+        .await
+        .map_err(|error| format!("DescribeTransactions: {error}"))?;
+    let known = described
+        .transaction_states
+        .iter()
+        .find(|state| state.transactional_id.as_str() == transactional_id)
+        .ok_or("DescribeTransactions left out the id")?;
+    facts.set("describe.error", known.error_code);
+    facts.set("describe.state", known.transaction_state.as_str());
+    facts.set("describe.same_producer", known.producer_id.0 == producer_id);
+    facts.set("describe.epoch", known.producer_epoch);
+    facts.set("describe.timeout_ms", known.transaction_timeout_ms);
+    facts.set(
+        "describe.partitions",
+        format!(
+            "{:?}",
+            known
+                .topics
+                .iter()
+                .map(|topic| topic.partitions.clone())
+                .collect::<Vec<_>>()
+        ),
+    );
+    facts.set(
+        "describe.unknown.error",
+        described
+            .transaction_states
+            .iter()
+            .find(|state| state.transactional_id.as_str() != transactional_id)
+            .map_or(-2, |state| state.error_code),
+    );
+
+    let list_version = version(client, ApiKey::ListTransactions, 1)?.min(1);
+    let listed = client
+        .send(
+            &ListTransactionsRequest::default()
+                .with_state_filters(vec![s("Ongoing"), s("NoSuchState")])
+                .with_producer_id_filters(vec![ProducerId(producer_id)])
+                .with_duration_filter(-1),
+            list_version,
+        )
+        .await
+        .map_err(|error| format!("ListTransactions: {error}"))?;
+    facts.set("list.error", listed.error_code);
+    facts.set(
+        "list.unknown_filters",
+        listed
+            .unknown_state_filters
+            .iter()
+            .map(|filter| filter.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    facts.set(
+        "list.states",
+        listed
+            .transaction_states
+            .iter()
+            .map(|state| {
+                format!(
+                    "{}:{}",
+                    state.transactional_id.as_str() == transactional_id,
+                    state.transaction_state.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+
+    let producers_version = version(client, ApiKey::DescribeProducers, 0)?;
+    let producers_request = DescribeProducersRequest::default().with_topics(vec![
+        TopicRequest::default()
+            .with_name(topic(&name))
+            .with_partition_indexes(vec![0]),
+    ]);
+    let producers = client
+        .send(&producers_request, producers_version)
+        .await
+        .map_err(|error| format!("DescribeProducers: {error}"))?;
+    let partition = producers
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .ok_or("DescribeProducers answered no partition")?;
+    facts.set("producers.error", partition.error_code);
+    let active = partition
+        .active_producers
+        .iter()
+        .find(|active| active.producer_id.0 == producer_id);
+    facts.set("producers.lists_ours", active.is_some());
+    facts.set(
+        "producers.epoch",
+        active.map_or(-1, |active| active.producer_epoch),
+    );
+    facts.set(
+        "producers.last_sequence",
+        active.map_or(-2, |active| active.last_sequence),
+    );
+    facts.set(
+        "producers.txn_start_offset",
+        active.map_or(-2, |active| active.current_txn_start_offset),
+    );
+    let coordinator_epoch = active.map_or(0, |active| active.coordinator_epoch);
+
+    let markers_version = version(client, ApiKey::WriteTxnMarkers, 1)?.min(1);
+    let abort = WriteTxnMarkersRequest::default().with_markers(vec![
+        WritableTxnMarker::default()
+            .with_producer_id(ProducerId(producer_id))
+            .with_producer_epoch(epoch)
+            .with_transaction_result(false)
+            .with_coordinator_epoch(coordinator_epoch)
+            .with_topics(vec![
+                WritableTxnMarkerTopic::default()
+                    .with_name(topic(&name))
+                    .with_partition_indexes(vec![0]),
+            ]),
+    ]);
+    let aborted = client
+        .send(&abort, markers_version)
+        .await
+        .map_err(|error| format!("WriteTxnMarkers: {error}"))?;
+    facts.set(
+        "abort.error",
+        aborted
+            .markers
+            .first()
+            .and_then(|marker| marker.topics.first())
+            .and_then(|topic| topic.partitions.first())
+            .map_or(-2, |partition| partition.error_code),
+    );
+    let (answer, bytes) = fetch_raw(client, &name, 0, 0, 1).await?;
+    facts.set(
+        "after_abort.values",
+        committed_view(&answer, bytes)?.join(","),
+    );
+    facts.set("after_abort.high_watermark", answer.high_watermark);
+    facts.set(
+        "after_abort.stable_is_high",
+        answer.last_stable_offset == answer.high_watermark,
+    );
+    let producers = client
+        .send(&producers_request, producers_version)
+        .await
+        .map_err(|error| format!("DescribeProducers: {error}"))?;
+    facts.set(
+        "after_abort.txn_start_offset",
+        producers
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .and_then(|partition| {
+                partition
+                    .active_producers
+                    .iter()
+                    .find(|active| active.producer_id.0 == producer_id)
+            })
+            .map_or(-2, |active| active.current_txn_start_offset),
+    );
+    // Tidy: the producer ends its own transaction, as it would.
+    facts.set(
+        "producer_abort.error",
+        end_settled(client, &producer, false).await?,
+    );
+    Ok(())
+}

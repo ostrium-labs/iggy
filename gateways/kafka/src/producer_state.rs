@@ -338,6 +338,23 @@ impl ProducerStates {
         }
     }
 
+    /// The producers held for `partition` of `topic`: id, epoch and last sequence, for
+    /// `DescribeProducers` (KW-T).
+    #[must_use]
+    pub fn producers_on(&self, topic: &str, partition: i32) -> Vec<(i64, i16, i32)> {
+        let mut producers: Vec<(i64, i16, i32)> = self
+            .lock()
+            .iter()
+            .filter(|(key, _)| key.partition == partition && key.topic == topic)
+            .map(|(key, entry)| {
+                let last = entry.batches.back().map_or(-1, |batch| batch.last);
+                (key.producer_id, entry.epoch, last)
+            })
+            .collect();
+        producers.sort_unstable();
+        producers
+    }
+
     /// Entries held, for tests and metrics.
     #[must_use]
     pub fn len(&self) -> usize {

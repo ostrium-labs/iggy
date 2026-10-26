@@ -26,7 +26,8 @@ use kafka_protocol::protocol::Decodable;
 use crate::error::Result;
 use crate::protocol::api::{ApiVersionRange, ERROR_INVALID_REQUEST, HandleOutcome};
 use crate::protocol::handlers::{
-    add_offsets_to_txn, add_partitions_to_txn, end_txn, txn_offset_commit,
+    add_offsets_to_txn, add_partitions_to_txn, describe_producers, describe_transactions, end_txn,
+    txn_offset_commit, write_txn_markers,
 };
 use crate::protocol::handlers::{decode_guarded, respond_or_close};
 
@@ -36,6 +37,10 @@ pub static TXN_ADVERTISED_RANGES: &[ApiVersionRange] = &[
     add_offsets_to_txn::RANGE,
     end_txn::RANGE,
     txn_offset_commit::RANGE,
+    describe_producers::RANGE,
+    describe_transactions::DESCRIBE_RANGE,
+    describe_transactions::LIST_RANGE,
+    write_txn_markers::RANGE,
 ];
 
 /// Decodes a request of a key in [`TXN_ADVERTISED_RANGES`], or the outcome to send instead: a
