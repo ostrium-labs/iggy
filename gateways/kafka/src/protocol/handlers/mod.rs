@@ -207,8 +207,12 @@ pub(crate) async fn dispatch_unscoped(
             add_partitions_to_txn::handle(state, principal, api_version, body).await
         }
         end_txn::API_KEY => end_txn::handle(state, api_version, body).await,
-        add_offsets_to_txn::API_KEY => add_offsets_to_txn::handle(state, api_version, body).await,
-        txn_offset_commit::API_KEY => txn_offset_commit::handle(state, api_version, body).await,
+        add_offsets_to_txn::API_KEY => {
+            add_offsets_to_txn::handle(state, principal, api_version, body).await
+        }
+        txn_offset_commit::API_KEY => {
+            txn_offset_commit::handle(state, principal, api_version, body).await
+        }
         _ => HandleOutcome::Close,
     }
 }

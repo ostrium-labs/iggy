@@ -21,8 +21,12 @@
 use bytes::Bytes;
 use kafka_protocol::messages::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse};
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::GroupScope;
 use crate::error::Result;
-use crate::protocol::api::{ApiVersionRange, GatewayState, HandleOutcome};
+use crate::protocol::api::{
+    ApiVersionRange, ERROR_GROUP_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+};
 use crate::protocol::bounds_guard::validate_add_offsets_to_txn_shape;
 use crate::protocol::handlers::txn::decode_txn_request;
 use crate::protocol::handlers::{encode_message, respond_or_close};
@@ -39,7 +43,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// The first version whose clients know `PRODUCER_FENCED` (KIP-588).
 const PRODUCER_FENCED_VERSION: i16 = 2;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(coordinator) = state.transactions.as_ref() else {
         return HandleOutcome::Close;
     };
@@ -55,15 +64,25 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         Err(outcome) => return outcome,
     };
     let transactional_id = request.transactional_id.to_string();
+    // KW-10: the group is the principal's own, in its namespace, and group access follows read
+    // access to some topic, as for every group API.
+    let group = principal.map_or_else(
+        || request.group_id.to_string(),
+        |principal| GroupScope::of(&principal.username).scope(request.group_id.as_str()),
+    );
+    let may_use_group = principal
+        .is_none_or(|principal| principal.permissions_known && principal.grants.reads_any_topic());
     let code = if transactional_id.is_empty() || request.group_id.is_empty() {
         codes::INVALID_REQUEST
+    } else if !may_use_group {
+        ERROR_GROUP_AUTHORIZATION_FAILED
     } else {
         coordinator
             .add_offsets(
                 &transactional_id,
                 request.producer_id.0,
                 request.producer_epoch,
-                &request.group_id,
+                &group,
             )
             .await
             .err()

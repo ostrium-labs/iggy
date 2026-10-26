@@ -31,12 +31,17 @@ use kafka_protocol::messages::txn_offset_commit_response::{
 };
 use kafka_protocol::messages::{TxnOffsetCommitRequest, TxnOffsetCommitResponse};
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::{GroupScope, TopicOp};
 use crate::error::Result;
 use crate::group::CommitRequest;
-use crate::protocol::api::{ApiVersionRange, GatewayState, HandleOutcome};
+use crate::protocol::api::{
+    ApiVersionRange, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    GatewayState, HandleOutcome,
+};
 use crate::protocol::bounds_guard::validate_txn_offset_commit_shape;
 use crate::protocol::handlers::txn::decode_txn_request;
-use crate::protocol::handlers::{encode_message, respond_or_close};
+use crate::protocol::handlers::{encode_message, may_topic, respond_or_close};
 use crate::transactions::{TopicPartition, codes};
 
 pub const API_KEY: i16 = 28;
@@ -50,11 +55,16 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// The first version that names the consumer's member and generation (KIP-447).
 const MEMBER_VERSION: i16 = 3;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(coordinator) = state.transactions.as_ref() else {
         return HandleOutcome::Close;
     };
-    let request = match decode_txn_request::<TxnOffsetCommitRequest>(
+    let mut request = match decode_txn_request::<TxnOffsetCommitRequest>(
         RANGE,
         api_version,
         body,
@@ -65,11 +75,49 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         Ok(request) => request,
         Err(outcome) => return outcome,
     };
-    let code = commit(state, coordinator, api_version, &request).await;
-    respond_or_close(
-        encode_response(api_version, &request, code),
-        "TxnOffsetCommit",
-    )
+    // KW-10: the group lives in the principal's namespace, as every group API's does, and needs
+    // read access to some topic; each topic needs READ. As in Kafka, the readable topics are
+    // committed and the others answer 29.
+    let unreadable: Vec<String> = if let Some(principal) = principal {
+        if !(principal.permissions_known && principal.grants.reads_any_topic()) {
+            return respond_or_close(
+                encode_response(api_version, &request, ERROR_GROUP_AUTHORIZATION_FAILED),
+                "TxnOffsetCommit",
+            );
+        }
+        let scope = GroupScope::of(&principal.username);
+        request.group_id.0 =
+            kafka_protocol::protocol::StrBytes::from_string(scope.scope(request.group_id.as_str()));
+        request
+            .topics
+            .iter()
+            .filter(|topic| !may_topic(state, Some(principal), topic.name.as_str(), TopicOp::Read))
+            .map(|topic| topic.name.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let code = if unreadable.is_empty() {
+        commit(state, coordinator, api_version, &request).await
+    } else {
+        let mut readable = request.clone();
+        readable
+            .topics
+            .retain(|topic| !unreadable.contains(&topic.name.to_string()));
+        if readable.topics.is_empty() {
+            codes::NONE
+        } else {
+            commit(state, coordinator, api_version, &readable).await
+        }
+    };
+    let encoded = encode_response_with(api_version, &request, |topic| {
+        if unreadable.iter().any(|name| name == topic) {
+            ERROR_TOPIC_AUTHORIZATION_FAILED
+        } else {
+            code
+        }
+    });
+    respond_or_close(encoded, "TxnOffsetCommit")
 }
 
 async fn commit(
@@ -135,6 +183,15 @@ async fn commit(
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
 pub fn encode_response(version: i16, request: &TxnOffsetCommitRequest, code: i16) -> Result<Bytes> {
+    encode_response_with(version, request, |_| code)
+}
+
+/// [`encode_response`] with each topic's code from `code_of`.
+fn encode_response_with(
+    version: i16,
+    request: &TxnOffsetCommitRequest,
+    code_of: impl Fn(&str) -> i16,
+) -> Result<Bytes> {
     let topics = request
         .topics
         .iter()
@@ -148,7 +205,7 @@ pub fn encode_response(version: i16, request: &TxnOffsetCommitRequest, code: i16
                         .map(|partition| {
                             TxnOffsetCommitResponsePartition::default()
                                 .with_partition_index(partition.partition_index)
-                                .with_error_code(code)
+                                .with_error_code(code_of(topic.name.as_str()))
                         })
                         .collect(),
                 )
