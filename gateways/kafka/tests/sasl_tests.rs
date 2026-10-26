@@ -1395,9 +1395,11 @@ async fn given_a_principal_with_permissions_when_describing_acls_should_report_t
 }
 
 #[tokio::test]
-async fn given_only_poll_messages_should_not_render_a_group_binding() {
-    // Regression. Consumer-group operations route through Iggy's topic rule, which never consults
-    // `poll_messages`, so deriving the group binding from polling advertised access Iggy denies.
+async fn given_only_poll_messages_should_render_the_group_binding_the_gateway_enforces() {
+    // Before KW-10 group operations ran through Iggy's topic rule as the principal, which never
+    // consults `poll_messages`, so a polling principal was shown no group binding. Since KW-10
+    // the gateway decides group access itself, from topic read access, and polling is a topic
+    // read (Iggy's `poll_messages` rule): the binding must say what the gateway allows.
     let addr = spawn_gateway_for(PrincipalPermissions {
         poll_messages: true,
         ..PrincipalPermissions::default()
@@ -1420,8 +1422,8 @@ async fn given_only_poll_messages_should_not_render_a_group_binding() {
         "polling still grants TOPIC READ, got {bindings:?}"
     );
     assert!(
-        !bindings.iter().any(|(resource, ..)| *resource == 3),
-        "no group binding without a topic read grant, got {bindings:?}"
+        bindings.contains(&(3, "*".to_string(), 3, 3, 3)),
+        "group access follows topic read access, got {bindings:?}"
     );
 }
 

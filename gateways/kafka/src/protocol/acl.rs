@@ -167,6 +167,10 @@ pub fn bindings_for(permissions: &PrincipalPermissions) -> Vec<AclBinding> {
             operation::READ,
         ));
     }
+    // The global flags alone. Since KW-10 the gateway decides group access from topic read
+    // access, polling included, and `scoped_bindings` renders that GROUP READ; this one is the
+    // narrower pre-KW-10 reading, kept for callers without grants.
+    //
     // Derived, not stored: Iggy has no group-level permission. Group *membership* operations
     // (create, delete, get, join, leave) route through `Permissioner::get_topic`
     // (`permissioner_rules/consumer_groups.rs`), which admits on the read and manage flags and
