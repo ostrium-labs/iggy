@@ -162,7 +162,7 @@ pub fn env_flag(name: &str) -> bool {
 }
 
 /// The container CLI, `docker` unless `KAFKA_ORACLE_CONTAINER_CLI` names another (`podman`).
-fn container_cli() -> String {
+pub fn container_cli() -> String {
     std::env::var("KAFKA_ORACLE_CONTAINER_CLI").unwrap_or_else(|_| "docker".to_string())
 }
 
