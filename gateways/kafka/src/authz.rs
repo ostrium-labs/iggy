@@ -28,6 +28,12 @@
 //! Kafka consumer groups have no Iggy resource. Group access follows topic read access, and group
 //! ids are scoped per principal ([`GroupScope`]), so a principal sees, joins and deletes only the
 //! groups in its own namespace (owner ruling of 2026-10-25).
+//!
+//! Transactional ids have no Iggy resource either. They are scoped per principal the same way
+//! ([`TransactionalIdScope`], coordinator ruling of 2026-10-27 under the KW-10 ruling), and a
+//! principal may use transactional ids in its namespace when it may write some topic: Kafka's
+//! `WRITE` and `DESCRIBE` on `TRANSACTIONAL_ID`, which a transaction needs to write anything at
+//! all.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -390,6 +396,14 @@ impl GroupScope {
     }
 }
 
+/// A principal's transactional id namespace (KW-TXP).
+///
+/// The same `<length>:<principal>/<id>` form as [`GroupScope`]: the transaction coordinator keys,
+/// logs and expires every transaction under the scoped id, so two tenants that both use
+/// `orders-tx` run two transactions, and neither can fence, end, describe or list the other's.
+/// Groups and transactional ids live in different stores, so sharing the form shares nothing.
+pub type TransactionalIdScope = GroupScope;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +541,18 @@ mod tests {
         assert_ne!(crafty.scope("y"), alice.scope("x/y"));
         assert_eq!(alice.unscope(&crafty.scope("y")), None);
         assert_eq!(GroupScope::of("bob").unscope(&scoped), None);
+    }
+
+    #[test]
+    fn transactional_id_scopes_cannot_reach_each_other() {
+        let alice = TransactionalIdScope::of("alice");
+        let bob = TransactionalIdScope::of("bob");
+        let key = alice.scope("orders-tx");
+        assert_eq!(key, "5:alice/orders-tx");
+        assert_ne!(bob.scope("orders-tx"), key);
+        assert_eq!(bob.unscope(&key), None);
+        // Naming another principal's key spells an id in one's own namespace, not theirs.
+        assert_ne!(bob.scope(&key), key);
+        assert_eq!(alice.unscope(&bob.scope(&key)), None);
     }
 }

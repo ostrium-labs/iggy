@@ -18,6 +18,15 @@ follows topic read access, and every principal gets a namespace of its own: the 
 names is kept as `<length>:<principal>/<group>`, so a principal sees, joins, commits to and deletes
 only its own groups, and two tenants that both name `orders-app` use two groups.
 
+**Transactional ids are scoped per principal too** (KW-TXP, coordinator ruling of 2026-10-27 under
+the KW-10 ruling). They have no Iggy resource either. Access follows topic write access, and the
+transaction coordinator keeps the id a client names as `<length>:<principal>/<id>`, so a principal
+can only initialize, fence, end, describe and list its own transactions, and two tenants that both
+use `orders-tx` run two transactions. In Kafka terms each principal holds `WRITE` and `DESCRIBE`
+on its own prefix of `TRANSACTIONAL_ID` and nothing else; a principal that may write no topic is
+refused every transaction API with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53), as Kafka refuses
+a principal without those ACLs.
+
 **Enforcement needs a principal.** It applies on a gateway where a listener names principals (a
 SASL listener, or `SSL` with client certificates). There every connection has one: a connection
 that proved no identity, also on a `PLAINTEXT` listener beside such a listener, is `ANONYMOUS`
@@ -47,6 +56,8 @@ connection keeps the result. See [Staleness](#staleness).
 | `OffsetCommit`, `OffsetFetch`, `OffsetDelete` | `READ` on the topic | `poll_messages`, Iggy's consumer offset rule | 29 on each partition; an every-topic `OffsetFetch` leaves the topic out |
 | The group APIs | `READ` / `DESCRIBE` / `DELETE` on the group | any topic read grant, anywhere | 30 (an empty `ListGroups`), in the principal's own namespace |
 | `InitProducerId` | `IDEMPOTENT_WRITE` on the cluster | `append_messages` on some topic | 31 |
+| `InitProducerId` with a transactional id, transactional Produce, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn` | `WRITE` on the transactional id, checked first | `append_messages` on some topic, in the principal's own namespace | 53 (every partition where the answer has partitions); then the topic and group checks above |
+| `FindCoordinator` (transaction), `DescribeTransactions`, `ListTransactions` | `DESCRIBE` on the transactional id | as above | 53 per key or id; `ListTransactions` lists only the principal's own ids, none without the grant. `DescribeTransactions` leaves out topics the principal may not describe |
 
 Kafka implies `DESCRIBE` from every other topic operation, so a principal that may read or write a
 topic may also look it up. A principal whose permissions could not be read is refused everything:

@@ -118,6 +118,40 @@ Transactions past their timeout are fenced and aborted every
   once on the gateway and on Kafka; `StreamsEosProbe` (a Kafka Streams 3.9 word count at
   `exactly_once_v2`, restarted half way) ends with the same counts on both.
 
+## Transactional ids per principal (KW-TXP)
+
+On a gateway where a listener names principals (KW-10), transactional ids are scoped per
+principal the way consumer groups are (coordinator ruling of 2026-10-27, under the owner's KW-10
+ruling). Every handler that names a transactional id (`InitProducerId`, transactional Produce,
+`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `FindCoordinator` with key
+type 1, `DescribeTransactions`) turns it into `<length>:<principal>/<id>` before the coordinator
+sees it (`handlers::txn::coordinator_key`), so the coordinator, the `txn_state` log, its
+partitioning, timeouts and expiry all work on scoped ids. `DescribeTransactions` answers with the
+id as the client named it, and `ListTransactions` lists only the caller's own ids, unscoped.
+
+Access follows topic write access (`handlers::txn::may_use_transactional_ids`): Kafka's `WRITE`
+(and the `DESCRIBE` it implies) on `TRANSACTIONAL_ID`, checked before anything else as Kafka's
+`KafkaApis` does. A principal that may write no topic, or whose permissions were never read, gets
+`TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) from every API above, an empty `ListTransactions`, and
+no coordinator from `FindCoordinator`.
+
+Compared with Apache Kafka 4.3.1: Kafka answers 53 when a principal names an id it holds no ACL
+for. Here a principal cannot name another's id at all: the same name, or even another principal's
+scoped form spelled out, lands in its own namespace, so the other transaction is neither fenced nor
+seen, and `DescribeTransactions` of it answers `TRANSACTIONAL_ID_NOT_FOUND` (105) unless the caller
+has one of that name. The equivalent Kafka setup is one where every principal holds `WRITE` on a
+prefixed `TRANSACTIONAL_ID` pattern of its own. A gateway with no listener that names principals
+scopes nothing, as before.
+
+Ids logged before this change (unscoped) are not reachable by any principal on a gateway that
+names principals; an open one is aborted at its timeout and the id expires as usual. Transactions
+are a preview behind `IGGY_KAFKA_TRANSACTIONS_ENABLED`, so no migration is attempted.
+
+Tests: `src/protocol/handlers/txn.rs` and `src/authz.rs` (the scope), `describe_transactions.rs`
+(topics filtered), and `tests/transactions_authz_real_bridge_tests.rs` against a real
+`iggy-server`: two writers with the same id run two transactions; a reader-only and a no-grant
+principal get 53 from every transaction API.
+
 ## Limits
 
 - One gateway per Iggy default stream coordinates transactions. Two gateways with the switch on

@@ -28,10 +28,13 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::authz::TopicOp;
 use crate::error::Result;
 use crate::protocol::api::{
-    ApiVersionRange, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+    ApiVersionRange, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+    GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_add_partitions_to_txn_shape;
-use crate::protocol::handlers::txn::decode_txn_request;
+use crate::protocol::handlers::txn::{
+    coordinator_key, decode_txn_request, may_use_transactional_ids,
+};
 use crate::protocol::handlers::{encode_message, may_topic, respond_or_close};
 use crate::transactions::{AddError, TopicPartition, codes};
 
@@ -76,7 +79,9 @@ pub async fn handle(
                 .map(|partition| (topic.name.to_string(), *partition))
         })
         .collect();
-    let transactional_id = request.v3_and_below_transactional_id.to_string();
+    // KW-TXP: the id is the principal's own, in its namespace.
+    let transactional_id =
+        coordinator_key(principal, request.v3_and_below_transactional_id.as_str());
     // KW-10: a transaction may only take in partitions its principal may write, since committing
     // it writes a marker to each. As in Kafka, the refused ones answer 29 and the rest 55.
     let refused: std::collections::BTreeMap<TopicPartition, i16> = partitions
@@ -84,7 +89,10 @@ pub async fn handle(
         .filter(|(topic, _)| !may_topic(state, principal, topic, TopicOp::Write))
         .map(|partition| (partition.clone(), ERROR_TOPIC_AUTHORIZATION_FAILED))
         .collect();
-    let outcome = if transactional_id.is_empty() {
+    // As Kafka's `KafkaApis`: WRITE on the transactional id first, for every partition (53).
+    let outcome = if !may_use_transactional_ids(principal) {
+        Err(AddError::All(ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED))
+    } else if transactional_id.is_empty() {
         Err(AddError::All(codes::INVALID_REQUEST))
     } else if !refused.is_empty() {
         Err(AddError::Partitions(refused))
@@ -196,6 +204,14 @@ mod tests {
         }
         let refused = Err(AddError::Partitions([(("a".to_string(), 1), 3)].into()));
         assert_eq!(codes_of(3, &refused), [codes::OPERATION_NOT_ATTEMPTED, 3]);
+    }
+
+    #[test]
+    fn given_an_unauthorized_transactional_id_should_answer_53_for_every_partition() {
+        let refused = Err(AddError::All(ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED));
+        for version in 0..=3 {
+            assert_eq!(codes_of(version, &refused), [53, 53]);
+        }
     }
 
     #[test]

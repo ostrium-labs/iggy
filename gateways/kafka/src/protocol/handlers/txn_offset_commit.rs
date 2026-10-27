@@ -37,10 +37,12 @@ use crate::error::Result;
 use crate::group::CommitRequest;
 use crate::protocol::api::{
     ApiVersionRange, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_TOPIC_AUTHORIZATION_FAILED,
-    GatewayState, HandleOutcome,
+    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_txn_offset_commit_shape;
-use crate::protocol::handlers::txn::decode_txn_request;
+use crate::protocol::handlers::txn::{
+    coordinator_key, decode_txn_request, may_use_transactional_ids,
+};
 use crate::protocol::handlers::{encode_message, may_topic, respond_or_close};
 use crate::transactions::{TopicPartition, codes};
 
@@ -78,6 +80,20 @@ pub async fn handle(
     // KW-10: the group lives in the principal's namespace, as every group API's does, and needs
     // read access to some topic; each topic needs READ. As in Kafka, the readable topics are
     // committed and the others answer 29.
+    // KW-TXP: Kafka asks for WRITE on the transactional id before anything else (53 for every
+    // partition), and the id is the principal's own, in its namespace.
+    if !may_use_transactional_ids(principal) {
+        return respond_or_close(
+            encode_response(
+                api_version,
+                &request,
+                ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+            ),
+            "TxnOffsetCommit",
+        );
+    }
+    let transactional_id = coordinator_key(principal, request.transactional_id.as_str());
+    request.transactional_id.0 = kafka_protocol::protocol::StrBytes::from_string(transactional_id);
     let unreadable: Vec<String> = if let Some(principal) = principal {
         if !(principal.permissions_known && principal.grants.reads_any_topic()) {
             return respond_or_close(
