@@ -37,8 +37,8 @@ use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
     ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState, HandleOutcome, REQUEST_DEADLINE, UNKNOWN_OFFSET,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, REQUEST_DEADLINE,
+    UNKNOWN_OFFSET,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
 use crate::protocol::handlers::fetch::{Spells, sight_first, sight_loading};
