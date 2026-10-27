@@ -30,10 +30,14 @@ use kafka_protocol::messages::describe_producers_response::{
 };
 use kafka_protocol::messages::{DescribeProducersRequest, DescribeProducersResponse, ProducerId};
 
-use crate::protocol::api::{ApiVersionRange, GatewayState, HandleOutcome};
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
+use crate::protocol::api::{
+    ApiVersionRange, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+};
 use crate::protocol::bounds_guard::validate_describe_producers_shape;
 use crate::protocol::handlers::txn::decode_txn_request;
-use crate::protocol::handlers::{encode_message, respond_or_close};
+use crate::protocol::handlers::{encode_message, may_topic, respond_or_close};
 use crate::transactions::{DataPlane, codes};
 
 pub const API_KEY: i16 = 61;
@@ -44,7 +48,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 0,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let (Some(coordinator), Some(bridge)) = (state.transactions.as_ref(), state.bridge.as_ref())
     else {
         return HandleOutcome::Close;
@@ -62,9 +71,16 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     };
     let mut topics = Vec::with_capacity(request.topics.len());
     for topic in &request.topics {
+        // KW-10: Kafka asks for READ on the topic and answers 29 for each partition of a topic the
+        // principal may not read, before it looks the partition up.
+        let readable = may_topic(state, principal, topic.name.as_str(), TopicOp::Read);
         let mut partitions = Vec::with_capacity(topic.partition_indexes.len());
         for &index in &topic.partition_indexes {
             let answer = PartitionResponse::default().with_partition_index(index);
+            if !readable {
+                partitions.push(answer.with_error_code(ERROR_TOPIC_AUTHORIZATION_FAILED));
+                continue;
+            }
             // Kafka answers for a partition it leads; this gateway reads every partition.
             if let Err(error) = DataPlane::high_watermark(bridge.as_ref(), &topic.name, index).await
             {

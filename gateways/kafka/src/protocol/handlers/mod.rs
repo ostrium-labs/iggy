@@ -216,7 +216,9 @@ pub(crate) async fn dispatch_unscoped(
         txn_offset_commit::API_KEY => {
             txn_offset_commit::handle(state, principal, api_version, body).await
         }
-        describe_producers::API_KEY => describe_producers::handle(state, api_version, body).await,
+        describe_producers::API_KEY => {
+            describe_producers::handle(state, principal, api_version, body).await
+        }
         write_txn_markers::API_KEY => {
             write_txn_markers::handle(state, principal, api_version, body).await
         }
