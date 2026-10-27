@@ -82,11 +82,11 @@ impl SaslAuthenticator for FixedCredentialAuthenticator {
         let matches = credentials.username == self.username
             && credentials.password.expose_secret() == self.password;
         if matches {
-            Ok(AuthenticatedPrincipal {
-                username: credentials.username.clone(),
-                permissions: self.permissions,
-                permissions_known: true,
-            })
+            Ok(AuthenticatedPrincipal::from_projection(
+                credentials.username.clone(),
+                self.permissions,
+                true,
+            ))
         } else {
             Err(AuthError::Rejected)
         }
@@ -1033,11 +1033,11 @@ impl SaslAuthenticator for StallingAuthenticator {
         _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         let _held = self.release.acquire().await;
-        Ok(AuthenticatedPrincipal {
-            username: credentials.username.clone(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: true,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            credentials.username.clone(),
+            PrincipalPermissions::default(),
+            true,
+        ))
     }
 }
 
@@ -1099,11 +1099,11 @@ impl SaslAuthenticator for ConcurrencyRecordingAuthenticator {
         // bounded run still finishes well inside the pre-authentication budget.
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        Ok(AuthenticatedPrincipal {
-            username: credentials.username.clone(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: true,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            credentials.username.clone(),
+            PrincipalPermissions::default(),
+            true,
+        ))
     }
 }
 
@@ -1395,9 +1395,11 @@ async fn given_a_principal_with_permissions_when_describing_acls_should_report_t
 }
 
 #[tokio::test]
-async fn given_only_poll_messages_should_not_render_a_group_binding() {
-    // Regression. Consumer-group operations route through Iggy's topic rule, which never consults
-    // `poll_messages`, so deriving the group binding from polling advertised access Iggy denies.
+async fn given_only_poll_messages_should_render_the_group_binding_the_gateway_enforces() {
+    // Before KW-10 group operations ran through Iggy's topic rule as the principal, which never
+    // consults `poll_messages`, so a polling principal was shown no group binding. Since KW-10
+    // the gateway decides group access itself, from topic read access, and polling is a topic
+    // read (Iggy's `poll_messages` rule): the binding must say what the gateway allows.
     let addr = spawn_gateway_for(PrincipalPermissions {
         poll_messages: true,
         ..PrincipalPermissions::default()
@@ -1420,8 +1422,8 @@ async fn given_only_poll_messages_should_not_render_a_group_binding() {
         "polling still grants TOPIC READ, got {bindings:?}"
     );
     assert!(
-        !bindings.iter().any(|(resource, ..)| *resource == 3),
-        "no group binding without a topic read grant, got {bindings:?}"
+        bindings.contains(&(3, "*".to_string(), 3, 3, 3)),
+        "group access follows topic read access, got {bindings:?}"
     );
 }
 
@@ -1498,11 +1500,11 @@ impl SaslAuthenticator for UnreadPermissionsAuthenticator {
         credentials: &PlainCredentials,
         _slot: SemaphorePermit<'_>,
     ) -> Result<AuthenticatedPrincipal, AuthError> {
-        Ok(AuthenticatedPrincipal {
-            username: credentials.username.clone(),
-            permissions: PrincipalPermissions::default(),
-            permissions_known: false,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            credentials.username.clone(),
+            PrincipalPermissions::default(),
+            false,
+        ))
     }
 }
 

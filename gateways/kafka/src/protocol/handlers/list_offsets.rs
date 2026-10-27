@@ -29,17 +29,21 @@ use kafka_protocol::messages::list_offsets_response::{
 use kafka_protocol::messages::{ListOffsetsRequest, ListOffsetsResponse, TopicName};
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::iggy_bridge::{FetchSlot, LocatedRecord, PartitionProbe, RecordLookup};
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
-    REQUEST_DEADLINE, UNKNOWN_OFFSET,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    GatewayState, HandleOutcome, REQUEST_DEADLINE, UNKNOWN_OFFSET,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
 use crate::protocol::handlers::fetch::{Spells, sight_first, sight_loading};
-use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, respond_or_close};
+use crate::protocol::handlers::{
+    decode_guarded, decode_request, encode_message, may_topic, respond_or_close,
+};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_OFFSETS,
@@ -85,7 +89,12 @@ type PartitionProbesResult = core::result::Result<
     BridgeError,
 >;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let decoded = decode_request(
         API_KEY_LIST_OFFSETS,
         api_version,
@@ -94,18 +103,43 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         encode_error_response,
         "ListOffsets",
     );
-    let req = match decoded {
+    let mut req = match decoded {
         Ok(req) => req,
         Err(outcome) => return outcome,
     };
     let Some(bridge) = &state.bridge else {
         return respond_or_close(encode_response(api_version, &req), "ListOffsets");
     };
+    // Kafka's DESCRIBE on the topic, which reading or writing it implies.
+    let mut denied = Vec::new();
+    req.topics.retain(|topic| {
+        if may_topic(state, principal, topic.name.as_str(), TopicOp::Describe) {
+            return true;
+        }
+        denied.push(
+            ListOffsetsTopicResponse::default()
+                .with_name(topic.name.clone())
+                .with_partitions(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|partition| {
+                            error_response(
+                                partition.partition_index,
+                                ERROR_TOPIC_AUTHORIZATION_FAILED,
+                            )
+                        })
+                        .collect(),
+                ),
+        );
+        false
+    });
 
     // No `timeout_ms` below v10, so the ceiling is fixed. It bounds the sum of the topic calls.
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let resolved = resolve_all_topics(bridge, &state.loading, &req.topics, deadline).await;
-    let topics = locate_records(bridge, &state.unproven_empty, resolved, deadline).await;
+    let mut topics = locate_records(bridge, &state.unproven_empty, resolved, deadline).await;
+    topics.extend(denied);
     let resp = ListOffsetsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets")
 }

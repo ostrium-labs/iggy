@@ -27,17 +27,20 @@ use kafka_protocol::messages::offset_commit_response::{
 };
 use kafka_protocol::messages::{OffsetCommitRequest, OffsetCommitResponse};
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{IggyBridge, OffsetCalls};
 use crate::error::Result;
 use crate::group::CommitRequest;
 use crate::protocol::api::{
     API_KEY_OFFSET_COMMIT, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-    ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
-    HandleOutcome, is_supported_version,
+    ERROR_NONE, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_offset_commit_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, offset_deadline, offset_refusal_cause, respond_or_close,
+    decode_guarded, encode_message, may_topic, offset_deadline, offset_refusal_cause,
+    respond_or_close,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -52,6 +55,7 @@ const PER_PARTITION_BYTES: usize = 7;
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -60,22 +64,34 @@ pub async fn handle(
     if !is_supported_version(API_KEY_OFFSET_COMMIT, api_version) {
         return HandleOutcome::Close;
     }
-    let request = match decode_guarded::<OffsetCommitRequest>(api_version, body, |version, body| {
-        validate_offset_commit_shape(version, body, state.max_frame_size)
-    }) {
-        Ok(request) => request,
-        Err(error) => {
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(%error, api_version, "Failed to decode OffsetCommit request");
-            return HandleOutcome::Close;
-        }
-    };
+    let mut request =
+        match decode_guarded::<OffsetCommitRequest>(api_version, body, |version, body| {
+            validate_offset_commit_shape(version, body, state.max_frame_size)
+        }) {
+            Ok(request) => request,
+            Err(error) => {
+                // debug!, not warn!: attacker-controlled, not operator-actionable.
+                tracing::debug!(%error, api_version, "Failed to decode OffsetCommit request");
+                return HandleOutcome::Close;
+            }
+        };
+
+    // Kafka's READ on each topic: Iggy's `store_consumer_offset`, which is `poll_messages`. A
+    // denied topic is answered, the others are still committed.
+    let (allowed, denied): (Vec<_>, Vec<_>) = std::mem::take(&mut request.topics)
+        .into_iter()
+        .partition(|topic| may_topic(state, principal, topic.name.as_str(), TopicOp::Read));
+    request.topics = allowed;
+    let denied = same_code(
+        &OffsetCommitRequest::default().with_topics(denied),
+        ERROR_TOPIC_AUTHORIZATION_FAILED,
+    );
 
     let validated = state
         .groups
         .validate_commit(&CommitRequest::from(&request))
         .await;
-    let topics = match (&state.bridge, validated) {
+    let mut topics = match (&state.bridge, validated) {
         (Some(bridge), Ok(commit)) => {
             // The commit stays counted until none of its Iggy calls can land, also past the
             // deadline, so a deletion of the group's offsets waits for them.
@@ -85,6 +101,7 @@ pub async fn handle(
         (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
         (_, Err(error)) => same_code(&request, error),
     };
+    topics.extend(denied);
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }
 
@@ -233,7 +250,7 @@ mod tests {
     async fn codes(version: i16, request: &OffsetCommitRequest) -> Vec<(String, i32, i16)> {
         let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
-        let mut response = handle(&state, &connection, version, body(version, request))
+        let mut response = handle(&state, &connection, None, version, body(version, request))
             .await
             .expect_response("OffsetCommit answers");
         let response = OffsetCommitResponse::decode(&mut response, version).unwrap();
@@ -314,9 +331,13 @@ mod tests {
         let connection = ConnectionState::default();
 
         let truncated = body(9, &request(-1, "")).slice(..5);
-        assert!(handle(&state, &connection, 9, truncated).await.is_close());
         assert!(
-            handle(&state, &connection, 10, body(9, &request(-1, "")))
+            handle(&state, &connection, None, 9, truncated)
+                .await
+                .is_close()
+        );
+        assert!(
+            handle(&state, &connection, None, 10, body(9, &request(-1, "")))
                 .await
                 .is_close()
         );

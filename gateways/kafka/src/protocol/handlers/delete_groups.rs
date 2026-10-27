@@ -343,7 +343,6 @@ mod tests {
 
     use super::*;
     use crate::group::{CommitRequest, GroupCoordinator, GroupCoordinatorConfig, JoinRequest};
-    use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::ERROR_MEMBER_ID_REQUIRED;
 
     /// No bridge, and a first join that completes at once.
@@ -387,14 +386,14 @@ mod tests {
     }
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     async fn codes(

@@ -55,7 +55,9 @@ iggy = { workspace = true }
 # OAUTHBEARER: JWT signature and claim checks (RustCrypto backend, as the server uses).
 jsonwebtoken = { workspace = true }
 # The codec features stay on for the encoder, which the batch tests use to build fixtures.
-kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
+# `client` adds request encoding and response decoding: the per-principal group namespace
+# (`group_scope.rs`) rewrites the group ids of a request and of its answer.
+kafka-protocol = { workspace = true, features = ["client", "gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
 pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 lz4 = { workspace = true }

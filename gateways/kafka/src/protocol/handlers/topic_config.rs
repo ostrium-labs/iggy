@@ -30,11 +30,13 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::protocol::api::{
     ERROR_INVALID_CONFIG, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
 };
 use crate::protocol::handlers::kafka_topic_configs::TopicWrite;
+use crate::protocol::handlers::may_topic_on;
 
 /// Kafka `ConfigResource.Type.TOPIC`.
 pub const RESOURCE_TYPE_TOPIC: i8 = 2;
@@ -222,29 +224,47 @@ pub fn topic_cap_and_duplicates<R: TopicResource>(resources: &[R]) -> (bool, Has
     )
 }
 
-/// The denial every resource gets when `principal` may not alter topic configuration, or
-/// `None` when the alter may run.
+/// Whether `principal` may alter the configuration of one resource.
 ///
-/// No principal means no listener of this gateway names principals, so there is nothing to
-/// enforce against. Once one does, a connection that proved no identity carries
+/// A topic needs Iggy's `manage_topic` on it (Kafka's `ALTER_CONFIGS` on the topic,
+/// `crate::authz`); any other resource the global `manage_topics`, as before per-topic grants
+/// were enforced. No principal means no listener of this gateway names principals, so there is
+/// nothing to enforce against. Once one does, a connection that proved no identity carries
 /// [`AuthenticatedPrincipal::anonymous`] instead and is denied here. Permissions that were never
 /// read deny: granting would authorize a write off a value nothing read.
 #[must_use]
-pub fn alter_denial(
+pub fn may_alter(
+    bridge: Option<&IggyBridge>,
     principal: Option<&AuthenticatedPrincipal>,
+    resource: &impl TopicResource,
     api_name: &str,
-) -> Option<StrBytes> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
-        return None;
-    }
-    if !principal.permissions_known {
+) -> bool {
+    let Some(known) = principal else {
+        return true;
+    };
+    if !known.permissions_known {
         tracing::warn!(
-            principal = %principal.username,
+            principal = %known.username,
             "{api_name} asked on a connection whose permissions were never read; denying"
         );
+        return false;
     }
-    Some(StrBytes::from_static_str(NOT_AUTHORIZED_TO_ALTER))
+    if resource.kafka_resource_type() == RESOURCE_TYPE_TOPIC {
+        may_topic_on(
+            bridge,
+            principal,
+            resource.kafka_resource_name(),
+            TopicOp::Manage,
+        )
+    } else {
+        known.permissions.manage_topics
+    }
+}
+
+/// The message a resource denied by [`may_alter`] carries.
+#[must_use]
+pub const fn not_authorized_to_alter() -> StrBytes {
+    StrBytes::from_static_str(NOT_AUTHORIZED_TO_ALTER)
 }
 
 /// The reason a topic name failed Kafka's own naming rules, or a fixed fallback.

@@ -500,14 +500,14 @@ fn principal(manage_topics: bool) -> AuthenticatedPrincipal {
 }
 
 fn principal_reading(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-    AuthenticatedPrincipal {
-        username: "alice".to_string(),
-        permissions: PrincipalPermissions {
+    AuthenticatedPrincipal::from_projection(
+        "alice",
+        PrincipalPermissions {
             manage_topics,
             ..PrincipalPermissions::default()
         },
         permissions_known,
-    }
+    )
 }
 
 /// Kafka's own sequence: the first lookup answers `UNKNOWN_TOPIC_OR_PARTITION` while the topic is

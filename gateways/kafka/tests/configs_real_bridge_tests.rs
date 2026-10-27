@@ -118,7 +118,7 @@ async fn describe(
         .with_resources(resources)
         .with_include_synonyms(include_synonyms)
         .with_include_documentation(include_documentation);
-    let outcome = describe_configs::handle(state, version, encode(&request, version)).await;
+    let outcome = describe_configs::handle(state, None, version, encode(&request, version)).await;
     decode(outcome.expect_response("DescribeConfigs answers"), version)
 }
 

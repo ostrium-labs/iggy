@@ -161,6 +161,10 @@ pub const ERROR_GROUP_SUBSCRIBED_TO_TOPIC: i16 = ResponseError::GroupSubscribedT
 /// permission rejection from Iggy at that point is not an authentication failure and saying so
 /// would send an operator to the wrong hop. Not sent by any stub response today.
 pub const ERROR_TOPIC_AUTHORIZATION_FAILED: i16 = ResponseError::TopicAuthorizationFailed.code();
+/// The principal may not do this to the cluster: describe broker configs, or initialize a producer
+/// id without `WRITE` on any topic (`crate::authz`).
+pub const ERROR_CLUSTER_AUTHORIZATION_FAILED: i16 =
+    ResponseError::ClusterAuthorizationFailed.code();
 /// The mechanism a client asked for in `SaslHandshake` is not one this gateway enables. The
 /// response still carries the enabled mechanism list, which is what the client prints.
 pub const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = ResponseError::UnsupportedSaslMechanism.code();
@@ -808,7 +812,23 @@ pub fn describe_acls_outcome(
     permissions: &PrincipalPermissions,
     filter: &AclFilter,
 ) -> HandleOutcome {
-    let selected: Vec<AclBinding> = acl::bindings_for(permissions)
+    describe_bindings_outcome(
+        api_version,
+        principal,
+        acl::bindings_for(permissions),
+        filter,
+    )
+}
+
+/// Answers `DescribeAcls` for `principal` from `bindings`.
+#[must_use]
+pub fn describe_bindings_outcome(
+    api_version: i16,
+    principal: &str,
+    bindings: Vec<AclBinding>,
+    filter: &AclFilter,
+) -> HandleOutcome {
+    let selected: Vec<AclBinding> = bindings
         .into_iter()
         .filter(|binding| filter.matches(binding, principal))
         .collect();

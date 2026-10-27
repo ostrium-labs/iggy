@@ -58,6 +58,7 @@ use kafka_protocol::messages::offset_delete_response::{
 use kafka_protocol::messages::{OffsetDeleteRequest, OffsetDeleteResponse};
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, ScannedGroups, TopicTarget};
 use crate::error::Result;
 use crate::group::{OffsetDeletion, Subscribed, is_valid_group_id};
@@ -65,13 +66,14 @@ use crate::protocol::api::{
     API_KEY_OFFSET_DELETE, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
     ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_GROUP_ID_NOT_FOUND, ERROR_GROUP_SUBSCRIBED_TO_TOPIC,
     ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST, ERROR_NON_EMPTY_GROUP, ERROR_NONE,
-    ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
+    ERROR_NOT_COORDINATOR, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_offset_delete_shape;
 use crate::protocol::handlers::{
-    decode_guarded, deletion_deadline, encode_message, may_delete_groups, offset_refusal_cause,
-    respond_or_close, unsupported_version_response,
+    decode_guarded, deletion_deadline, encode_message, may_delete_groups, may_topic,
+    offset_refusal_cause, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -95,19 +97,20 @@ pub async fn handle(
             encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
         });
     }
-    let request = match decode_guarded::<OffsetDeleteRequest>(api_version, body, |version, body| {
-        validate_offset_delete_shape(version, body, state.max_frame_size)
-    }) {
-        Ok(request) => request,
-        Err(error) => {
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(%error, api_version, "Failed to decode OffsetDelete request");
-            return respond_or_close(
-                encode_error_response(api_version, ERROR_INVALID_REQUEST),
-                "OffsetDelete",
-            );
-        }
-    };
+    let mut request =
+        match decode_guarded::<OffsetDeleteRequest>(api_version, body, |version, body| {
+            validate_offset_delete_shape(version, body, state.max_frame_size)
+        }) {
+            Ok(request) => request,
+            Err(error) => {
+                // debug!, not warn!: attacker-controlled, not operator-actionable.
+                tracing::debug!(%error, api_version, "Failed to decode OffsetDelete request");
+                return respond_or_close(
+                    encode_error_response(api_version, ERROR_INVALID_REQUEST),
+                    "OffsetDelete",
+                );
+            }
+        };
 
     if !may_delete_groups(principal, "OffsetDelete") {
         return respond_or_close(
@@ -115,8 +118,18 @@ pub async fn handle(
             "OffsetDelete",
         );
     }
+    // Kafka's READ on each topic, as for a commit (Iggy's `delete_consumer_offset`, which is
+    // `poll_messages`): a denied topic is answered, the others are still deleted.
+    let (allowed, denied): (Vec<_>, Vec<_>) = std::mem::take(&mut request.topics)
+        .into_iter()
+        .partition(|topic| may_topic(state, principal, topic.name.as_str(), TopicOp::Read));
+    request.topics = allowed;
+    let denied = same_code(
+        &OffsetDeleteRequest::default().with_topics(denied),
+        ERROR_TOPIC_AUTHORIZATION_FAILED,
+    );
     let encoded = match delete_offsets(state, connection, &request).await {
-        Ok(topics) => encode_response(api_version, topics),
+        Ok(topics) => encode_response(api_version, [topics, denied].concat()),
         Err(code) => encode_error_response(api_version, code),
     };
     respond_or_close(encoded, "OffsetDelete")
@@ -388,7 +401,6 @@ mod tests {
 
     use super::*;
     use crate::group::{GroupCoordinator, GroupCoordinatorConfig, JoinRequest};
-    use crate::protocol::acl::PrincipalPermissions;
 
     /// No bridge, and a first join that completes at once.
     fn state() -> GatewayState {
@@ -435,14 +447,14 @@ mod tests {
     }
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     /// The top-level error and each partition's `(topic, partition, error)`.

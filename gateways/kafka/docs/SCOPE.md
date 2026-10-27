@@ -574,9 +574,14 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
       and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
       connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
       silently widen what an unauthenticated client may send
-- [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
-      bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
-      (31) are not implemented and not advertised
+- [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions, global, per
+      stream and per topic, as Kafka ACL bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only:
+      `CreateAcls` (30) and `DeleteAcls` (31) are the next KW-10 step and not advertised yet
+- [x] Per-principal authorization ([#4518](https://github.com/apache/iggy/issues/4518), KW-10):
+      every topic a request names is checked against the principal's own Iggy grants with Iggy's
+      rules (29 per topic, 31 for the cluster), the bridge's Iggy user stays the ceiling, and
+      consumer groups are scoped per principal (30 without any topic read grant)
+      ([`ACL_MAPPING.md`](ACL_MAPPING.md#enforcement))
 - [x] TLS on the gateway listener ([#4510](https://github.com/apache/iggy/issues/4510)):
       Kafka-style listeners, one per security protocol, each advertising its own address;
       rustls with certificate reload; client certificates mapped to Iggy users through

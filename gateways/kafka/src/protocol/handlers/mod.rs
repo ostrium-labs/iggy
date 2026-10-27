@@ -38,6 +38,7 @@ pub mod describe_groups;
 pub mod end_txn;
 pub mod fetch;
 pub mod find_coordinator;
+mod group_scope;
 pub mod heartbeat;
 pub mod incremental_alter_configs;
 pub mod init_producer_id;
@@ -66,6 +67,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
@@ -123,21 +125,54 @@ pub async fn dispatch(
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
+    // On a gateway that names principals, consumer groups live in each principal's namespace
+    // (`group_scope`, `crate::authz`).
+    if let Some(principal) = principal
+        && group_scope::is_group_api(api_key)
+    {
+        return Box::pin(group_scope::handle(
+            state,
+            connection,
+            principal,
+            api_key,
+            api_version,
+            body,
+        ))
+        .await;
+    }
+    dispatch_unscoped(state, connection, principal, api_key, api_version, body).await
+}
+
+/// [`dispatch`] without the group namespace: what a group API runs once its ids are scoped.
+pub(crate) async fn dispatch_unscoped(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     match api_key {
         API_KEY_PRODUCE => produce::handle(state, connection, principal, api_version, body).await,
-        API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
-        API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
+        API_KEY_FETCH => fetch::handle(state, connection, principal, api_version, body).await,
+        API_KEY_LIST_OFFSETS => list_offsets::handle(state, principal, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, connection, principal, api_version, body).await,
-        API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
-        API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
+        API_KEY_OFFSET_COMMIT => {
+            offset_commit::handle(state, connection, principal, api_version, body).await
+        }
+        API_KEY_OFFSET_FETCH => {
+            offset_fetch::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
-        API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
+        API_KEY_CREATE_TOPICS => create_topics::handle(state, principal, api_version, body).await,
         API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
         API_KEY_DELETE_RECORDS => delete_records::handle(state, principal, api_version, body).await,
         API_KEY_CREATE_PARTITIONS => {
             create_partitions::handle(state, principal, api_version, body).await
         }
-        API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
+        API_KEY_DESCRIBE_CONFIGS => {
+            describe_configs::handle(state, principal, api_version, body).await
+        }
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
         API_KEY_INCREMENTAL_ALTER_CONFIGS => {
             incremental_alter_configs::handle(state, principal, api_version, body).await
@@ -162,7 +197,9 @@ pub async fn dispatch(
         API_KEY_OFFSET_DELETE => {
             offset_delete::handle(state, connection, principal, api_version, body).await
         }
-        API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
+        API_KEY_INIT_PRODUCER_ID => {
+            init_producer_id::handle(state, principal, api_version, body).await
+        }
         // KW-T: served only while transactions are on; each handler closes otherwise.
         add_partitions_to_txn::API_KEY => {
             add_partitions_to_txn::handle(state, principal, api_version, body).await
@@ -205,6 +242,43 @@ pub(crate) async fn learn_topic_ids(
     }
 }
 
+/// Whether `principal` may do `op` on Kafka topic `topic` (`crate::authz`).
+///
+/// `None` means no listener of this gateway names principals, so there is nothing to enforce
+/// against; once one does, a connection that proved no identity carries
+/// [`AuthenticatedPrincipal::anonymous`], which holds nothing. Permissions that were never read
+/// deny: granting would authorize off a value nothing read. The topic is checked under the Iggy
+/// stream and topic the topic mapping gives it; without a bridge there is no mapping, and only the
+/// principal's global grants can apply.
+pub(crate) fn may_topic(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    topic: &str,
+    op: TopicOp,
+) -> bool {
+    may_topic_on(state.bridge.as_deref(), principal, topic, op)
+}
+
+/// [`may_topic`] with the bridge whose topic mapping places `topic`.
+pub(crate) fn may_topic_on(
+    bridge: Option<&IggyBridge>,
+    principal: Option<&AuthenticatedPrincipal>,
+    topic: &str,
+    op: TopicOp,
+) -> bool {
+    let Some(principal) = principal else {
+        return true;
+    };
+    if !principal.permissions_known {
+        return false;
+    }
+    let (stream, iggy_topic) = bridge.map_or_else(
+        || (String::new(), topic.to_string()),
+        |bridge| bridge.topic_identity(topic),
+    );
+    principal.grants.allows(op, &stream, &iggy_topic)
+}
+
 /// Whether a request carries a transactional id, which this gateway never serves.
 ///
 /// An empty id reads as absent: `kafka_protocol` decodes a null wire string to `None` but its
@@ -217,9 +291,10 @@ pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bo
 /// Whether `principal` may delete a group or its offsets. `None` means no listener of this gateway
 /// names principals, with nothing to enforce against, as in `DeleteTopics`.
 ///
-/// Kafka asks for `DELETE` on the group. Iggy has no group permission, and lets any reader of a
-/// topic delete a group on it, so the gate asks for what `DeleteTopics` asks for: a global
-/// `manage_topics` or `manage_streams`, which the principal's `manage_topics` stands for.
+/// Kafka asks for `DELETE` on the group. Iggy has no group permission: groups are scoped per
+/// principal (`group_scope`), so a principal only ever names its own, and group access follows
+/// topic read access (`crate::authz`), as the owner's KW-10 ruling has it. Which topics' offsets
+/// may go is checked per topic.
 fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> bool {
     let Some(principal) = principal else {
         return true;
@@ -233,7 +308,7 @@ fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> b
         );
         return false;
     }
-    principal.permissions.manage_topics
+    principal.grants.reads_any_topic()
 }
 
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.

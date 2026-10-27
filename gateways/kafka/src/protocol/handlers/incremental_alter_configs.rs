@@ -48,9 +48,9 @@ use crate::protocol::handlers::kafka_topic_configs::{
     TopicConfigSnapshot, TopicWrite, apply_operation, plan_alter,
 };
 use crate::protocol::handlers::topic_config::{
-    ConfigFault, ConfigOp, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, alter_denial, bridge_failure,
-    fault_response, incremental_ops, name_reason, topic_cap_and_duplicates, topic_cap_message,
-    write_configs,
+    ConfigFault, ConfigOp, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC, bridge_failure,
+    fault_response, incremental_ops, may_alter, name_reason, not_authorized_to_alter,
+    topic_cap_and_duplicates, topic_cap_message, write_configs,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -82,7 +82,7 @@ pub async fn handle(
         );
     }
 
-    let req = match decode_guarded::<IncrementalAlterConfigsRequest>(
+    let mut req = match decode_guarded::<IncrementalAlterConfigsRequest>(
         api_version,
         body,
         |version, body| {
@@ -101,9 +101,10 @@ pub async fn handle(
 
     // Authorization and the cap come before the bridge-availability stub: neither depends on
     // the controller being reachable.
-    if let Some(responses) = authorize(principal, &req.resources) {
+    let denied = authorize(state.bridge.as_deref(), principal, &mut req.resources);
+    if req.resources.is_empty() && !denied.is_empty() {
         return respond_or_close(
-            encode_message(&response(responses), api_version, 256),
+            encode_message(&response(denied), api_version, 256),
             API_NAME,
         );
     }
@@ -119,7 +120,7 @@ pub async fn handle(
             .map(|resource| resource_error(resource, ERROR_POLICY_VIOLATION, Some(message.clone())))
             .collect();
         return respond_or_close(
-            encode_message(&response(responses), api_version, 256),
+            encode_message(&response([responses, denied].concat()), api_version, 256),
             API_NAME,
         );
     }
@@ -131,7 +132,7 @@ pub async fn handle(
             .map(|resource| resource_error(resource, ERROR_NOT_CONTROLLER, None))
             .collect();
         return respond_or_close(
-            encode_message(&response(responses), api_version, 256),
+            encode_message(&response([responses, denied].concat()), api_version, 256),
             API_NAME,
         );
     };
@@ -139,30 +140,31 @@ pub async fn handle(
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let responses = alter_all(bridge, &req, &duplicate_names, deadline).await;
     respond_or_close(
-        encode_message(&response(responses), api_version, 256),
+        encode_message(&response([responses, denied].concat()), api_version, 256),
         API_NAME,
     )
 }
 
-/// Denies every resource when [`alter_denial`] says `principal` may not alter topic
-/// configuration.
+/// Takes out of `resources`, and answers, each one [`may_alter`] denies `principal`, so the
+/// others are still altered.
 fn authorize(
+    bridge: Option<&IggyBridge>,
     principal: Option<&AuthenticatedPrincipal>,
-    resources: &[AlterConfigsResource],
-) -> Option<Vec<AlterConfigsResourceResponse>> {
-    let message = alter_denial(principal, API_NAME)?;
-    Some(
-        resources
-            .iter()
-            .map(|resource| {
-                resource_error(
-                    resource,
-                    ERROR_TOPIC_AUTHORIZATION_FAILED,
-                    Some(message.clone()),
-                )
-            })
-            .collect(),
-    )
+    resources: &mut Vec<AlterConfigsResource>,
+) -> Vec<AlterConfigsResourceResponse> {
+    let mut denied = Vec::new();
+    resources.retain(|resource| {
+        if may_alter(bridge, principal, resource, API_NAME) {
+            return true;
+        }
+        denied.push(resource_error(
+            resource,
+            ERROR_TOPIC_AUTHORIZATION_FAILED,
+            Some(not_authorized_to_alter()),
+        ));
+        false
+    });
+    denied
 }
 
 /// # Errors
@@ -330,17 +332,16 @@ fn resource_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::acl::PrincipalPermissions;
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     fn resource(name: &str) -> AlterConfigsResource {
@@ -351,23 +352,29 @@ mod tests {
 
     #[test]
     fn no_principal_is_not_gated() {
-        assert!(authorize(None, &[resource("orders")]).is_none());
+        assert_eq!(
+            authorize(None, None, &mut vec![resource("orders")]),
+            Vec::new()
+        );
     }
 
     #[test]
     fn a_principal_with_manage_topics_is_allowed() {
         let principal = principal(true, true);
-        assert!(authorize(Some(&principal), &[resource("orders")]).is_none());
+        assert_eq!(
+            authorize(None, Some(&principal), &mut vec![resource("orders")]),
+            Vec::new()
+        );
     }
 
     #[test]
     fn a_principal_without_manage_topics_is_denied_every_resource() {
         let principal = principal(false, true);
         let responses = authorize(
+            None,
             Some(&principal),
-            &[resource("orders"), resource("payments")],
-        )
-        .expect("denied");
+            &mut vec![resource("orders"), resource("payments")],
+        );
         assert_eq!(responses.len(), 2);
         assert!(
             responses
@@ -379,7 +386,7 @@ mod tests {
     #[test]
     fn unread_permissions_fail_closed() {
         let principal = principal(true, false);
-        let responses = authorize(Some(&principal), &[resource("orders")]).expect("denied");
+        let responses = authorize(None, Some(&principal), &mut vec![resource("orders")]);
         assert_eq!(responses[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
     }
 }

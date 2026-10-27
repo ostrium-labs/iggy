@@ -28,6 +28,8 @@ use kafka_protocol::messages::DescribeAclsResponse;
 use kafka_protocol::messages::describe_acls_response::{AclDescription, DescribeAclsResource};
 use kafka_protocol::protocol::StrBytes;
 
+use crate::authz::Grants;
+use crate::bridge::TopicMapping;
 use crate::error::Result;
 use crate::protocol::api::ERROR_NONE;
 use crate::protocol::handlers::encode_message;
@@ -112,18 +114,18 @@ pub struct PrincipalPermissions {
 
 /// One rendered binding. Principal, host and permission type are constant for every binding this
 /// gateway produces, so they are not carried here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclBinding {
     pub resource_type: i8,
-    pub resource_name: &'static str,
+    pub resource_name: String,
     pub operation: i8,
 }
 
 impl AclBinding {
-    const fn new(resource_type: i8, resource_name: &'static str, operation: i8) -> Self {
+    fn new(resource_type: i8, resource_name: impl Into<String>, operation: i8) -> Self {
         Self {
             resource_type,
-            resource_name,
+            resource_name: resource_name.into(),
             operation,
         }
     }
@@ -165,6 +167,10 @@ pub fn bindings_for(permissions: &PrincipalPermissions) -> Vec<AclBinding> {
             operation::READ,
         ));
     }
+    // The global flags alone. Since KW-10 the gateway decides group access from topic read
+    // access, polling included, and `scoped_bindings` renders that GROUP READ; this one is the
+    // narrower pre-KW-10 reading, kept for callers without grants.
+    //
     // Derived, not stored: Iggy has no group-level permission. Group *membership* operations
     // (create, delete, get, join, leave) route through `Permissioner::get_topic`
     // (`permissioner_rules/consumer_groups.rs`), which admits on the read and manage flags and
@@ -191,6 +197,125 @@ pub fn bindings_for(permissions: &PrincipalPermissions) -> Vec<AclBinding> {
         ));
     }
 
+    bindings
+}
+
+/// Renders a principal's per-stream and per-topic grants as Kafka ACL bindings.
+///
+/// The grants (`crate::authz`), and the group access that topic read access gives, land on the
+/// Kafka topics `mapping` names for them. Iggy's inheritance is applied, as in [`bindings_for`].
+///
+/// A grant on one Iggy topic is a binding on the Kafka topic that maps to it. A grant on a whole
+/// stream is a binding on every Kafka topic of that stream: `*` for the default stream when no
+/// override puts a Kafka topic in another stream, else a binding per override in the stream. A
+/// default-stream grant next to overrides elsewhere is left out, since `*` would over-report it;
+/// under-reporting is the safe direction for an authorization view.
+#[must_use]
+pub fn scoped_bindings(grants: &Grants, mapping: &TopicMapping) -> Vec<AclBinding> {
+    let mut bindings = Vec::new();
+    for (stream, grant) in grants.streams() {
+        let manages = grant.manage_stream || grant.manage_topics;
+        let reads = grant.read_stream || grant.read_topics || manages;
+        let mut ops = Vec::new();
+        if reads {
+            ops.push(operation::DESCRIBE);
+        }
+        if reads || grant.poll_messages {
+            ops.push(operation::READ);
+        }
+        if manages || grant.send_messages {
+            ops.push(operation::WRITE);
+        }
+        if manages {
+            ops.extend([operation::CREATE, operation::DELETE, operation::ALTER]);
+        }
+        for name in stream_topic_names(mapping, stream) {
+            for &op in &ops {
+                bindings.push(AclBinding::new(resource_type::TOPIC, name.clone(), op));
+            }
+        }
+        for (topic, grant) in &grant.topics {
+            let Some(name) = mapping.kafka_topic_of(stream, topic) else {
+                continue;
+            };
+            let manages = grant.manage_topic;
+            let mut ops = Vec::new();
+            if grant.read_topic || manages {
+                ops.push(operation::DESCRIBE);
+            }
+            if grant.read_topic || grant.poll_messages || manages {
+                ops.push(operation::READ);
+            }
+            if grant.send_messages || manages {
+                ops.push(operation::WRITE);
+            }
+            if manages {
+                ops.extend([operation::DELETE, operation::ALTER]);
+            }
+            for op in ops {
+                bindings.push(AclBinding::new(resource_type::TOPIC, name.clone(), op));
+            }
+        }
+    }
+    // Groups have no Iggy grant: group access follows topic read access (KW-10 ruling), and the
+    // groups are the principal's own namespace, which `*` names from its point of view.
+    if grants.reads_any_topic() {
+        bindings.push(AclBinding::new(
+            resource_type::GROUP,
+            WILDCARD,
+            operation::READ,
+        ));
+    }
+    bindings
+}
+
+/// The Kafka topic names a grant on Iggy stream `stream` covers, as rendered names.
+fn stream_topic_names(mapping: &TopicMapping, stream: &str) -> Vec<String> {
+    if stream == mapping.default_stream() {
+        let elsewhere = mapping
+            .overrides()
+            .any(|(_, target)| target.stream != mapping.default_stream());
+        return if elsewhere {
+            Vec::new()
+        } else {
+            vec![WILDCARD.to_string()]
+        };
+    }
+    mapping
+        .overrides()
+        .filter(|(_, target)| target.stream == stream)
+        .map(|(kafka_topic, _)| kafka_topic.to_string())
+        .collect()
+}
+
+/// The global bindings and the scoped ones together, each once, in a stable order.
+#[must_use]
+pub fn all_bindings(
+    permissions: &PrincipalPermissions,
+    grants: &Grants,
+    mapping: Option<&TopicMapping>,
+) -> Vec<AclBinding> {
+    let mut bindings = bindings_for(permissions);
+    let scoped = mapping.map_or_else(
+        || {
+            // Without a mapping only the derived group binding can be rendered.
+            if grants.reads_any_topic() {
+                vec![AclBinding::new(
+                    resource_type::GROUP,
+                    WILDCARD,
+                    operation::READ,
+                )]
+            } else {
+                Vec::new()
+            }
+        },
+        |mapping| scoped_bindings(grants, mapping),
+    );
+    for binding in scoped {
+        if !bindings.contains(&binding) {
+            bindings.push(binding);
+        }
+    }
     bindings
 }
 
@@ -225,7 +350,7 @@ impl AclFilter {
         ) {
             return false;
         }
-        if !self.matches_resource_name(binding.resource_name) {
+        if !self.matches_resource_name(&binding.resource_name) {
             return false;
         }
         if !matches_name(self.principal.as_deref(), &format!("User:{principal}")) {
@@ -298,14 +423,14 @@ pub fn encode_describe_acls_response(
 
         if let Some(resource) = grouped.iter_mut().find(|resource| {
             resource.resource_type == binding.resource_type
-                && resource.resource_name.as_str() == binding.resource_name
+                && resource.resource_name.as_str() == binding.resource_name.as_str()
         }) {
             resource.acls.push(description);
         } else {
             grouped.push(
                 DescribeAclsResource::default()
                     .with_resource_type(binding.resource_type)
-                    .with_resource_name(StrBytes::from_static_str(binding.resource_name))
+                    .with_resource_name(StrBytes::from_string(binding.resource_name.clone()))
                     .with_pattern_type(pattern_type::LITERAL)
                     .with_acls(vec![description]),
             );
@@ -449,7 +574,7 @@ mod tests {
             bindings
                 .iter()
                 .all(|binding| binding.resource_type == resource_type::CLUSTER
-                    && binding.resource_name == CLUSTER_NAME)
+                    && binding.resource_name.as_str() == CLUSTER_NAME)
         );
     }
 
@@ -604,5 +729,105 @@ mod tests {
                 .all(|binding| binding.resource_type == resource_type::CLUSTER)
         );
         assert_ne!(selected, []);
+    }
+
+    fn mapping(overrides: &[(&str, &str, &str)]) -> TopicMapping {
+        let topics = overrides
+            .iter()
+            .map(|(kafka, stream, topic)| {
+                (
+                    (*kafka).to_string(),
+                    crate::bridge::TopicOverride {
+                        stream: (*stream).to_string(),
+                        topic: (*topic).to_string(),
+                    },
+                )
+            })
+            .collect();
+        TopicMapping::new("kafka".to_string(), topics).expect("valid mapping")
+    }
+
+    fn scoped(
+        configure: impl FnOnce(&mut iggy::prelude::StreamPermissions),
+        stream: usize,
+    ) -> Grants {
+        let mut permissions = iggy::prelude::StreamPermissions::default();
+        configure(&mut permissions);
+        let names = crate::authz::IdNames {
+            streams: std::collections::HashMap::from([
+                (1, "kafka".to_string()),
+                (2, "billing".to_string()),
+            ]),
+            topics: std::collections::HashMap::from([((1, 3), "orders".to_string())]),
+        };
+        Grants::from_iggy(&iggy::prelude::Permissions {
+            global: iggy::prelude::GlobalPermissions::default(),
+            streams: Some(std::collections::BTreeMap::from([(stream, permissions)])),
+        })
+        .resolve(&names)
+    }
+
+    #[test]
+    fn a_topic_grant_renders_on_its_kafka_topic_with_iggys_inheritance() {
+        let grants = scoped(
+            |stream| {
+                stream.topics = Some(std::collections::BTreeMap::from([(
+                    3,
+                    iggy::prelude::TopicPermissions {
+                        send_messages: true,
+                        ..iggy::prelude::TopicPermissions::default()
+                    },
+                )]));
+            },
+            1,
+        );
+        let bindings = scoped_bindings(&grants, &mapping(&[]));
+        assert_eq!(
+            bindings,
+            vec![AclBinding::new(
+                resource_type::TOPIC,
+                "orders",
+                operation::WRITE
+            )]
+        );
+    }
+
+    #[test]
+    fn a_stream_grant_renders_on_every_topic_of_the_stream() {
+        let poll = |stream: &mut iggy::prelude::StreamPermissions| stream.poll_messages = true;
+        // The default stream with no override elsewhere: every topic.
+        let bindings = scoped_bindings(&scoped(poll, 1), &mapping(&[]));
+        assert!(bindings.contains(&AclBinding::new(
+            resource_type::TOPIC,
+            WILDCARD,
+            operation::READ
+        )));
+        // Group access follows topic read access.
+        assert!(bindings.contains(&AclBinding::new(
+            resource_type::GROUP,
+            WILDCARD,
+            operation::READ
+        )));
+        // Another stream: the override topics that live there.
+        let elsewhere = mapping(&[("invoices", "billing", "invoices")]);
+        let bindings = scoped_bindings(&scoped(poll, 2), &elsewhere);
+        assert!(bindings.contains(&AclBinding::new(
+            resource_type::TOPIC,
+            "invoices",
+            operation::READ
+        )));
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| binding.resource_name == WILDCARD
+                    && binding.resource_type == resource_type::TOPIC)
+        );
+        // The default stream next to an override elsewhere: `*` would over-report, so nothing.
+        let bindings = scoped_bindings(&scoped(poll, 1), &elsewhere);
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| binding.resource_type == resource_type::TOPIC)
+        );
     }
 }

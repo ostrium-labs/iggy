@@ -305,6 +305,22 @@ impl TopicMapping {
 
     /// Whether `kafka_topic` is no override's key yet resolves to the Iggy stream and topic an
     /// override targets, so writing through it would land in that override's data.
+    /// The Kafka topic that resolves to Iggy topic `topic` of stream `stream`, if any: the
+    /// override that targets it, or the same name in the default stream when no override takes
+    /// that name elsewhere.
+    #[must_use]
+    pub fn kafka_topic_of(&self, stream: &str, topic: &str) -> Option<String> {
+        if let Some((kafka_topic, _)) = self
+            .topics
+            .iter()
+            .find(|(_, over)| over.stream == stream && over.topic == topic)
+        {
+            return Some(kafka_topic.clone());
+        }
+        (stream == self.default_stream && !self.topics.contains_key(topic))
+            .then(|| topic.to_string())
+    }
+
     #[must_use]
     pub fn aliases_an_override(&self, kafka_topic: &str) -> bool {
         if self.topics.contains_key(kafka_topic) {
@@ -709,5 +725,30 @@ mod tests {
         };
         assert!(mapping.aliases_an_override("orders_v2"));
         assert!(!mapping.aliases_an_override("orders"));
+    }
+
+    #[test]
+    fn a_kafka_topic_is_found_back_from_its_iggy_topic() {
+        let mapping = mapping_with(
+            "kafka",
+            HashMap::from([(
+                "invoices".to_string(),
+                TopicOverride {
+                    stream: "billing".to_string(),
+                    topic: "inv".to_string(),
+                },
+            )]),
+        );
+        assert_eq!(
+            mapping.kafka_topic_of("billing", "inv").as_deref(),
+            Some("invoices")
+        );
+        assert_eq!(
+            mapping.kafka_topic_of("kafka", "orders").as_deref(),
+            Some("orders")
+        );
+        // `invoices` in the default stream is not where the Kafka topic `invoices` goes.
+        assert_eq!(mapping.kafka_topic_of("kafka", "invoices"), None);
+        assert_eq!(mapping.kafka_topic_of("other", "orders"), None);
     }
 }

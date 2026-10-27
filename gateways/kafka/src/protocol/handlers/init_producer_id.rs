@@ -32,10 +32,11 @@ use kafka_protocol::messages::{
     InitProducerIdRequest, InitProducerIdResponse, ProducerId, TransactionalId,
 };
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_INIT_PRODUCER_ID, ApiVersionRange, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    API_KEY_INIT_PRODUCER_ID, ApiVersionRange, ERROR_CLUSTER_AUTHORIZATION_FAILED, ERROR_NONE,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_init_producer_id_shape;
 use crate::protocol::handlers::{
@@ -113,7 +114,16 @@ impl ProducerIdAllocator {
     }
 }
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
+    // Kafka's IDEMPOTENT_WRITE on the cluster, which WRITE on any topic implies (`crate::authz`).
+    // A transactional id has no Iggy resource to grant, so it asks the same of the principal.
+    let may_write = principal
+        .is_none_or(|principal| principal.permissions_known && principal.grants.writes_any_topic());
     let request = match decode_request(
         API_KEY_INIT_PRODUCER_ID,
         api_version,
@@ -125,8 +135,15 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         Ok(request) => request,
         Err(outcome) => return outcome,
     };
-    let encoded = match (&state.transactions, &request.transactional_id) {
-        (Some(coordinator), Some(transactional_id)) if is_transactional(Some(transactional_id)) => {
+    let transactional_id = request
+        .transactional_id
+        .as_ref()
+        .filter(|id| is_transactional(Some(id)));
+    let encoded = match (&state.transactions, transactional_id) {
+        // Transactions off: a transactional id is refused (35) whatever the principal holds.
+        (None, Some(_)) => encode_response(api_version, &request, &state.producer_ids),
+        _ if !may_write => encode_error_response(api_version, ERROR_CLUSTER_AUTHORIZATION_FAILED),
+        (Some(coordinator), Some(transactional_id)) => {
             transactional(coordinator, api_version, &request, transactional_id).await
         }
         _ => encode_response(api_version, &request, &state.producer_ids),

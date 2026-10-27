@@ -25,11 +25,14 @@ use kafka_protocol::messages::add_partitions_to_txn_response::{
 use kafka_protocol::messages::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse};
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::error::Result;
-use crate::protocol::api::{ApiVersionRange, GatewayState, HandleOutcome};
+use crate::protocol::api::{
+    ApiVersionRange, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+};
 use crate::protocol::bounds_guard::validate_add_partitions_to_txn_shape;
 use crate::protocol::handlers::txn::decode_txn_request;
-use crate::protocol::handlers::{encode_message, respond_or_close};
+use crate::protocol::handlers::{encode_message, may_topic, respond_or_close};
 use crate::transactions::{AddError, TopicPartition, codes};
 
 pub const API_KEY: i16 = 24;
@@ -74,8 +77,17 @@ pub async fn handle(
         })
         .collect();
     let transactional_id = request.v3_and_below_transactional_id.to_string();
+    // KW-10: a transaction may only take in partitions its principal may write, since committing
+    // it writes a marker to each. As in Kafka, the refused ones answer 29 and the rest 55.
+    let refused: std::collections::BTreeMap<TopicPartition, i16> = partitions
+        .iter()
+        .filter(|(topic, _)| !may_topic(state, principal, topic, TopicOp::Write))
+        .map(|partition| (partition.clone(), ERROR_TOPIC_AUTHORIZATION_FAILED))
+        .collect();
     let outcome = if transactional_id.is_empty() {
         Err(AddError::All(codes::INVALID_REQUEST))
+    } else if !refused.is_empty() {
+        Err(AddError::Partitions(refused))
     } else if let Some(negative) = partitions.iter().find(|(_, partition)| *partition < 0) {
         Err(AddError::Partitions(
             [(negative.clone(), codes::UNKNOWN_TOPIC_OR_PARTITION)].into(),

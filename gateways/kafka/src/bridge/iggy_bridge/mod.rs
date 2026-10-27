@@ -29,8 +29,10 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::auth::{
-    AuthError, AuthenticatedPrincipal, PrincipalResolver, ScramCredentialSource, resolve_principal,
+    AuthError, AuthenticatedPrincipal, PrincipalResolver, ScramCredentialSource, read_grant_names,
+    resolve_principal,
 };
+use crate::authz::Grants;
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
@@ -258,6 +260,12 @@ impl IggyBridge {
             stream_id: Identifier::named(stream_name).map_err(BridgeError::Iggy)?,
             topic_id: Identifier::named(topic_name).map_err(BridgeError::Iggy)?,
         })
+    }
+
+    /// How Kafka topic names map onto Iggy streams and topics.
+    #[must_use]
+    pub const fn topic_mapping(&self) -> &crate::bridge::TopicMapping {
+        &self.config.topic_mapping
     }
 
     /// The Iggy stream unmapped Kafka topics live in.
@@ -513,6 +521,33 @@ impl PrincipalResolver for IggyBridge {
             Ok(resolved) => resolved,
             Err(error) => {
                 warn!(%error, "could not reach Iggy to look up the certificate's user");
+                Err(AuthError::Unavailable)
+            }
+        }
+    }
+
+    async fn name_grants(&self, grants: Grants) -> Result<Grants, AuthError> {
+        if !grants.needs_names() {
+            return Ok(grants);
+        }
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let config = self.config.clone();
+        let wanted = grants.clone();
+        let read = |connected: Arc<IggyClient>| async move {
+            Ok(read_grant_names(connected.as_ref(), &wanted).await)
+        };
+        match self
+            .lookup_client
+            .until_detached(config, deadline, read)
+            .await
+        {
+            Ok(Ok(names)) => Ok(grants.resolve(&names)),
+            Ok(Err(error)) => {
+                warn!(%error, "could not name the principal's per-stream grants");
+                Err(AuthError::Unavailable)
+            }
+            Err(error) => {
+                warn!(%error, "could not reach Iggy to name the principal's grants");
                 Err(AuthError::Unavailable)
             }
         }
