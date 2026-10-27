@@ -75,6 +75,8 @@ it knows the server supports flexible encoding.
 | 44 | IncrementalAlterConfigs | 0 | 1 | 0, 1 | One operation per entry on the topic's configuration set; `APPEND` and `SUBTRACT` on list keys. Flexible encoding at v1. See [`CONFIGS.md`](CONFIGS.md) |
 | 47 | OffsetDelete | 0 | 0 | 0 | With a bridge: deletes offsets of a group. `GROUP_SUBSCRIBED_TO_TOPIC` (86) for a topic that a member subscribes to. See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md). v1 is not in a Kafka release |
 | 60 | DescribeCluster | 0 | 2 | 0, 1, 2 | The [cluster id](#cluster-id) and the broker Metadata advertises on the same listener. The controller endpoint type gets `MISMATCHED_ENDPOINT_TYPE` (114) and an unknown one `UNSUPPORTED_ENDPOINT_TYPE` (115). `cluster_authorized_operations` stays unset, so a Java client reads it as null. Flexible encoding at every version |
+| 68 | ConsumerGroupHeartbeat | 0 | 1 | 0, 1 | KIP-848 (`group.protocol=consumer`): server-side `uniform` and `range` assignors, member epochs, revoke-before-assign reconciliation, static members, regex subscriptions ([`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md#the-consumer-protocol-kip-848)). Without a bridge: `COORDINATOR_NOT_AVAILABLE` (15). Flexible encoding at every version |
+| 69 | ConsumerGroupDescribe | 0 | 1 | 0, 1 | KIP-848 groups on this coordinator: epochs, assignor, each member's assignment and target. A classic or missing group: `GROUP_ID_NOT_FOUND` (69). Flexible encoding at every version |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
 
@@ -110,6 +112,8 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 44 | IncrementalAlterConfigs | 0–1 | v1 |
 | 47 | OffsetDelete | 0 | never |
 | 60 | DescribeCluster | 0–2 | v0 |
+| 68 | ConsumerGroupHeartbeat | 0–1 | v0 |
+| 69 | ConsumerGroupDescribe | 0–1 | v0 |
 
 ### Topic ids
 
@@ -175,7 +179,6 @@ All API keys not listed above close the connection (see Governance model above) 
 | 48 | DescribeClientQuotas | v0-1, with keys 50 and 51 and only where they are: always answers that no entity has a quota (the gateway enforces none), so `kafka-configs --describe --entity-type users` works ([`AUTHENTICATION.md`](AUTHENTICATION.md#administration)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
 | 23, 27, 30, 31, 34, 35, 38 to 41, 43, 45, 46, 49, 52 to 59, 61+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
-| 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
 Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys_reference.md).
 

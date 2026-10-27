@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Java client probes on the host JDK: the Kafka 3.9 client jars from Maven Central (cached
-//! under the workspace `target/`), `javac`, and a bounded `java` run. The same pattern as
-//! `configs_java_client_tests.rs`, shared by the KW-T suites.
+//! Java client probes on the host JDK: the Kafka client jars from Maven Central (cached under the
+//! workspace `target/`), `javac`, and a bounded `java` run. The same pattern as
+//! `configs_java_client_tests.rs`, shared by the KW-T suites. The 3.9 client is the default; the
+//! KIP-848 suite runs the 4.x client ([`KAFKA_4`]), which is the first to speak
+//! `group.protocol=consumer`.
 
 #![allow(dead_code)]
 
@@ -55,6 +57,51 @@ const JARS: &[(&str, &str)] = &[
         "https://repo1.maven.org/maven2/com/github/luben/zstd-jni/1.5.6-4/zstd-jni-1.5.6-4.jar",
     ),
 ];
+
+/// The Kafka 4 client and its logging, without the compression codecs (loaded only when a
+/// producer compresses, which the 4.x probes do not).
+const JARS_4: &[(&str, &str)] = &[
+    (
+        "kafka-clients-4.3.1.jar",
+        "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/4.3.1/kafka-clients-4.3.1.jar",
+    ),
+    (
+        "slf4j-api-1.7.36.jar",
+        "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar",
+    ),
+    (
+        "slf4j-simple-1.7.36.jar",
+        "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/1.7.36/slf4j-simple-1.7.36.jar",
+    ),
+];
+
+/// A client version's jars and the directory they are cached in.
+#[derive(Debug, Clone, Copy)]
+pub struct JarSet {
+    dir: &'static str,
+    jars: &'static [(&'static str, &'static str)],
+}
+
+/// The Kafka 3.9 client, the default of [`jar_dir`], [`ensure_jars`], [`compile`] and [`run`].
+pub const KAFKA_3_9: JarSet = JarSet {
+    dir: "kafka-3.9-admin-jars",
+    jars: JARS,
+};
+
+/// The Kafka 4.3.1 client.
+pub const KAFKA_4: JarSet = JarSet {
+    dir: "kafka-4.3-client-jars",
+    jars: JARS_4,
+};
+
+impl JarSet {
+    #[must_use]
+    pub fn dir(self) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(self.dir)
+    }
+}
 
 /// Why the suite cannot run. Panics when `JAVA_E2E_REQUIRED=1`, so a run that means to cover
 /// this fails instead of passing over nothing.
@@ -128,12 +175,17 @@ pub fn output_bounded(command: &mut Command, what: &str) -> Result<Output, Strin
 }
 
 pub fn jar_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/kafka-3.9-admin-jars")
+    KAFKA_3_9.dir()
 }
 
 pub fn ensure_jars(dir: &Path) -> Result<(), String> {
+    ensure_jars_of(KAFKA_3_9, dir)
+}
+
+/// Downloads the jars of `set` into `dir` that are not there yet.
+pub fn ensure_jars_of(set: JarSet, dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("create jar cache: {error}"))?;
-    for (name, url) in JARS {
+    for (name, url) in set.jars {
         let path = dir.join(name);
         if path.exists() {
             continue;
@@ -173,8 +225,12 @@ pub fn ensure_jars(dir: &Path) -> Result<(), String> {
 }
 
 pub fn classpath(jars: &Path, classes: &Path) -> String {
+    classpath_of(KAFKA_3_9, jars, classes)
+}
+
+pub fn classpath_of(set: JarSet, jars: &Path, classes: &Path) -> String {
     let mut parts = vec![classes.display().to_string()];
-    for (name, _) in JARS {
+    for (name, _) in set.jars {
         parts.push(jars.join(name).display().to_string());
     }
     parts.join(":")
@@ -182,6 +238,11 @@ pub fn classpath(jars: &Path, classes: &Path) -> String {
 
 /// Compiles `tests/java/<source>` into `classes`.
 pub fn compile(jars: &Path, classes: &Path, source: &str) -> Result<(), String> {
+    compile_with(KAFKA_3_9, jars, classes, source)
+}
+
+/// [`compile`] against the jars of `set`.
+pub fn compile_with(set: JarSet, jars: &Path, classes: &Path, source: &str) -> Result<(), String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/java")
         .join(source);
@@ -190,7 +251,7 @@ pub fn compile(jars: &Path, classes: &Path, source: &str) -> Result<(), String> 
             .arg("--release")
             .arg("17")
             .arg("-cp")
-            .arg(classpath(jars, classes))
+            .arg(classpath_of(set, jars, classes))
             .arg("-d")
             .arg(classes)
             .arg(&path),
@@ -213,10 +274,21 @@ pub fn run(
     class: &str,
     args: &[&str],
 ) -> Result<(bool, String), String> {
+    run_with(KAFKA_3_9, jars, classes, class, args)
+}
+
+/// [`run`] against the jars of `set`.
+pub fn run_with(
+    set: JarSet,
+    jars: &Path,
+    classes: &Path,
+    class: &str,
+    args: &[&str],
+) -> Result<(bool, String), String> {
     let output = output_bounded(
         Command::new("java")
             .arg("-cp")
-            .arg(classpath(jars, classes))
+            .arg(classpath_of(set, jars, classes))
             .arg(class)
             .args(args),
         class,

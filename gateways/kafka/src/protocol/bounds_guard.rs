@@ -46,7 +46,11 @@ use bytes::{Buf, Bytes};
 
 use crate::error::{KafkaProtocolError, Result};
 
+mod consumer_group;
 mod txn;
+pub use consumer_group::{
+    validate_consumer_group_describe_shape, validate_consumer_group_heartbeat_shape,
+};
 pub use txn::{validate_add_partitions_to_txn_shape, validate_end_txn_shape};
 
 /// Per-array cap: large enough that no single legitimate array (e.g. a topic list) is rejected,

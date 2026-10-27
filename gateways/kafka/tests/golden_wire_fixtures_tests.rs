@@ -41,11 +41,11 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=25 (compact array: N+1=26)
+    // error_code=0, api_count=27 (compact array: N+1=28)
     // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
-    let expected: [u8; 183] = [
+    let expected: [u8; 197] = [
         0x00, 0x00, // error_code
-        0x1A, // compact array count (25+1)
+        0x1C, // compact array count (27+1)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x0D, 0x00, // key 0:  Produce         0-13 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x12, 0x00, // key 1:  Fetch           4-18
         0x00, 0x02, 0x00, 0x01, 0x00, 0x0A, 0x00, // key 2:  ListOffsets     1-10
@@ -71,6 +71,8 @@ async fn golden_apiversions_v3_flexible_response_fixture() {
         0x00, 0x2C, 0x00, 0x00, 0x00, 0x01, 0x00, // key 44: IncrementalAlterConfigs 0-1
         0x00, 0x2F, 0x00, 0x00, 0x00, 0x00, 0x00, // key 47: OffsetDelete    0-0
         0x00, 0x3C, 0x00, 0x00, 0x00, 0x02, 0x00, // key 60: DescribeCluster 0-2
+        0x00, 0x44, 0x00, 0x00, 0x00, 0x01, 0x00, // key 68: ConsumerGroupHeartbeat 0-1
+        0x00, 0x45, 0x00, 0x00, 0x00, 0x01, 0x00, // key 69: ConsumerGroupDescribe 0-1
         0x00, 0x00, 0x00, 0x00, // throttle_ms
         0x00, // top-level tagged fields
     ];
@@ -84,10 +86,10 @@ async fn golden_apiversions_v1_response_fixture() {
         .await
         .expect_response("test request has acks != 0 and expects a response");
 
-    // error_code=0, api_count=25; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
-    let expected: [u8; 160] = [
+    // error_code=0, api_count=27; Produce advertises min=0 per KAFKA-18659; throttle_ms=0
+    let expected: [u8; 172] = [
         0x00, 0x00, // error_code
-        0x00, 0x00, 0x00, 0x19, // api count = 25
+        0x00, 0x00, 0x00, 0x1B, // api count = 27
         0x00, 0x00, 0x00, 0x00, 0x00, 0x0D, // key 0:  Produce         0-13 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x12, // key 1:  Fetch           4-18
         0x00, 0x02, 0x00, 0x01, 0x00, 0x0A, // key 2:  ListOffsets     1-10
@@ -113,6 +115,8 @@ async fn golden_apiversions_v1_response_fixture() {
         0x00, 0x2C, 0x00, 0x00, 0x00, 0x01, // key 44: IncrementalAlterConfigs 0-1
         0x00, 0x2F, 0x00, 0x00, 0x00, 0x00, // key 47: OffsetDelete    0-0
         0x00, 0x3C, 0x00, 0x00, 0x00, 0x02, // key 60: DescribeCluster 0-2
+        0x00, 0x44, 0x00, 0x00, 0x00, 0x01, // key 68: ConsumerGroupHeartbeat 0-1
+        0x00, 0x45, 0x00, 0x00, 0x00, 0x01, // key 69: ConsumerGroupDescribe 0-1
         0x00, 0x00, 0x00, 0x00, // throttle_ms
     ];
     assert_eq!(actual.as_ref(), &expected);

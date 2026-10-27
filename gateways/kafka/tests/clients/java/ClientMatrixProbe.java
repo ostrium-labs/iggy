@@ -105,6 +105,11 @@ public final class ClientMatrixProbe {
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
         props.put(ConsumerConfig.CLIENT_ID_CONFIG, "matrix-java");
         props.put(ConsumerConfig.GROUP_ID_CONFIG, GROUP);
+        // KW-13: the KIP-848 row runs the same scenario with group.protocol=consumer.
+        String protocol = System.getenv("GROUP_PROTOCOL");
+        if (protocol != null && !protocol.isEmpty()) {
+            props.put("group.protocol", protocol);
+        }
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());

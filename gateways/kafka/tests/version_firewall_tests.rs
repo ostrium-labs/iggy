@@ -73,7 +73,7 @@ use wire::{
 
 #[test]
 fn supported_ranges_table_has_twenty_five_entries() {
-    assert_eq!(supported_api_ranges().len(), 25);
+    assert_eq!(supported_api_ranges().len(), 27);
 }
 
 #[test]

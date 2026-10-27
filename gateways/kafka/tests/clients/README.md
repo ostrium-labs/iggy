@@ -11,7 +11,7 @@ The latest recorded results are in [MATRIX.md](MATRIX.md).
 
 | Tier | Clients | When |
 | --- | --- | --- |
-| Smoke | kcat 1.7.1 (librdkafka 1.7), confluent-kafka-python 2.16.0 (librdkafka 2.16), franz-go 1.22.1, Java client 3.9.0 and 4.3.1 | Every pull request, in `Kafka gateway required` |
+| Smoke | kcat 1.7.1 (librdkafka 1.7), confluent-kafka-python 2.16.0 (librdkafka 2.16), franz-go 1.22.1, Java client 3.9.0 and 4.3.1; confluent-kafka-python and Java 4.3.1 again with `group.protocol=consumer` (KIP-848, the `-kip848` rows) | Every pull request, in `Kafka gateway required` |
 | Nightly | Vector 0.59.0, Fluent Bit 5.0.11, RisingWave 3.0.5, Flink 2.2.1 with `flink-sql-connector-kafka` 5.0.0-2.2, Kafka Connect with Debezium 3.6.2 (PostgreSQL 17.10) | The scheduled run and manual dispatches (`KAFKA_CLIENT_MATRIX_FULL=1`) |
 
 Every image is pinned by tag and digest in `client_matrix_tests.rs`

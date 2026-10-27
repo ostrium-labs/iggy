@@ -215,7 +215,7 @@ breadth. Status is `Planned` unless noted.
 | KW-10 | Per-principal authorization, ACL admin | #4518 | Planned (design notes below; not started) | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
 | KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Built** (branch `kw12-limits`; commit metadata log, client id and host, limit variables) | KW-0 | Yes |
-| KW-13 | KIP-848 consumer groups | #4523 | **Started, not wired** (branch `kw13-kip848-draft`) | KW-8 | Yes |
+| KW-13 | KIP-848 consumer groups | #4523 | **Part 1 built** (branch `kw13-kip848`); online migration (part 2) not built | KW-8 | Yes |
 | KW-14 | DescribeLogDirs, read-only `__consumer_offsets` | #4524 | Planned | KW-7 | Yes |
 | KW-15 | Remaining admin APIs | #4526 | Planned | KW-3, KW-8 | Yes |
 | KW-16 | Old and pinned clients | #4528 | Planned | KW-2 | Yes |
@@ -935,16 +935,22 @@ Kafka 4.x.
 
 **Exit.** #4523's acceptance criteria pass.
 
-**Status (2026-10-24): started, not wired, not built.** Branch `kw13-kip848-draft` holds a first
-cut that was never compiled: `src/group/consumer_protocol.rs` (the state machine: group and member
-epochs, revoke-before-assign reconciliation, partition ownership, uniform and range assignors,
-static members, regex subscriptions, session and revocation expiry, `STALE_MEMBER_EPOCH` commit
-check, with unit tests), `src/group/consumer_coordinator.rs` (consumer groups beside classic ones,
-`group.consumer.migration.policy=disabled` semantics), and handlers for 68 and 69. Still to do:
-wire them in (API keys, `SUPPORTED_RANGES`, dispatch, shape guards, `ListGroups` type,
-`DeleteGroups`/`OffsetDelete`/`OffsetCommit` hooks), build and fix, a Java 4
-`group.protocol=consumer` e2e (two members, leave and resume; classic-to-consumer offsets carried
-over), a KIP-848 oracle scenario, then online migration as part 2.
+**Status (2026-10-26): part 1 built (branch `kw13-kip848`, on top of KW-12).** The draft of
+2026-10-24 is wired and built: `src/group/consumer_protocol.rs` (group and member epochs,
+revoke-before-assign reconciliation, partition ownership, `uniform` and `range` assignors, static
+members, regex subscriptions, session and revocation expiry, `STALE_MEMBER_EPOCH` on commits),
+`src/group/consumer_coordinator.rs` (consumer groups beside classic ones, NOT_COORDINATOR with
+several gateways, `group.consumer.migration.policy=disabled` semantics), handlers for 68 and 69 with
+shape guards, ListGroups type `consumer`, DeleteGroups/OffsetDelete/OffsetCommit hooks, member client
+id and host from KW-12. Tests: unit tests of the state machine and assignors; the Java 4.3.1
+`ConsumerProtocolProbe` (two members, leave, resume, describe, classic-then-consumer offsets) against
+the gateway and Apache Kafka 4.3.1; the `consumer_group` oracle scenario; `-kip848` rows in the client
+matrix (Java 4.3.1 and confluent-kafka-python/librdkafka 2.16 with `group.protocol=consumer`).
+**Part 2 (not built): online migration**, Kafka 4's default `bidirectional` policy: a live classic
+group converted member by member (classic members inside a consumer group, served by
+JoinGroup/SyncGroup/Heartbeat with server-side assignments) and back. Until then a classic JoinGroup
+into a live consumer group answers `INCONSISTENT_GROUP_PROTOCOL` and a consumer heartbeat into a live
+classic group `GROUP_ID_NOT_FOUND`; a group changes protocol after its members stop (offsets kept).
 
 ### KW-14. DescribeLogDirs and a read-only `__consumer_offsets`
 

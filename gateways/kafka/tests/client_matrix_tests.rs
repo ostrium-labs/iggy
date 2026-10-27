@@ -280,15 +280,21 @@ enum Smoke {
     FranzGo,
     Java39,
     Java43,
+    /// confluent-kafka-python with `group.protocol=consumer` (KIP-848, KW-13).
+    ConfluentPythonKip848,
+    /// The Java 4.3 client with `group.protocol=consumer` (KIP-848, KW-13).
+    Java43Kip848,
 }
 
 impl Smoke {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Kcat,
         Self::ConfluentPython,
         Self::FranzGo,
         Self::Java39,
         Self::Java43,
+        Self::ConfluentPythonKip848,
+        Self::Java43Kip848,
     ];
 
     const fn name(self) -> &'static str {
@@ -298,10 +304,32 @@ impl Smoke {
             Self::FranzGo => "franz-go",
             Self::Java39 => "java-3.9",
             Self::Java43 => "java-4.3",
+            Self::ConfluentPythonKip848 => "confluent-kafka-python-kip848",
+            Self::Java43Kip848 => "java-4.3-kip848",
+        }
+    }
+
+    /// The group protocol the client is told to use, when not its default.
+    const fn group_protocol(self) -> Option<&'static str> {
+        match self {
+            Self::ConfluentPythonKip848 | Self::Java43Kip848 => Some("consumer"),
+            _ => None,
+        }
+    }
+
+    /// The client this row runs, with its default settings.
+    const fn base(self) -> Self {
+        match self {
+            Self::ConfluentPythonKip848 => Self::ConfluentPython,
+            Self::Java43Kip848 => Self::Java43,
+            other => other,
         }
     }
 
     fn version(self) -> String {
+        if let Some(protocol) = self.group_protocol() {
+            return format!("{}, group.protocol={protocol}", self.base().version());
+        }
         match self {
             Self::Kcat => "kcat 1.7.1, librdkafka 1.7.0".to_string(),
             Self::ConfluentPython => {
@@ -311,7 +339,8 @@ impl Smoke {
             }
             Self::FranzGo => format!("franz-go {}", franz_version()),
             Self::Java39 => "kafka-clients 3.9.0".to_string(),
-            Self::Java43 => "kafka-clients 4.3.1".to_string(),
+            Self::Java43 | Self::Java43Kip848 => "kafka-clients 4.3.1".to_string(),
+            Self::ConfluentPythonKip848 => unreachable!("handled above"),
         }
     }
 
@@ -321,7 +350,8 @@ impl Smoke {
             Self::ConfluentPython => PYTHON_IMAGE,
             Self::FranzGo => GOLANG_IMAGE,
             Self::Java39 => JAVA_39_IMAGE,
-            Self::Java43 => JAVA_43_IMAGE,
+            Self::Java43 | Self::Java43Kip848 => JAVA_43_IMAGE,
+            Self::ConfluentPythonKip848 => PYTHON_IMAGE,
         }
     }
 
@@ -332,7 +362,10 @@ impl Smoke {
             vec!["-v".to_string(), format!("{}:{guest}:ro", path_str(host))]
         };
         let mut args = Vec::new();
-        match self {
+        if let Some(protocol) = self.group_protocol() {
+            args.extend(["-e".to_string(), format!("GROUP_PROTOCOL={protocol}")]);
+        }
+        match self.base() {
             Self::Kcat => {
                 args.extend(mount(&clients_dir().join("kcat"), "/probe"));
                 args.extend(["--entrypoint".into(), "sh".into(), self.image().into()]);
@@ -357,6 +390,7 @@ impl Smoke {
                         .ok_or("probe name")?
                 ));
             }
+            Self::ConfluentPythonKip848 | Self::Java43Kip848 => unreachable!("base() maps these"),
             Self::Java39 | Self::Java43 => {
                 let classes = java_probe(self.image())?;
                 args.extend(mount(&classes, "/probe"));

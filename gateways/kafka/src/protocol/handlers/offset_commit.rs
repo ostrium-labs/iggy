@@ -76,7 +76,7 @@ pub async fn handle(
 
     let validated = state
         .groups
-        .validate_commit(&CommitRequest::from(&request))
+        .validate_commit(&CommitRequest::from((api_version, &request)))
         .await;
     let topics = match (&state.bridge, validated) {
         (Some(bridge), Ok(commit)) => {

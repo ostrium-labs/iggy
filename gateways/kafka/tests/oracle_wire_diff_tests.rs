@@ -86,6 +86,8 @@ mod facts;
 mod iggy_server;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "oracle/consumer_group.rs"]
+mod consumer_group;
 #[path = "oracle/transactions.rs"]
 mod transactions;
 
@@ -134,6 +136,7 @@ enum Scenario {
     ClassicGroup,
     StandaloneCommit,
     OffsetMetadata,
+    ConsumerGroup,
     InitProducerId,
     IdempotentProducer,
     IdempotentRestart,
@@ -144,7 +147,7 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -154,6 +157,7 @@ impl Scenario {
         Self::ClassicGroup,
         Self::StandaloneCommit,
         Self::OffsetMetadata,
+        Self::ConsumerGroup,
         Self::InitProducerId,
         Self::IdempotentProducer,
         Self::IdempotentRestart,
@@ -174,6 +178,7 @@ impl Scenario {
             Self::ClassicGroup => "classic_group",
             Self::StandaloneCommit => "standalone_commit",
             Self::OffsetMetadata => "offset_metadata",
+            Self::ConsumerGroup => "consumer_group",
             Self::InitProducerId => "init_producer_id",
             Self::IdempotentProducer => "idempotent_producer",
             Self::IdempotentRestart => "idempotent_restart",
@@ -202,6 +207,9 @@ impl Scenario {
             Self::ClassicGroup => classic_group(cx, &mut client, &mut facts).await?,
             Self::StandaloneCommit => standalone_commit(cx, &mut client, &mut facts).await?,
             Self::OffsetMetadata => offset_metadata(cx, &mut client, &mut facts).await?,
+            Self::ConsumerGroup => {
+                consumer_group::consumer_group(cx, &mut client, &mut facts).await?;
+            }
             Self::InitProducerId => init_producer_id(cx, &mut client, &mut facts).await?,
             Self::IdempotentProducer => idempotent_producer(cx, &mut client, &mut facts).await?,
             Self::IdempotentRestart => idempotent_restart(cx, &mut client, &mut facts).await?,

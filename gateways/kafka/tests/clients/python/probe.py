@@ -103,6 +103,9 @@ def consumer(group, extra=None):
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
     }
+    # KW-13: the KIP-848 rows run the same scenario with group.protocol=consumer.
+    if os.environ.get("GROUP_PROTOCOL"):
+        config["group.protocol"] = os.environ["GROUP_PROTOCOL"]
     config.update(extra or {})
     return Consumer(config)
 

@@ -529,6 +529,7 @@ mod tests {
             generation_id: -1,
             member_id: StrBytes::new(),
             group_instance_id: None,
+            api_version: 9,
         };
         let _running = state
             .groups
