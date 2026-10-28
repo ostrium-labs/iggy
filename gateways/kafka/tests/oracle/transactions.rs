@@ -462,3 +462,205 @@ fn clone(producer: &Producer) -> Producer {
         sequence: producer.sequence,
     }
 }
+
+/// What a Java `read_committed` consumer keeps of one Fetch answer: the data records of batches
+/// not aborted, by `CompletedFetch`'s rules (an aborted transaction joins the aborted set once a
+/// batch reaches its first offset, and its abort marker takes it out).
+fn committed_view(
+    answer: &kafka_protocol::messages::fetch_response::PartitionData,
+    bytes: Bytes,
+) -> Result<Vec<String>, String> {
+    let mut aborted: Vec<(i64, i64)> = answer
+        .aborted_transactions
+        .iter()
+        .flatten()
+        .map(|txn| (txn.first_offset, txn.producer_id.0))
+        .collect();
+    aborted.sort_unstable();
+    let mut aborted = aborted.into_iter().peekable();
+    let mut aborted_producers = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    let mut bytes = bytes;
+    for set in RecordBatchDecoder::decode_all(&mut bytes)
+        .map_err(|error| format!("decode records: {error}"))?
+    {
+        let Some(first) = set.records.first() else {
+            continue;
+        };
+        let last = set
+            .records
+            .last()
+            .map_or(first.offset, |record| record.offset);
+        if first.producer_id >= 0 {
+            while let Some((_, producer)) = aborted.next_if(|(offset, _)| *offset <= last) {
+                aborted_producers.insert(producer);
+            }
+            if first.control {
+                let abort = first.key.as_ref().and_then(|key| key.get(2..4)) == Some(&[0, 0][..]);
+                if abort {
+                    aborted_producers.remove(&first.producer_id);
+                }
+                continue;
+            }
+            if first.transactional && aborted_producers.contains(&first.producer_id) {
+                continue;
+            }
+        }
+        values.extend(
+            set.records
+                .iter()
+                .filter(|record| !record.control)
+                .map(|record| {
+                    record.value.as_ref().map_or_else(String::new, |value| {
+                        String::from_utf8_lossy(value).into_owned()
+                    })
+                }),
+        );
+    }
+    Ok(values)
+}
+
+/// A Fetch of partition 0 from `offset` at `isolation`, recorded under `label`: the values a Java
+/// consumer keeps, the last stable offset, the high watermark, and the aborted transactions
+/// listed.
+async fn read_at(
+    client: &mut WireClient,
+    name: &str,
+    offset: i64,
+    isolation: i8,
+    facts: &mut Facts,
+    label: &str,
+) -> Result<(), String> {
+    let (answer, bytes) = fetch_raw(client, name, 0, offset, isolation)
+        .await
+        .map_err(|error| format!("Fetch {label}: {error}"))?;
+    facts.set(format!("{label}.error"), answer.error_code);
+    facts.set(format!("{label}.high_watermark"), answer.high_watermark);
+    facts.set(
+        format!("{label}.last_stable_offset"),
+        answer.last_stable_offset,
+    );
+    facts.set(
+        format!("{label}.values"),
+        committed_view(&answer, bytes)?.join(","),
+    );
+    facts.set(
+        format!("{label}.aborted"),
+        answer.aborted_transactions.as_ref().map_or_else(
+            || "null".to_string(),
+            |list| {
+                list.iter()
+                    .map(|txn| txn.first_offset.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+        ),
+    );
+    Ok(())
+}
+
+/// `ListOffsets` `LATEST` of partition 0 at `isolation`.
+async fn latest(client: &mut WireClient, name: &str, isolation: i8) -> Result<(i16, i64), String> {
+    use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
+    let request = kafka_protocol::messages::ListOffsetsRequest::default()
+        .with_replica_id(kafka_protocol::messages::BrokerId(-1))
+        .with_isolation_level(isolation)
+        .with_topics(vec![
+            ListOffsetsTopic::default()
+                .with_name(topic(name))
+                .with_partitions(vec![
+                    ListOffsetsPartition::default()
+                        .with_partition_index(0)
+                        .with_current_leader_epoch(-1)
+                        .with_timestamp(-1),
+                ]),
+        ]);
+    let list_version = version(client, ApiKey::ListOffsets, 7)?;
+    let response = client
+        .send(&request, list_version)
+        .await
+        .map_err(|error| format!("ListOffsets: {error}"))?;
+    let answer = response
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .ok_or_else(|| "ListOffsets answered no partition".to_string())?;
+    Ok((answer.error_code, answer.offset))
+}
+
+/// `read_committed` on one partition: a commit, an abort, and an open transaction with a plain
+/// record after it. The open one holds the last stable offset, the aborted one is listed, and a
+/// consumer keeps only committed records; once the open one commits, everything up to the high
+/// watermark is stable.
+pub async fn read_committed(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let name = cx.name("read_committed", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let transactional_id = cx.name("read_committed", "tx");
+    find_coordinator(client, &transactional_id).await?;
+    let (error, producer_id, epoch) = init(client, &transactional_id, 60_000).await?;
+    if error != 0 {
+        return Err(format!("InitProducerId answered {error}"));
+    }
+    let mut producer = Producer {
+        id: transactional_id,
+        producer_id,
+        epoch,
+        sequence: 0,
+    };
+    for (values, commit) in [(&["c1", "c2"][..], true), (&["a1"][..], false)] {
+        add_partitions(client, &producer, &name, &[0]).await?;
+        let batch = txn_batch(&mut producer, values)?;
+        produce_txn(client, &producer, &name, 0, batch).await?;
+        end_settled(client, &producer, commit).await?;
+    }
+    // Both markers in place before the next transaction starts writing.
+    let mut high_watermark = 0;
+    for _ in 0..60 {
+        high_watermark = fetch_raw(client, &name, 0, 0, 0).await?.0.high_watermark;
+        if high_watermark >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("before_open.high_watermark", high_watermark);
+    add_partitions(client, &producer, &name, &[0]).await?;
+    let batch = txn_batch(&mut producer, &["o1"])?;
+    facts.set(
+        "open.produce.error",
+        produce_txn(client, &producer, &name, 0, batch).await?.0,
+    );
+    let plain = super::batch(&[(Some("k"), Some("plain"), &[])], now_ms())?;
+    facts.set(
+        "plain.produce.error",
+        super::produce(client, &name, 0, plain).await?.0,
+    );
+
+    read_at(client, &name, 0, 1, facts, "open.committed").await?;
+    read_at(client, &name, 0, 0, facts, "open.uncommitted").await?;
+    read_at(client, &name, 4, 1, facts, "open.committed_from_marker").await?;
+    let (error, offset) = latest(client, &name, 1).await?;
+    facts.set("open.latest_committed", format!("{error}:{offset}"));
+    let (error, offset) = latest(client, &name, 0).await?;
+    facts.set("open.latest_uncommitted", format!("{error}:{offset}"));
+
+    end_settled(client, &producer, true).await?;
+    let mut stable = 0;
+    for _ in 0..60 {
+        let (answer, _) = fetch_raw(client, &name, 0, 0, 1).await?;
+        stable = answer.last_stable_offset;
+        if stable >= 8 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("after.stable_reached", stable);
+    read_at(client, &name, 0, 1, facts, "after.committed").await?;
+    let (error, offset) = latest(client, &name, 1).await?;
+    facts.set("after.latest_committed", format!("{error}:{offset}"));
+    Ok(())
+}
