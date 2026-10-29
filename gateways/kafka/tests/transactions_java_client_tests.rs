@@ -38,6 +38,8 @@ mod iggy_server;
 mod java;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "common/txn_wire.rs"]
+mod txn_wire;
 
 use iggy_server::TestServer;
 use oracle::{KafkaOracle, Unavailable};
@@ -278,4 +280,128 @@ async fn given_a_kafka_streams_word_count_at_exactly_once_v2_should_count_as_on_
     }
     let _ = shutdown.send(());
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// `kafka-transactions.sh` from Apache Kafka 4.3.1 against `bootstrap`, in its container on the
+/// host network: whether it exited 0, and what it printed.
+fn kafka_transactions_sh(bootstrap: &str, args: &[&str]) -> (bool, String) {
+    let cli = oracle::container_cli();
+    let output = std::process::Command::new("timeout")
+        .args(["--kill-after=10s", "120"])
+        .arg(&cli)
+        .args(["run", "--rm", "--pull", "never", "--network", "host"])
+        .arg(oracle::KAFKA_ORACLE_IMAGE)
+        .args([
+            "/opt/kafka/bin/kafka-transactions.sh",
+            "--bootstrap-server",
+            bootstrap,
+        ])
+        .args(args)
+        .output()
+        .expect("run kafka-transactions.sh");
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_hanging_transaction_kafka_transactions_sh_should_list_describe_and_abort_it() {
+    if oracle::image_ready(oracle::KAFKA_ORACLE_IMAGE).is_err() {
+        java::skip("the apache/kafka image is not pulled");
+        return;
+    }
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    iggy_gateway_kafka::bridge::IggyBridge::connect(server.test_config())
+        .await
+        .expect("seed bridge")
+        .ensure_stream_and_topic("hang", 1)
+        .await
+        .expect("seed the topic");
+    let (address, shutdown) = gateway(&server).await;
+    let mut client = oracle::WireClient::connect(&address)
+        .await
+        .expect("connect");
+    let producer = txn_wire::init(&mut client, &address, "hang-tx", 600_000).await;
+    assert_eq!(
+        txn_wire::add(&mut client, "hang-tx", producer, "hang", &[0]).await,
+        0
+    );
+    let records = txn_wire::batch(producer.0, producer.1, 0, &["stuck"]);
+    assert_eq!(
+        txn_wire::produce(&mut client, "hang-tx", "hang", 0, records)
+            .await
+            .0,
+        0
+    );
+    let id = producer.0.to_string();
+
+    let tool = |args: Vec<String>| {
+        let address = address.clone();
+        tokio::task::spawn_blocking(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            kafka_transactions_sh(&address, &args)
+        })
+    };
+    let owned = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+    let (ok, text) = tool(owned(&["list"])).await.expect("ran");
+    println!("list:\n{text}");
+    assert!(
+        ok && text.contains("hang-tx") && text.contains("Ongoing"),
+        "{text}"
+    );
+    let (ok, text) = tool(owned(&["describe", "--transactional-id", "hang-tx"]))
+        .await
+        .expect("ran");
+    println!("describe:\n{text}");
+    assert!(
+        ok && text.contains("Ongoing") && text.contains(&id),
+        "{text}"
+    );
+    let (ok, text) = tool(owned(&[
+        "describe-producers",
+        "--topic",
+        "hang",
+        "--partition",
+        "0",
+    ]))
+    .await
+    .expect("ran");
+    println!("describe-producers:\n{text}");
+    assert!(ok && text.contains(&id), "{text}");
+
+    let (ok, text) = tool(owned(&[
+        "abort",
+        "--topic",
+        "hang",
+        "--partition",
+        "0",
+        "--start-offset",
+        "0",
+    ]))
+    .await
+    .expect("ran");
+    println!("abort:\n{text}");
+    assert!(ok, "{text}");
+    let (values, stable, high) =
+        txn_wire::read_until(&mut client, &address, "hang", 0, |_, stable, high| {
+            stable == high && high >= 2
+        })
+        .await;
+    assert!(
+        values.is_empty(),
+        "the aborted record stays hidden: {values:?}"
+    );
+    assert_eq!(
+        (stable, high),
+        (2, 2),
+        "the record and the operator's abort marker"
+    );
+    let _ = shutdown.send(());
 }
