@@ -2332,7 +2332,15 @@ async fn given_the_same_requests_the_gateway_should_answer_as_the_oracles_do() {
                 ));
                 continue;
             }
-            let theirs = match scenario.run(&context(oracle)).await {
+            let outcome = scenario.run(&context(oracle)).await;
+            // The managed cluster holds few partitions: each scenario's topics go as it ends.
+            if oracle.kind == TargetKind::Confluent
+                && let Some(cleanup) = &confluent_cleanup
+                && let Err(error) = cleanup.scenario_done(scenario.name()).await
+            {
+                confluent_notes.push(format!("{} cleanup failed: {error}", scenario.name()));
+            }
+            let theirs = match outcome {
                 Ok(theirs) => theirs,
                 Err(error) if oracle.kind == TargetKind::Confluent => {
                     confluent_notes.push(format!("{} failed: {error}", scenario.name()));
@@ -2479,6 +2487,13 @@ struct ConfluentCleanup {
 }
 
 impl ConfluentCleanup {
+    /// Deletes the topics `scenario` created in this run.
+    async fn scenario_done(&self, scenario: &str) -> Result<Vec<String>, String> {
+        self.oracle
+            .delete_topics(&format!("{}{scenario}-", self.prefix))
+            .await
+    }
+
     async fn finish(mut self) -> String {
         self.done = true;
         match self.oracle.delete_topics(&self.prefix).await {
@@ -2654,4 +2669,29 @@ fn given_a_confluent_env_file_the_parser_should_read_keys_quotes_and_exports() {
     assert_eq!(env["CONFLUENT_ORACLE_API_KEY"], "k");
     assert_eq!(env["CONFLUENT_ORACLE_API_SECRET"], "a=b");
     assert_eq!(env.len(), 3);
+}
+
+/// Deletes what killed runs left on the Confluent Cloud oracle: every `loams-oracle-` topic of a
+/// run that started more than 6 hours ago, and nothing else. On demand only:
+/// `cargo nextest run -p iggy-gateway-kafka --test oracle_wire_diff_tests --run-ignored only
+/// sweep_confluent`. Needs the oracle's env file, as the diff does.
+#[tokio::test]
+#[ignore = "touches the shared Confluent Cloud cluster; run on demand"]
+async fn sweep_confluent_leftovers() {
+    let confluent = match ConfluentOracle::start().await {
+        Ok(confluent) => confluent,
+        Err(Unavailable::Skipped(reason) | Unavailable::Failed(reason)) => {
+            panic!("Confluent Cloud oracle unavailable: {reason}")
+        }
+    };
+    match confluent.sweep_stale().await {
+        Ok(deleted) => eprintln!("deleted {} stale topics", deleted.len()),
+        Err(error) => panic!("sweep failed: {error}"),
+    }
+    let left = confluent.prefixed_topics().await.unwrap_or_default();
+    eprintln!(
+        "{} loams-oracle- topics left: {}",
+        left.len(),
+        left.join(", ")
+    );
 }
