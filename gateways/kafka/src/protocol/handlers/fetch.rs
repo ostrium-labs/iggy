@@ -92,6 +92,14 @@ const MAX_POLL_COUNT: u32 = 1000;
 /// Most messages one poll asks for. Iggy caps a poll by count, not by bytes, so this caps what one
 /// poll can load: about 1 GB of the largest messages. A byte cap in Iggy would lift it.
 const MAX_PAGE_COUNT: u32 = 16;
+/// Most messages one poll asks for while the partition's messages are small, so a 1000-message
+/// read costs a handful of round trips to Iggy instead of 63. See [`GROWN_PAGE_MAX_SIZE`].
+const GROWN_PAGE_COUNT: u32 = 250;
+/// Largest stored message size (the probe's average for the first page, the largest seen after
+/// that) at which a poll may ask for [`GROWN_PAGE_COUNT`] messages. An empty reply to a grown
+/// poll (Iggy answers empty when the reply passes its u32 frame) drops the read back to
+/// [`MAX_PAGE_COUNT`] for the rest of its polls.
+const GROWN_PAGE_MAX_SIZE: u64 = 8 * 1024;
 /// The largest message Iggy stores, header included.
 const LARGEST_MESSAGE_BYTES: u64 =
     MAX_PAYLOAD_SIZE as u64 + MAX_USER_HEADERS_SIZE as u64 + IGGY_MESSAGE_HEADER_SIZE as u64;
@@ -1053,6 +1061,12 @@ impl<'a> Reader<'a> {
                     break;
                 };
                 match page {
+                    // A grown poll Iggy could not answer: ask again in small pages.
+                    Ok(page)
+                        if page.messages.is_empty() && count > MAX_PAGE_COUNT && !polled.shrunk =>
+                    {
+                        polled.shrunk = true;
+                    }
                     // The probe showed records, yet the first poll found none.
                     Ok(page) if page.messages.is_empty() && polled.messages.is_empty() => {
                         return Read::Empty(EmptyRead {
@@ -1746,6 +1760,8 @@ struct Polled {
     high_watermark: u64,
     /// A page came back short, so nothing more waits.
     done: bool,
+    /// A grown poll came back empty: poll [`MAX_PAGE_COUNT`] at most from here on.
+    shrunk: bool,
 }
 
 impl Polled {
@@ -1757,6 +1773,16 @@ impl Polled {
             largest: 0,
             high_watermark,
             done: false,
+            shrunk: false,
+        }
+    }
+
+    /// Messages one poll may ask for, given the size of the biggest message it may hold.
+    fn page_cap(&self, size: u64) -> u32 {
+        if self.shrunk || size > GROWN_PAGE_MAX_SIZE {
+            MAX_PAGE_COUNT
+        } else {
+            GROWN_PAGE_COUNT
         }
     }
 
@@ -1792,12 +1818,12 @@ fn next_page(polled: &Polled, budget: usize, average_size: u64) -> Option<u32> {
         return None;
     }
     if polled.messages.is_empty() {
-        return Some(poll_count(budget, average_size, waiting).min(MAX_PAGE_COUNT));
+        return Some(poll_count(budget, average_size, waiting).min(polled.page_cap(average_size)));
     }
     let fits = budget.saturating_sub(polled.bytes) / polled.largest.max(1);
     let count = u32::try_from(fits)
         .unwrap_or(u32::MAX)
-        .min(MAX_PAGE_COUNT)
+        .min(polled.page_cap(u64::try_from(polled.largest).unwrap_or(u64::MAX)))
         .min(room);
     (count > 0).then_some(count)
 }
@@ -2192,7 +2218,18 @@ mod tests {
     #[test]
     fn given_a_new_read_when_sizing_the_first_page_should_use_the_average_up_to_the_cap() {
         let mib = 1024 * 1024;
-        assert_eq!(next_page(&Polled::new(0, 10_000), mib, 100), Some(16));
+        assert_eq!(
+            next_page(&Polled::new(0, 10_000), mib, 100),
+            Some(GROWN_PAGE_COUNT)
+        );
+        assert_eq!(
+            next_page(&Polled::new(0, 10_000), 64 * mib, 16 * 1024),
+            Some(MAX_PAGE_COUNT),
+            "big messages keep the small page"
+        );
+        let mut shrunk = Polled::new(0, 10_000);
+        shrunk.shrunk = true;
+        assert_eq!(next_page(&shrunk, mib, 100), Some(MAX_PAGE_COUNT));
         assert_eq!(next_page(&Polled::new(0, 3), mib, 100), Some(3));
         assert_eq!(
             next_page(&Polled::new(0, 100), 10, 100),
@@ -2207,7 +2244,7 @@ mod tests {
         let mut polled = Polled::new(0, 10_000);
         polled.add(page(0, &[100; 16], 15), 16);
         assert_eq!(polled.next, 16);
-        assert_eq!(next_page(&polled, 1024 * 1024, 100), Some(MAX_PAGE_COUNT));
+        assert_eq!(next_page(&polled, 1024 * 1024, 100), Some(GROWN_PAGE_COUNT));
     }
 
     #[test]
