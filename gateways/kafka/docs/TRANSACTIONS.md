@@ -1,6 +1,6 @@
 # Kafka transactions (Ostrium fork, KW-T)
 
-Status: **steps 1 and 2 of 5 built** in the Ostrium Labs fork, behind
+Status: **steps 1 to 3 of 5 built** in the Ostrium Labs fork, behind
 `IGGY_KAFKA_TRANSACTIONS_ENABLED=true` (off by default). Not upstream. The plan is section 6 of
 `docs/loams/kafka-wire-plan.md`; this document is what the code does.
 
@@ -11,7 +11,7 @@ With the switch off, the gateway refuses transactions exactly as [`SCOPE.md`](SC
 | --- | --- | --- |
 | 1 | Coordinator, transaction log, `InitProducerId` with a transactional id, `FindCoordinator` (transaction), `AddPartitionsToTxn`, `EndTxn`, transactional Produce, markers, timeouts, fencing, recovery | **Built** |
 | 2 | `read_committed`: last stable offset, aborted transactions in Fetch, `ListOffsets` at `read_committed` | **Built** |
-| 3 | `AddOffsetsToTxn`, `TxnOffsetCommit`, `OffsetFetch` `require_stable`: consume-transform-produce (Kafka Streams `exactly_once_v2`, Flink 2PC) | Planned |
+| 3 | `AddOffsetsToTxn`, `TxnOffsetCommit`, `OffsetFetch` `require_stable`: consume-transform-produce (Kafka Streams `exactly_once_v2`, Flink 2PC) | **Built** (Flink not run yet) |
 | 4 | `DescribeTransactions`, `ListTransactions`, `DescribeProducers`, transactional id expiry, log snapshots | Planned |
 | 5 | Several gateways (KW-5 ownership), crash and network-fault matrix | Planned |
 
@@ -98,6 +98,26 @@ Transactions past their timeout are fenced and aborted every
 - The oracle scenario `read_committed` checks a commit, an abort and an open transaction with a
   plain record after it against Apache Kafka, fact for fact.
 
+## Consume-transform-produce (step 3)
+
+- `AddOffsetsToTxn` (v0-4) adds a group to the transaction; `TxnOffsetCommit` (v0-4) stores the
+  group's offsets in it, in the transaction log (`offsets` on the id's record), so a coordinator
+  that restarts after `PrepareCommit` still commits them.
+- From v3 `TxnOffsetCommit` names the consumer's member and generation (KIP-447); they are
+  checked as an `OffsetCommit`'s are, and a producer that names no member commits standalone,
+  as Kafka allows.
+- The offsets become the group's committed offsets (Iggy's external group offsets,
+  `OFFSET_STORAGE.md`) after the markers of a committed transaction and before its
+  `CompleteCommit`; an aborted transaction's are dropped.
+- `OffsetFetch` with `require_stable` (v7+) answers `UNSTABLE_OFFSET_COMMIT` (88) and -1 for an
+  offset an open transaction holds, so a `read_committed` consumer waits for it (KIP-447).
+- Oracle scenario `exactly_once`: 12 facts (the unstable and stable reads, commit and abort,
+  fencing, the codes for a group never added), equal to Apache Kafka 4.3.1.
+- Java: `EosCopyProbe` (a consume-transform-produce loop with `sendOffsetsToTransaction` and the
+  group metadata, aborting every third transaction and rewinding) copies every record exactly
+  once on the gateway and on Kafka; `StreamsEosProbe` (a Kafka Streams 3.9 word count at
+  `exactly_once_v2`, restarted half way) ends with the same counts on both.
+
 ## Limits
 
 - One gateway per Iggy default stream coordinates transactions. Two gateways with the switch on
@@ -122,5 +142,5 @@ Transactions past their timeout are fenced and aborted every
 - `tests/transactions_java_client_tests.rs`: the Java producer commits, aborts and is fenced, on
   the gateway and on Apache Kafka 4.3.1, and a `read_uncommitted` and a `read_committed` consumer
   read alike on both.
-- Oracle scenarios `transactions` and `read_committed`: Apache Kafka (pass/fail), Redpanda
+- Oracle scenarios `transactions`, `read_committed` and `exactly_once`: Apache Kafka (pass/fail), Redpanda
   (nightly), Confluent Cloud (report-only, local).

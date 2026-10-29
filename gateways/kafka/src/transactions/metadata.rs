@@ -155,6 +155,8 @@ pub struct TxnMetadata {
     pub partitions: BTreeMap<TopicPartition, PartitionStart>,
     /// The groups whose offsets this transaction commits (`AddOffsetsToTxn`).
     pub groups: BTreeSet<String>,
+    /// The offsets `TxnOffsetCommit` stored for each group, visible once the transaction commits.
+    pub offsets: BTreeMap<String, BTreeMap<TopicPartition, i64>>,
     /// When the transaction's first partition was added, -1 when none is.
     pub start_ms: i64,
     pub update_ms: i64,
@@ -184,6 +186,7 @@ impl TxnMetadata {
             state: TxnState::Empty,
             partitions: BTreeMap::new(),
             groups: BTreeSet::new(),
+            offsets: BTreeMap::new(),
             start_ms: -1,
             update_ms: now_ms,
         }
@@ -265,6 +268,7 @@ impl TxnMetadata {
             state: TxnState::Empty,
             partitions: BTreeMap::new(),
             groups: BTreeSet::new(),
+            offsets: BTreeMap::new(),
             start_ms: -1,
             update_ms: now_ms,
             ..self.clone()
@@ -338,6 +342,7 @@ impl TxnMetadata {
             next.start_ms = now_ms;
             next.partitions.clear();
             next.groups.clear();
+            next.offsets.clear();
         }
         for (partition, start) in partitions {
             next.partitions.entry(partition.clone()).or_insert(*start);
@@ -391,9 +396,45 @@ impl TxnMetadata {
             },
             partitions: BTreeMap::new(),
             groups: BTreeSet::new(),
+            offsets: BTreeMap::new(),
             update_ms: now_ms,
             ..self.clone()
         }
+    }
+
+    /// `TxnOffsetCommit`: stores `offsets` of `group` in the transaction, to be committed with it.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_PRODUCER_EPOCH` for a fenced producer (the code the group coordinator answers for
+    /// a stale epoch), `INVALID_PRODUCER_ID_MAPPING`, `CONCURRENT_TRANSACTIONS` while markers are
+    /// written, and `INVALID_TXN_STATE` for a group the transaction did not add.
+    pub fn commit_offsets(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        group: &str,
+        offsets: &BTreeMap<TopicPartition, i64>,
+        now_ms: i64,
+    ) -> Result<Self, i16> {
+        match self.check_producer(producer_id, epoch) {
+            Err(codes::PRODUCER_FENCED) => return Err(codes::INVALID_PRODUCER_EPOCH),
+            other => other?,
+        }
+        if self.state.is_preparing() {
+            return Err(codes::CONCURRENT_TRANSACTIONS);
+        }
+        if self.state != TxnState::Ongoing || !self.groups.contains(group) {
+            return Err(codes::INVALID_TXN_STATE);
+        }
+        let mut next = self.clone();
+        next.offsets.entry(group.to_string()).or_default().extend(
+            offsets
+                .iter()
+                .map(|(partition, offset)| (partition.clone(), *offset)),
+        );
+        next.update_ms = now_ms;
+        Ok(next)
     }
 
     /// Whether an open transaction ran past its timeout at `now_ms`.

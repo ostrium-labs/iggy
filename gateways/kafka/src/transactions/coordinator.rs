@@ -122,6 +122,18 @@ pub trait DataPlane: Send + Sync + 'static {
     ///
     /// The bridge's error. The marker may still land; it is written again.
     async fn write_marker(&self, marker: &Marker) -> Result<Landed, BridgeError>;
+
+    /// Stores `offsets` as `group`'s committed offsets: what a committed transaction's
+    /// `TxnOffsetCommit` stored becomes visible. Writing the same offsets again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The bridge's error for any partition; the whole set is written again.
+    async fn commit_offsets(
+        &self,
+        group: &str,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<(), BridgeError>;
 }
 
 /// Hands out a producer id for a new transactional id, or `None` once the space is spent.
@@ -692,6 +704,59 @@ impl TransactionCoordinator {
         Ok(())
     }
 
+    /// `TxnOffsetCommit`: stores `offsets` of `group` in the producer's transaction.
+    ///
+    /// # Errors
+    ///
+    /// The Kafka error to answer for every partition.
+    pub async fn txn_offset_commit(
+        self: &Arc<Self>,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        group: &str,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<(), i16> {
+        if !self.is_loaded() {
+            return Err(codes::COORDINATOR_LOAD_IN_PROGRESS);
+        }
+        let entry = self
+            .entry(transactional_id)
+            .ok_or(codes::INVALID_PRODUCER_ID_MAPPING)?;
+        let _turn = entry.transition.lock().await;
+        let next =
+            entry
+                .metadata()
+                .commit_offsets(producer_id, epoch, group, offsets, self.now())?;
+        self.append(&next, Vec::new())
+            .await
+            .map_err(|error| log_failed(&error, transactional_id))?;
+        self.publish(&entry, next);
+        Ok(())
+    }
+
+    /// Whether an open transaction holds an offset of `group` for `partition` that it has not
+    /// committed yet: `OffsetFetch` with `require_stable` then answers `UNSTABLE_OFFSET_COMMIT`
+    /// (KIP-447).
+    #[must_use]
+    pub fn has_pending_offset(&self, group: &str, partition: &TopicPartition) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|entry| {
+                let metadata = entry
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                metadata.state.is_open()
+                    && metadata
+                        .offsets
+                        .get(group)
+                        .is_some_and(|offsets| offsets.contains_key(partition))
+            })
+    }
+
     /// Checks a transactional Produce batch against its transaction, before it is written.
     ///
     /// # Errors
@@ -788,7 +853,23 @@ impl TransactionCoordinator {
                 exact,
             });
         }
-        // Group offsets of the transaction are materialized here (KW-T step 3).
+        // A committed transaction's offsets become the groups' committed offsets before it is
+        // complete, as Kafka's commit marker on `__consumer_offsets` makes them visible.
+        if control == ControlType::Commit {
+            for (group, offsets) in &prepared.offsets {
+                loop {
+                    match self.data.commit_offsets(group, offsets).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            debug!(%error, transactional_id, group, "transaction offsets not committed yet");
+                        }
+                    }
+                    if self.sleep_or_cancelled(RETRY_BACKOFF).await {
+                        return;
+                    }
+                }
+            }
+        }
         loop {
             let turn = entry.transition.lock().await;
             let current = entry.metadata();
@@ -881,6 +962,7 @@ mod tests {
     struct MemoryData {
         markers: Mutex<Vec<Marker>>,
         next: AtomicU64,
+        committed: Mutex<BTreeMap<(String, TopicPartition), i64>>,
     }
 
     #[async_trait]
@@ -900,6 +982,19 @@ mod tests {
         async fn write_marker(&self, marker: &Marker) -> Result<Landed, BridgeError> {
             self.markers.lock().unwrap().push(marker.clone());
             Ok(Landed::At(self.next.fetch_add(1, Ordering::Relaxed)))
+        }
+
+        async fn commit_offsets(
+            &self,
+            group: &str,
+            offsets: &BTreeMap<TopicPartition, i64>,
+        ) -> Result<(), BridgeError> {
+            self.committed.lock().unwrap().extend(
+                offsets
+                    .iter()
+                    .map(|(partition, offset)| ((group.to_string(), partition.clone()), *offset)),
+            );
+            Ok(())
         }
     }
 
@@ -1190,5 +1285,89 @@ mod tests {
             .unwrap();
         let start = coordinator.describe("tx").unwrap().partitions[&tp("t", 0)].start;
         assert_eq!(start, Some(marker + 1));
+    }
+
+    #[tokio::test]
+    async fn given_offsets_in_a_transaction_should_commit_them_only_when_it_commits() {
+        let (log, data) = (
+            Arc::new(MemoryLog::default()),
+            Arc::new(MemoryData::default()),
+        );
+        let coordinator = loaded(&log, &data).await;
+        let (id, epoch) = coordinator
+            .init_producer_id("eos", 60_000, None)
+            .await
+            .unwrap();
+        let offsets = BTreeMap::from([(tp("in", 0), 42)]);
+        assert_eq!(
+            coordinator
+                .txn_offset_commit("eos", id, epoch, "g", &offsets)
+                .await,
+            Err(codes::INVALID_TXN_STATE),
+            "the group was not added"
+        );
+        coordinator
+            .add_offsets("eos", id, epoch, "g")
+            .await
+            .unwrap();
+        coordinator
+            .add_partitions("eos", id, epoch, &[tp("out", 0)], None)
+            .await
+            .unwrap();
+        coordinator
+            .txn_offset_commit("eos", id, epoch, "g", &offsets)
+            .await
+            .unwrap();
+        assert!(coordinator.has_pending_offset("g", &tp("in", 0)));
+        assert!(!coordinator.has_pending_offset("g", &tp("in", 1)));
+        assert_eq!(
+            coordinator
+                .txn_offset_commit("eos", id, epoch + 1, "g", &offsets)
+                .await,
+            Err(codes::INVALID_PRODUCER_EPOCH)
+        );
+        coordinator
+            .end_txn("eos", id, epoch, Outcome::Commit)
+            .await
+            .unwrap();
+        assert_eq!(settle(&coordinator, "eos").await, TxnState::CompleteCommit);
+        assert!(!coordinator.has_pending_offset("g", &tp("in", 0)));
+        assert_eq!(
+            data.committed
+                .lock()
+                .unwrap()
+                .get(&("g".to_string(), tp("in", 0))),
+            Some(&42)
+        );
+
+        coordinator
+            .add_offsets("eos", id, epoch, "g")
+            .await
+            .unwrap();
+        coordinator
+            .txn_offset_commit("eos", id, epoch, "g", &BTreeMap::from([(tp("in", 0), 99)]))
+            .await
+            .unwrap();
+        coordinator
+            .end_txn("eos", id, epoch, Outcome::Abort)
+            .await
+            .unwrap();
+        assert_eq!(settle(&coordinator, "eos").await, TxnState::CompleteAbort);
+        assert_eq!(
+            data.committed
+                .lock()
+                .unwrap()
+                .get(&("g".to_string(), tp("in", 0))),
+            Some(&42),
+            "an aborted transaction's offsets are dropped"
+        );
+        let replayed = log
+            .records()
+            .iter()
+            .rev()
+            .map(LogRecord::metadata)
+            .find(|metadata| !metadata.offsets.is_empty())
+            .expect("the offsets are in the log");
+        assert_eq!(replayed.offsets["g"][&tp("in", 0)], 99);
     }
 }

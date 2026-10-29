@@ -46,6 +46,7 @@ use crate::protocol::handlers::{
     decode_guarded, encode_message, may_topic, offset_deadline, offset_refusal_cause,
     respond_or_close,
 };
+use crate::transactions::TransactionCoordinator;
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_OFFSET_FETCH,
@@ -163,6 +164,11 @@ pub async fn handle(
     for (query, answer) in queries.iter().zip(&mut answers) {
         deny_unreadable(state, principal, query, answer);
     }
+    if request.require_stable
+        && let Some(transactions) = &state.transactions
+    {
+        mark_unstable(transactions, &queries, &mut answers);
+    }
     respond_or_close(
         encode_response(api_version, &queries, answers),
         "OffsetFetch",
@@ -197,6 +203,35 @@ fn deny_unreadable(
         }
     }
 }
+
+/// KW-T, KIP-447: with `require_stable`, an offset an open transaction has stored and not yet
+/// committed answers `UNSTABLE_OFFSET_COMMIT` (88) and offset -1, so the consumer waits for the
+/// transaction to end instead of reading the offset before it.
+fn mark_unstable(
+    transactions: &TransactionCoordinator,
+    queries: &[GroupQuery],
+    answers: &mut [GroupAnswer],
+) {
+    for (query, answer) in queries.iter().zip(answers) {
+        if answer.error != ERROR_NONE {
+            continue;
+        }
+        for topic in &mut answer.topics {
+            for partition in &mut topic.partitions {
+                let key = (topic.name.to_string(), partition.index);
+                if partition.error == ERROR_NONE
+                    && transactions.has_pending_offset(&query.group_id, &key)
+                {
+                    partition.error = ERROR_UNSTABLE_OFFSET_COMMIT;
+                    partition.offset = -1;
+                }
+            }
+        }
+    }
+}
+
+/// `UNSTABLE_OFFSET_COMMIT`: a transaction holds an offset it has not committed yet.
+const ERROR_UNSTABLE_OFFSET_COMMIT: i16 = 88;
 
 /// One failed read fails the whole group, so a client never reads a lost answer as "nothing
 /// committed" and resets its position.
