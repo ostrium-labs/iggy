@@ -30,13 +30,19 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::error::Result;
-use crate::protocol::api::{ApiVersionRange, GatewayState, HandleOutcome};
+use crate::protocol::api::{
+    ApiVersionRange, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+};
 use crate::protocol::bounds_guard::{
     validate_describe_transactions_shape, validate_list_transactions_shape,
 };
-use crate::protocol::handlers::txn::decode_txn_request;
-use crate::protocol::handlers::{encode_message, respond_or_close};
+use crate::protocol::handlers::txn::{
+    coordinator_key, decode_txn_request, may_use_transactional_ids, visible_id,
+};
+use crate::protocol::handlers::{encode_message, may_topic, respond_or_close};
 use crate::transactions::coordinator::wall_clock_ms;
 use crate::transactions::{TxnMetadata, TxnState, codes};
 
@@ -67,8 +73,17 @@ const STATES: [TxnState; 7] = [
     TxnState::Dead,
 ];
 
+/// `DescribeTransactions`. KW-TXP: each id is looked up in the caller's own namespace, so a
+/// principal can only ever describe its own transactions, and the topics shown are those it may
+/// describe, as Kafka's `KafkaApis` filters them. A principal that may not use transactional ids
+/// is answered `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for each id.
 #[expect(clippy::unused_async, reason = "the shared handler signature")]
-pub async fn describe(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn describe(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(coordinator) = state.transactions.as_ref() else {
         return HandleOutcome::Close;
     };
@@ -84,20 +99,27 @@ pub async fn describe(state: &GatewayState, api_version: i16, body: Bytes) -> Ha
         Err(outcome) => return outcome,
     };
     let loaded = coordinator.is_loaded();
+    let authorized = may_use_transactional_ids(principal);
     let states = request
         .transactional_ids
         .iter()
         .map(|id| {
             let described = TransactionState::default().with_transactional_id(id.clone());
+            // Kafka checks DESCRIBE on each id before it asks the coordinator.
+            if !authorized {
+                return described.with_error_code(ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED);
+            }
             if !loaded {
                 return described.with_error_code(codes::COORDINATOR_LOAD_IN_PROGRESS);
             }
             if id.is_empty() {
                 return described.with_error_code(codes::INVALID_REQUEST);
             }
-            match coordinator.describe(id) {
+            match coordinator.describe(&coordinator_key(principal, id.as_str())) {
                 Some(metadata) if metadata.state != TxnState::Dead => {
-                    described_state(described, &metadata)
+                    described_state(described, &metadata, |topic| {
+                        may_topic(state, principal, topic, TopicOp::Describe)
+                    })
                 }
                 _ => described.with_error_code(codes::TRANSACTIONAL_ID_NOT_FOUND),
             }
@@ -113,11 +135,17 @@ pub async fn describe(state: &GatewayState, api_version: i16, body: Bytes) -> Ha
     )
 }
 
-fn described_state(described: TransactionState, metadata: &TxnMetadata) -> TransactionState {
+/// `described` filled from `metadata`, showing only the topics `may_describe` lets through.
+fn described_state(
+    described: TransactionState,
+    metadata: &TxnMetadata,
+    may_describe: impl Fn(&str) -> bool,
+) -> TransactionState {
     let mut topics: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
     for (topic, partition) in metadata.partitions.keys() {
         topics.entry(topic.as_str()).or_default().push(*partition);
     }
+    topics.retain(|topic, _| may_describe(topic));
     described
         .with_error_code(codes::NONE)
         .with_transaction_state(StrBytes::from_static_str(metadata.state.name()))
@@ -137,8 +165,16 @@ fn described_state(described: TransactionState, metadata: &TxnMetadata) -> Trans
         )
 }
 
+/// `ListTransactions`. KW-TXP: only the caller's own transactions are listed, by the ids it
+/// named them by; Kafka lists only the ids the caller may describe, and a principal that may not
+/// use transactional ids gets an empty list.
 #[expect(clippy::unused_async, reason = "the shared handler signature")]
-pub async fn list(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn list(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(coordinator) = state.transactions.as_ref() else {
         return HandleOutcome::Close;
     };
@@ -166,9 +202,11 @@ pub async fn list(state: &GatewayState, api_version: i16, body: Bytes) -> Handle
         .cloned()
         .collect();
     let now = wall_clock_ms();
+    let authorized = may_use_transactional_ids(principal);
     let listed = coordinator
         .list()
         .into_iter()
+        .filter(|_| authorized)
         .filter(|metadata| metadata.state != TxnState::Dead)
         .filter(|metadata| {
             request.state_filters.is_empty()
@@ -189,13 +227,15 @@ pub async fn list(state: &GatewayState, api_version: i16, body: Bytes) -> Handle
             request.duration_filter < 0
                 || now.saturating_sub(metadata.start_ms) >= request.duration_filter
         })
-        .map(|metadata| {
-            ListedState::default()
-                .with_transactional_id(TransactionalId(StrBytes::from_string(
-                    metadata.transactional_id.clone(),
-                )))
-                .with_producer_id(ProducerId(metadata.producer_id))
-                .with_transaction_state(StrBytes::from_static_str(metadata.state.name()))
+        .filter_map(|metadata| {
+            // Another principal's transaction stays out of the answer altogether.
+            let id = visible_id(principal, &metadata.transactional_id)?;
+            Some(
+                ListedState::default()
+                    .with_transactional_id(TransactionalId(StrBytes::from_string(id.to_string())))
+                    .with_producer_id(ProducerId(metadata.producer_id))
+                    .with_transaction_state(StrBytes::from_static_str(metadata.state.name())),
+            )
         })
         .collect();
     let response = ListTransactionsResponse::default()
@@ -216,4 +256,37 @@ pub fn encode_list_error(version: i16, error_code: i16) -> Result<Bytes> {
         version,
         16,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transactions::metadata::PartitionStart;
+
+    #[test]
+    fn a_described_transaction_shows_only_the_topics_the_caller_may_describe() {
+        let mut metadata = TxnMetadata::new("5:alice/orders-tx", 7, 60_000, 0);
+        metadata.state = TxnState::Ongoing;
+        for (topic, partition) in [("orders", 0), ("orders", 1), ("secret", 0)] {
+            metadata.partitions.insert(
+                (topic.to_string(), partition),
+                PartitionStart { start: None },
+            );
+        }
+        let described = described_state(
+            TransactionState::default()
+                .with_transactional_id(TransactionalId(StrBytes::from_static_str("orders-tx"))),
+            &metadata,
+            |topic| topic != "secret",
+        );
+        assert_eq!(described.error_code, codes::NONE);
+        assert_eq!(described.transactional_id.as_str(), "orders-tx");
+        assert_eq!(described.producer_id.0, 7);
+        let topics: Vec<(&str, &[i32])> = described
+            .topics
+            .iter()
+            .map(|topic| (topic.topic.as_str(), topic.partitions.as_slice()))
+            .collect();
+        assert_eq!(topics, [("orders", &[0, 1][..])]);
+    }
 }

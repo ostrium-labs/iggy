@@ -28,17 +28,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use kafka_protocol::messages::{
-    InitProducerIdRequest, InitProducerIdResponse, ProducerId, TransactionalId,
-};
+use kafka_protocol::messages::{InitProducerIdRequest, InitProducerIdResponse, ProducerId};
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_INIT_PRODUCER_ID, ApiVersionRange, ERROR_CLUSTER_AUTHORIZATION_FAILED, ERROR_NONE,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_init_producer_id_shape;
+use crate::protocol::handlers::txn::{coordinator_key, may_use_transactional_ids};
 use crate::protocol::handlers::{
     decode_guarded, decode_request, encode_message, is_transactional, respond_or_close,
 };
@@ -121,7 +121,6 @@ pub async fn handle(
     body: Bytes,
 ) -> HandleOutcome {
     // Kafka's IDEMPOTENT_WRITE on the cluster, which WRITE on any topic implies (`crate::authz`).
-    // A transactional id has no Iggy resource to grant, so it asks the same of the principal.
     let may_write = principal
         .is_none_or(|principal| principal.permissions_known && principal.grants.writes_any_topic());
     let request = match decode_request(
@@ -142,9 +141,19 @@ pub async fn handle(
     let encoded = match (&state.transactions, transactional_id) {
         // Transactions off: a transactional id is refused (35) whatever the principal holds.
         (None, Some(_)) => encode_response(api_version, &request, &state.producer_ids),
+        // KW-TXP: Kafka asks for WRITE on the transactional id first and answers 53. The id has
+        // no Iggy resource, so it asks for write access to some topic, in the principal's own
+        // namespace (`txn::may_use_transactional_ids`).
+        (Some(_), Some(_)) if !may_use_transactional_ids(principal) => encode_with_epoch(
+            api_version,
+            ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+            -1,
+            -1,
+        ),
         _ if !may_write => encode_error_response(api_version, ERROR_CLUSTER_AUTHORIZATION_FAILED),
         (Some(coordinator), Some(transactional_id)) => {
-            transactional(coordinator, api_version, &request, transactional_id).await
+            let key = coordinator_key(principal, transactional_id.as_str());
+            transactional(coordinator, api_version, &request, &key).await
         }
         _ => encode_response(api_version, &request, &state.producer_ids),
     };
@@ -156,11 +165,13 @@ const PRODUCER_FENCED_VERSION: i16 = 4;
 
 /// `InitProducerId` with a transactional id, on a gateway with transactions on (KW-T): the
 /// coordinator gives the id its producer id and bumps its epoch, fencing an older producer.
+///
+/// `transactional_id` is the coordinator's key for the id, in the principal's namespace.
 async fn transactional(
     coordinator: &Arc<TransactionCoordinator>,
     version: i16,
     request: &InitProducerIdRequest,
-    transactional_id: &TransactionalId,
+    transactional_id: &str,
 ) -> Result<Bytes> {
     // v3 and later name the producer's own id and epoch (KIP-360); both or neither.
     let expected = match (request.producer_id.0, request.producer_epoch) {

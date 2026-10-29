@@ -56,7 +56,8 @@ use crate::protocol::api::{
     API_KEY_DELETE_GROUPS, API_KEY_DESCRIBE_GROUPS, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT,
     API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_OFFSET_COMMIT,
     API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH, API_KEY_SYNC_GROUP, ConnectionState,
-    ERROR_GROUP_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+    ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, GatewayState,
+    HandleOutcome,
 };
 use crate::protocol::bounds_guard::{
     validate_delete_groups_shape, validate_describe_groups_shape, validate_find_coordinator_shape,
@@ -64,12 +65,16 @@ use crate::protocol::bounds_guard::{
     validate_list_groups_shape, validate_offset_commit_shape, validate_offset_delete_shape,
     validate_offset_fetch_shape, validate_sync_group_shape,
 };
+use crate::protocol::handlers::txn::may_use_transactional_ids;
 use crate::protocol::handlers::{
     decode_exhaustive, decode_guarded, dispatch_unscoped, encode_message,
 };
 
-/// `FindCoordinator`'s key type for a consumer group. A transactional id (1) is not scoped.
+/// `FindCoordinator`'s key type for a consumer group.
 const GROUP_KEY_TYPE: i8 = 0;
+
+/// `FindCoordinator`'s key type for a transactional id, scoped per principal as well (KW-TXP).
+const TRANSACTION_KEY_TYPE: i8 = 1;
 
 /// Whether `api_key` names consumer groups, and so runs in the principal's namespace.
 pub const fn is_group_api(api_key: i16) -> bool {
@@ -159,19 +164,32 @@ pub async fn handle(
             else {
                 return pass(body).await;
             };
-            if request.key_type != GROUP_KEY_TYPE {
+            // KW-TXP: a transactional id is looked up in the principal's namespace too, and Kafka
+            // asks for DESCRIBE on it (53). With transactions off the handler refuses every
+            // transactional key itself, so the request passes unchanged.
+            let transactional =
+                request.key_type == TRANSACTION_KEY_TYPE && state.transactions.is_some();
+            if request.key_type != GROUP_KEY_TYPE && !transactional {
                 return pass(body).await;
             }
+            let (allowed, refusal) = if transactional {
+                (
+                    may_use_transactional_ids(Some(principal)),
+                    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+                )
+            } else {
+                (allowed, ERROR_GROUP_AUTHORIZATION_FAILED)
+            };
             if !allowed {
                 let refused = |key: StrBytes| {
                     Coordinator::default()
                         .with_key(key)
                         .with_node_id(BrokerId(-1))
                         .with_port(-1)
-                        .with_error_code(ERROR_GROUP_AUTHORIZATION_FAILED)
+                        .with_error_code(refusal)
                 };
                 let answer = FindCoordinatorResponse::default()
-                    .with_error_code(ERROR_GROUP_AUTHORIZATION_FAILED)
+                    .with_error_code(refusal)
                     .with_node_id(BrokerId(-1))
                     .with_port(-1)
                     .with_coordinators(request.coordinator_keys.into_iter().map(refused).collect());

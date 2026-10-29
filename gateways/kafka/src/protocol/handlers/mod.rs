@@ -209,7 +209,7 @@ pub(crate) async fn dispatch_unscoped(
         add_partitions_to_txn::API_KEY => {
             add_partitions_to_txn::handle(state, principal, api_version, body).await
         }
-        end_txn::API_KEY => end_txn::handle(state, api_version, body).await,
+        end_txn::API_KEY => end_txn::handle(state, principal, api_version, body).await,
         add_offsets_to_txn::API_KEY => {
             add_offsets_to_txn::handle(state, principal, api_version, body).await
         }
@@ -223,10 +223,10 @@ pub(crate) async fn dispatch_unscoped(
             write_txn_markers::handle(state, principal, api_version, body).await
         }
         describe_transactions::DESCRIBE_API_KEY => {
-            describe_transactions::describe(state, api_version, body).await
+            describe_transactions::describe(state, principal, api_version, body).await
         }
         describe_transactions::LIST_API_KEY => {
-            describe_transactions::list(state, api_version, body).await
+            describe_transactions::list(state, principal, api_version, body).await
         }
         _ => HandleOutcome::Close,
     }

@@ -25,10 +25,13 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::authz::GroupScope;
 use crate::error::Result;
 use crate::protocol::api::{
-    ApiVersionRange, ERROR_GROUP_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+    ApiVersionRange, ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+    GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_add_offsets_to_txn_shape;
-use crate::protocol::handlers::txn::decode_txn_request;
+use crate::protocol::handlers::txn::{
+    coordinator_key, decode_txn_request, may_use_transactional_ids,
+};
 use crate::protocol::handlers::{encode_message, respond_or_close};
 use crate::transactions::codes;
 
@@ -63,7 +66,8 @@ pub async fn handle(
         Ok(request) => request,
         Err(outcome) => return outcome,
     };
-    let transactional_id = request.transactional_id.to_string();
+    // KW-TXP: the transactional id is the principal's own too, in its namespace.
+    let transactional_id = coordinator_key(principal, request.transactional_id.as_str());
     // KW-10: the group is the principal's own, in its namespace, and group access follows read
     // access to some topic, as for every group API.
     let group = principal.map_or_else(
@@ -72,7 +76,10 @@ pub async fn handle(
     );
     let may_use_group = principal
         .is_none_or(|principal| principal.permissions_known && principal.grants.reads_any_topic());
-    let code = if transactional_id.is_empty() || request.group_id.is_empty() {
+    // As Kafka's `KafkaApis`: WRITE on the transactional id (53) before READ on the group (30).
+    let code = if !may_use_transactional_ids(principal) {
+        ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    } else if transactional_id.is_empty() || request.group_id.is_empty() {
         codes::INVALID_REQUEST
     } else if !may_use_group {
         ERROR_GROUP_AUTHORIZATION_FAILED

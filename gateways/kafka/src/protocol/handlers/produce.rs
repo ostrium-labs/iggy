@@ -41,11 +41,13 @@ use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_PRODUCER_EPOCH,
     ERROR_INVALID_RECORD, ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE,
     ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_REQUEST_TIMED_OUT,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
     ERROR_UNSUPPORTED_COMPRESSION_TYPE, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
     REQUEST_DEADLINE, UNKNOWN_OFFSET, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
+use crate::protocol::handlers::txn::{coordinator_key, may_use_transactional_ids};
 use crate::protocol::handlers::{
     CODEC_OFF_WORKER_BYTES, decode_guarded, encode_message, is_transactional, learn_topic_ids,
     may_topic, off_worker, respond_or_close, unsupported_version_response,
@@ -154,10 +156,28 @@ pub async fn handle(
     // producer. acks=0 has no response to carry it, so the refusal is a close, which is what a
     // Kafka broker does on an acks=0 produce error.
     // KW-T: with transactions on, a transactional request is served against its transaction.
+    // KW-TXP: the transactional id is the principal's own, in its namespace, and Kafka asks for
+    // WRITE on it before anything else, answering 53 for every partition.
     let txn = match (&state.transactions, &request.transactional_id) {
+        (Some(_), Some(id))
+            if is_transactional(Some(id)) && !may_use_transactional_ids(principal) =>
+        {
+            return if request.acks == ACKS_NONE {
+                HandleOutcome::Close
+            } else {
+                respond_or_close(
+                    encode_uniform_response(
+                        api_version,
+                        &request,
+                        ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+                    ),
+                    "Produce",
+                )
+            };
+        }
         (Some(coordinator), Some(id)) if is_transactional(Some(id)) => Some(Txn {
             coordinator: Arc::clone(coordinator),
-            id: id.to_string(),
+            id: coordinator_key(principal, id.as_str()),
         }),
         _ => None,
     };

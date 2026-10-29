@@ -21,10 +21,15 @@
 use bytes::Bytes;
 use kafka_protocol::messages::{EndTxnRequest, EndTxnResponse, ProducerId};
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::error::Result;
-use crate::protocol::api::{ApiVersionRange, GatewayState, HandleOutcome};
+use crate::protocol::api::{
+    ApiVersionRange, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED, GatewayState, HandleOutcome,
+};
 use crate::protocol::bounds_guard::validate_end_txn_shape;
-use crate::protocol::handlers::txn::decode_txn_request;
+use crate::protocol::handlers::txn::{
+    coordinator_key, decode_txn_request, may_use_transactional_ids,
+};
 use crate::protocol::handlers::{encode_message, respond_or_close};
 use crate::transactions::{Outcome, codes};
 
@@ -39,7 +44,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// The first version whose clients know `PRODUCER_FENCED` (KIP-588).
 const PRODUCER_FENCED_VERSION: i16 = 2;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     let Some(coordinator) = state.transactions.as_ref() else {
         return HandleOutcome::Close;
     };
@@ -54,8 +64,11 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         Ok(request) => request,
         Err(outcome) => return outcome,
     };
-    let transactional_id = request.transactional_id.to_string();
-    let code = if transactional_id.is_empty() {
+    // KW-TXP: the id is the principal's own, in its namespace; Kafka asks for WRITE on it (53).
+    let transactional_id = coordinator_key(principal, request.transactional_id.as_str());
+    let code = if !may_use_transactional_ids(principal) {
+        ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    } else if transactional_id.is_empty() {
         codes::INVALID_REQUEST
     } else {
         let outcome = if request.committed {

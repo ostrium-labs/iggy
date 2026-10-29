@@ -866,6 +866,13 @@ so until then any principal that may write can use, and so fence, another's tran
 groups are, with the bridge's Iggy user as the ceiling. It changes KW-T's coordinator keys, so it
 lands as a follow-up PR after this one and KW-T step 3, coordinated with the KW-T work.
 
+**KW-TXP (written 2026-10-27, not yet compiled or run):** the follow-up. Every transaction API
+scopes the id as `<length>:<principal>/<id>` before the coordinator sees it; `DescribeTransactions`
+and `ListTransactions` answer only the caller's own ids; access follows topic write access, and a
+principal without it gets `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) from every transaction API,
+checked first as in Kafka 4.3.1. See `gateways/kafka/docs/TRANSACTIONS.md`, "Transactional ids per
+principal".
+
 ### KW-11. Repeated header names and header order
 
 **Why.** KafkaJS array headers, Spring trace headers; error 87 is fatal in
