@@ -113,6 +113,7 @@ async fn commit(state: &GatewayState, partitions: &[(i32, i64, Option<&str>)]) -
     let mut response = offset_commit::handle(
         state,
         &ConnectionState::default(),
+        None,
         COMMIT_VERSION,
         encode(&request, COMMIT_VERSION),
     )
@@ -138,6 +139,7 @@ async fn fetch(state: &GatewayState) -> Vec<(i64, String)> {
     let mut response = offset_fetch::handle(
         state,
         &ConnectionState::default(),
+        None,
         FETCH_VERSION,
         encode(&request, FETCH_VERSION),
     )

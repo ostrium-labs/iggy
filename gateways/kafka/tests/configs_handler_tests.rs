@@ -35,7 +35,6 @@ use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
-use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
     ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState,
     is_supported_version, supported_api_ranges,
@@ -79,6 +78,7 @@ async fn describe_configs_without_a_bridge_returns_not_controller() {
         .with_include_documentation(false);
     let outcome = describe_configs::handle(
         &state_without_bridge(),
+        None,
         DESCRIBE_VERSION,
         encode(&request, DESCRIBE_VERSION),
     )
@@ -197,13 +197,15 @@ async fn incremental_alter_configs_over_the_cap_is_rejected_even_with_the_bridge
 /// never reaches `NOT_CONTROLLER`, and an allowed one does.
 #[tokio::test]
 async fn incremental_alter_configs_requires_manage_topics_before_the_stub() {
-    let principal = |manage_topics| AuthenticatedPrincipal {
-        username: "alice".to_string(),
-        permissions: PrincipalPermissions {
-            manage_topics,
-            ..PrincipalPermissions::default()
-        },
-        permissions_known: true,
+    let principal = |manage_topics| {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
+                manage_topics,
+                ..iggy::prelude::GlobalPermissions::default()
+            },
+            true,
+        )
     };
 
     let denied = incremental_alter(
@@ -255,6 +257,7 @@ async fn describe_configs_over_the_cap_is_rejected_even_with_the_bridge_off() {
         .with_include_documentation(false);
     let outcome = describe_configs::handle(
         &state_without_bridge(),
+        None,
         DESCRIBE_VERSION,
         encode(&request, DESCRIBE_VERSION),
     )

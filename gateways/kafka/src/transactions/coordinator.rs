@@ -72,7 +72,13 @@ pub struct TransactionConfig {
     /// The coordinator epoch every marker carries. 0 until several gateways share the log
     /// (KW-5), when it becomes the owner's lease epoch.
     pub coordinator_epoch: i32,
+    /// Kafka's `transactional.id.expiration.ms`: an id with no transaction open and no change for
+    /// this long is forgotten (a `Dead` record), with its producer id.
+    pub id_expiration: Duration,
 }
+
+/// Kafka's `transactional.id.expiration.ms` default: 7 days.
+pub const DEFAULT_ID_EXPIRATION: Duration = Duration::from_hours(24 * 7);
 
 impl Default for TransactionConfig {
     fn default() -> Self {
@@ -80,6 +86,7 @@ impl Default for TransactionConfig {
             max_timeout: DEFAULT_MAX_TIMEOUT,
             abort_interval: DEFAULT_ABORT_INTERVAL,
             coordinator_epoch: 0,
+            id_expiration: DEFAULT_ID_EXPIRATION,
         }
     }
 }
@@ -122,6 +129,18 @@ pub trait DataPlane: Send + Sync + 'static {
     ///
     /// The bridge's error. The marker may still land; it is written again.
     async fn write_marker(&self, marker: &Marker) -> Result<Landed, BridgeError>;
+
+    /// Stores `offsets` as `group`'s committed offsets: what a committed transaction's
+    /// `TxnOffsetCommit` stored becomes visible. Writing the same offsets again changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The bridge's error for any partition; the whole set is written again.
+    async fn commit_offsets(
+        &self,
+        group: &str,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<(), BridgeError>;
 }
 
 /// Hands out a producer id for a new transactional id, or `None` once the space is spent.
@@ -317,6 +336,10 @@ impl TransactionCoordinator {
         let mut producers = Vec::with_capacity(replayed.metadata.len());
         let mut loaded = Vec::with_capacity(replayed.metadata.len());
         for (transactional_id, metadata) in replayed.metadata {
+            // An expired id is forgotten; its last record is the `Dead` one.
+            if metadata.state == TxnState::Dead {
+                continue;
+            }
             if metadata.state.is_open() {
                 for (partition, start) in &metadata.partitions {
                     self.index.open(
@@ -365,7 +388,10 @@ impl TransactionCoordinator {
         loop {
             tokio::select! {
                 () = self.cancel.cancelled() => return,
-                _ = tick.tick() => self.abort_timed_out().await,
+                _ = tick.tick() => {
+                    self.abort_timed_out().await;
+                    self.expire_idle().await;
+                }
             }
         }
     }
@@ -410,6 +436,134 @@ impl TransactionCoordinator {
                 }
             }
         }
+    }
+
+    /// Forgets every transactional id idle past [`TransactionConfig::id_expiration`], as Kafka's
+    /// `removeExpiredTransactionalIds` does: no transaction open, no change for that long. A
+    /// `Dead` record goes to the log first; a later `InitProducerId` starts the id over with a new
+    /// producer id.
+    pub async fn expire_idle(self: &Arc<Self>) {
+        if !self.is_loaded() {
+            return;
+        }
+        let expiry = i64::try_from(self.config.id_expiration.as_millis()).unwrap_or(i64::MAX);
+        let idle = |metadata: &TxnMetadata, now: i64| {
+            matches!(
+                metadata.state,
+                TxnState::Empty | TxnState::CompleteCommit | TxnState::CompleteAbort
+            ) && metadata.update_ms.saturating_add(expiry) < now
+        };
+        let now = self.now();
+        let candidates: Vec<(String, Arc<Entry>)> = self
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, entry)| idle(&entry.metadata(), now))
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+            .collect();
+        for (transactional_id, entry) in candidates {
+            let _turn = entry.transition.lock().await;
+            let current = entry.metadata();
+            if !idle(&current, self.now()) {
+                continue;
+            }
+            let dead = TxnMetadata {
+                state: TxnState::Dead,
+                update_ms: self.now(),
+                ..current.clone()
+            };
+            if let Err(error) = self.append(&dead, Vec::new()).await {
+                debug!(%error, transactional_id, "could not expire a transactional id yet");
+                continue;
+            }
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&transactional_id);
+            self.by_producer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&current.producer_id);
+            info!(transactional_id, "expired an idle transactional id");
+        }
+    }
+
+    /// `WriteTxnMarkers` from an operator (`kafka-transactions.sh abort`, KIP-664): writes the
+    /// marker of `producer_id` at `epoch` to `partition` and records its range, so a transaction
+    /// left hanging on a partition (its records with no marker) is ended. The range starts after
+    /// the producer's last marker there, or at its open transaction's first offset when this
+    /// coordinator knows one.
+    ///
+    /// # Errors
+    ///
+    /// `UNKNOWN_TOPIC_OR_PARTITION`, or `NOT_ENOUGH_REPLICAS` (retriable) when Iggy cannot take
+    /// the marker or the log record now.
+    pub async fn write_admin_marker(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        coordinator_epoch: i32,
+        commit: bool,
+        partition: &TopicPartition,
+    ) -> Result<(), i16> {
+        let control = if commit {
+            ControlType::Commit
+        } else {
+            ControlType::Abort
+        };
+        let marker = Marker {
+            topic: partition.0.clone(),
+            partition: partition.1,
+            producer_id,
+            user: None,
+            epoch,
+            control,
+            coordinator_epoch,
+        };
+        let refusal = |error: BridgeError| match error.to_kafka_error_code() {
+            codes::UNKNOWN_TOPIC_OR_PARTITION => codes::UNKNOWN_TOPIC_OR_PARTITION,
+            _ => codes::NOT_ENOUGH_REPLICAS,
+        };
+        let landed = tokio::time::timeout(MARKER_ATTEMPT, self.data.write_marker(&marker))
+            .await
+            .map_err(|_| codes::NOT_ENOUGH_REPLICAS)?
+            .map_err(refusal)?;
+        let (last, exact) = match landed {
+            Landed::At(offset) => (offset, true),
+            Landed::Below(watermark) => (watermark, false),
+        };
+        let first = self
+            .index
+            .first_of(partition, producer_id)
+            .or_else(|| self.index.after_marker(partition, producer_id))
+            .unwrap_or(0)
+            .min(last);
+        let range = EndedRange {
+            topic: partition.0.clone(),
+            partition: partition.1,
+            producer_id,
+            first,
+            last,
+            exact,
+        };
+        let record = LogRecord::admin(producer_id, epoch, !commit, vec![range.clone()], self.now());
+        let log_partition =
+            u32::try_from(producer_id.rem_euclid(i64::from(LOG_PARTITIONS))).unwrap_or(0);
+        self.log
+            .append(log_partition, &record)
+            .await
+            .map_err(|_| codes::NOT_ENOUGH_REPLICAS)?;
+        self.index.end(&range, !commit);
+        info!(
+            producer_id,
+            epoch,
+            topic = partition.0,
+            partition = partition.1,
+            ?control,
+            "wrote an operator's transaction marker"
+        );
+        Ok(())
     }
 
     /// Writes `metadata` to the log.
@@ -692,6 +846,59 @@ impl TransactionCoordinator {
         Ok(())
     }
 
+    /// `TxnOffsetCommit`: stores `offsets` of `group` in the producer's transaction.
+    ///
+    /// # Errors
+    ///
+    /// The Kafka error to answer for every partition.
+    pub async fn txn_offset_commit(
+        self: &Arc<Self>,
+        transactional_id: &str,
+        producer_id: i64,
+        epoch: i16,
+        group: &str,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<(), i16> {
+        if !self.is_loaded() {
+            return Err(codes::COORDINATOR_LOAD_IN_PROGRESS);
+        }
+        let entry = self
+            .entry(transactional_id)
+            .ok_or(codes::INVALID_PRODUCER_ID_MAPPING)?;
+        let _turn = entry.transition.lock().await;
+        let next =
+            entry
+                .metadata()
+                .commit_offsets(producer_id, epoch, group, offsets, self.now())?;
+        self.append(&next, Vec::new())
+            .await
+            .map_err(|error| log_failed(&error, transactional_id))?;
+        self.publish(&entry, next);
+        Ok(())
+    }
+
+    /// Whether an open transaction holds an offset of `group` for `partition` that it has not
+    /// committed yet: `OffsetFetch` with `require_stable` then answers `UNSTABLE_OFFSET_COMMIT`
+    /// (KIP-447).
+    #[must_use]
+    pub fn has_pending_offset(&self, group: &str, partition: &TopicPartition) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|entry| {
+                let metadata = entry
+                    .metadata
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                metadata.state.is_open()
+                    && metadata
+                        .offsets
+                        .get(group)
+                        .is_some_and(|offsets| offsets.contains_key(partition))
+            })
+    }
+
     /// Checks a transactional Produce batch against its transaction, before it is written.
     ///
     /// # Errors
@@ -788,7 +995,23 @@ impl TransactionCoordinator {
                 exact,
             });
         }
-        // Group offsets of the transaction are materialized here (KW-T step 3).
+        // A committed transaction's offsets become the groups' committed offsets before it is
+        // complete, as Kafka's commit marker on `__consumer_offsets` makes them visible.
+        if control == ControlType::Commit {
+            for (group, offsets) in &prepared.offsets {
+                loop {
+                    match self.data.commit_offsets(group, offsets).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            debug!(%error, transactional_id, group, "transaction offsets not committed yet");
+                        }
+                    }
+                    if self.sleep_or_cancelled(RETRY_BACKOFF).await {
+                        return;
+                    }
+                }
+            }
+        }
         loop {
             let turn = entry.transition.lock().await;
             let current = entry.metadata();
@@ -881,6 +1104,7 @@ mod tests {
     struct MemoryData {
         markers: Mutex<Vec<Marker>>,
         next: AtomicU64,
+        committed: Mutex<BTreeMap<(String, TopicPartition), i64>>,
     }
 
     #[async_trait]
@@ -900,6 +1124,19 @@ mod tests {
         async fn write_marker(&self, marker: &Marker) -> Result<Landed, BridgeError> {
             self.markers.lock().unwrap().push(marker.clone());
             Ok(Landed::At(self.next.fetch_add(1, Ordering::Relaxed)))
+        }
+
+        async fn commit_offsets(
+            &self,
+            group: &str,
+            offsets: &BTreeMap<TopicPartition, i64>,
+        ) -> Result<(), BridgeError> {
+            self.committed.lock().unwrap().extend(
+                offsets
+                    .iter()
+                    .map(|(partition, offset)| ((group.to_string(), partition.clone()), *offset)),
+            );
+            Ok(())
         }
     }
 
@@ -1190,5 +1427,134 @@ mod tests {
             .unwrap();
         let start = coordinator.describe("tx").unwrap().partitions[&tp("t", 0)].start;
         assert_eq!(start, Some(marker + 1));
+    }
+
+    #[tokio::test]
+    async fn given_offsets_in_a_transaction_should_commit_them_only_when_it_commits() {
+        let (log, data) = (
+            Arc::new(MemoryLog::default()),
+            Arc::new(MemoryData::default()),
+        );
+        let coordinator = loaded(&log, &data).await;
+        let (id, epoch) = coordinator
+            .init_producer_id("eos", 60_000, None)
+            .await
+            .unwrap();
+        let offsets = BTreeMap::from([(tp("in", 0), 42)]);
+        assert_eq!(
+            coordinator
+                .txn_offset_commit("eos", id, epoch, "g", &offsets)
+                .await,
+            Err(codes::INVALID_TXN_STATE),
+            "the group was not added"
+        );
+        coordinator
+            .add_offsets("eos", id, epoch, "g")
+            .await
+            .unwrap();
+        coordinator
+            .add_partitions("eos", id, epoch, &[tp("out", 0)], None)
+            .await
+            .unwrap();
+        coordinator
+            .txn_offset_commit("eos", id, epoch, "g", &offsets)
+            .await
+            .unwrap();
+        assert!(coordinator.has_pending_offset("g", &tp("in", 0)));
+        assert!(!coordinator.has_pending_offset("g", &tp("in", 1)));
+        assert_eq!(
+            coordinator
+                .txn_offset_commit("eos", id, epoch + 1, "g", &offsets)
+                .await,
+            Err(codes::INVALID_PRODUCER_EPOCH)
+        );
+        coordinator
+            .end_txn("eos", id, epoch, Outcome::Commit)
+            .await
+            .unwrap();
+        assert_eq!(settle(&coordinator, "eos").await, TxnState::CompleteCommit);
+        assert!(!coordinator.has_pending_offset("g", &tp("in", 0)));
+        assert_eq!(
+            data.committed
+                .lock()
+                .unwrap()
+                .get(&("g".to_string(), tp("in", 0))),
+            Some(&42)
+        );
+
+        coordinator
+            .add_offsets("eos", id, epoch, "g")
+            .await
+            .unwrap();
+        coordinator
+            .txn_offset_commit("eos", id, epoch, "g", &BTreeMap::from([(tp("in", 0), 99)]))
+            .await
+            .unwrap();
+        coordinator
+            .end_txn("eos", id, epoch, Outcome::Abort)
+            .await
+            .unwrap();
+        assert_eq!(settle(&coordinator, "eos").await, TxnState::CompleteAbort);
+        assert_eq!(
+            data.committed
+                .lock()
+                .unwrap()
+                .get(&("g".to_string(), tp("in", 0))),
+            Some(&42),
+            "an aborted transaction's offsets are dropped"
+        );
+        let replayed = log
+            .records()
+            .iter()
+            .rev()
+            .map(LogRecord::metadata)
+            .find(|metadata| !metadata.offsets.is_empty())
+            .expect("the offsets are in the log");
+        assert_eq!(replayed.offsets["g"][&tp("in", 0)], 99);
+    }
+
+    #[tokio::test]
+    async fn given_an_idle_id_past_its_expiry_should_forget_it_and_stay_forgotten() {
+        let (log, data) = (
+            Arc::new(MemoryLog::default()),
+            Arc::new(MemoryData::default()),
+        );
+        let config = TransactionConfig {
+            id_expiration: Duration::from_millis(10),
+            ..TransactionConfig::default()
+        };
+        let coordinator = TransactionCoordinator::with_clock(
+            config.clone(),
+            Arc::clone(&log) as Arc<dyn TxnLog>,
+            Arc::clone(&data) as Arc<dyn DataPlane>,
+            Arc::new(|| Some(900)),
+            wall_clock_ms,
+        );
+        coordinator.load().await;
+        let (id, _) = coordinator
+            .init_producer_id("old", 60_000, None)
+            .await
+            .unwrap();
+        coordinator.expire_idle().await;
+        assert!(
+            coordinator.describe("old").is_some(),
+            "not idle long enough yet"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        coordinator.expire_idle().await;
+        assert!(coordinator.describe("old").is_none());
+        assert!(!coordinator.knows_producer(id));
+        let replayed = TransactionCoordinator::with_clock(
+            config,
+            Arc::clone(&log) as Arc<dyn TxnLog>,
+            data,
+            Arc::new(|| Some(901)),
+            wall_clock_ms,
+        );
+        replayed.load().await;
+        assert!(
+            replayed.describe("old").is_none(),
+            "the Dead record keeps it forgotten"
+        );
     }
 }

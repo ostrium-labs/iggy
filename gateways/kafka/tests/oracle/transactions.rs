@@ -35,7 +35,7 @@ use kafka_protocol::records::{
 
 use super::{
     Context, Facts, TIMEOUT_MS, WireClient, await_topic, coordinator_loading, create_topic,
-    fetch_raw, now_ms, s, topic, version,
+    fetch_raw, find_group_coordinator, now_ms, s, topic, version,
 };
 
 /// Codes a client retries on, while a coordinator loads or markers are being written.
@@ -461,4 +461,634 @@ fn clone(producer: &Producer) -> Producer {
         epoch: producer.epoch,
         sequence: producer.sequence,
     }
+}
+
+/// What a Java `read_committed` consumer keeps of one Fetch answer: the data records of batches
+/// not aborted, by `CompletedFetch`'s rules (an aborted transaction joins the aborted set once a
+/// batch reaches its first offset, and its abort marker takes it out).
+fn committed_view(
+    answer: &kafka_protocol::messages::fetch_response::PartitionData,
+    bytes: Bytes,
+) -> Result<Vec<String>, String> {
+    let mut aborted: Vec<(i64, i64)> = answer
+        .aborted_transactions
+        .iter()
+        .flatten()
+        .map(|txn| (txn.first_offset, txn.producer_id.0))
+        .collect();
+    aborted.sort_unstable();
+    let mut aborted = aborted.into_iter().peekable();
+    let mut aborted_producers = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    let mut bytes = bytes;
+    for set in RecordBatchDecoder::decode_all(&mut bytes)
+        .map_err(|error| format!("decode records: {error}"))?
+    {
+        let Some(first) = set.records.first() else {
+            continue;
+        };
+        let last = set
+            .records
+            .last()
+            .map_or(first.offset, |record| record.offset);
+        if first.producer_id >= 0 {
+            while let Some((_, producer)) = aborted.next_if(|(offset, _)| *offset <= last) {
+                aborted_producers.insert(producer);
+            }
+            if first.control {
+                let abort = first.key.as_ref().and_then(|key| key.get(2..4)) == Some(&[0, 0][..]);
+                if abort {
+                    aborted_producers.remove(&first.producer_id);
+                }
+                continue;
+            }
+            if first.transactional && aborted_producers.contains(&first.producer_id) {
+                continue;
+            }
+        }
+        values.extend(
+            set.records
+                .iter()
+                .filter(|record| !record.control)
+                .map(|record| {
+                    record.value.as_ref().map_or_else(String::new, |value| {
+                        String::from_utf8_lossy(value).into_owned()
+                    })
+                }),
+        );
+    }
+    Ok(values)
+}
+
+/// A Fetch of partition 0 from `offset` at `isolation`, recorded under `label`: the values a Java
+/// consumer keeps, the last stable offset, the high watermark, and the aborted transactions
+/// listed.
+async fn read_at(
+    client: &mut WireClient,
+    name: &str,
+    offset: i64,
+    isolation: i8,
+    facts: &mut Facts,
+    label: &str,
+) -> Result<(), String> {
+    let (answer, bytes) = fetch_raw(client, name, 0, offset, isolation)
+        .await
+        .map_err(|error| format!("Fetch {label}: {error}"))?;
+    facts.set(format!("{label}.error"), answer.error_code);
+    facts.set(format!("{label}.high_watermark"), answer.high_watermark);
+    facts.set(
+        format!("{label}.last_stable_offset"),
+        answer.last_stable_offset,
+    );
+    facts.set(
+        format!("{label}.values"),
+        committed_view(&answer, bytes)?.join(","),
+    );
+    facts.set(
+        format!("{label}.aborted"),
+        answer.aborted_transactions.as_ref().map_or_else(
+            || "null".to_string(),
+            |list| {
+                list.iter()
+                    .map(|txn| txn.first_offset.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+        ),
+    );
+    Ok(())
+}
+
+/// `ListOffsets` `LATEST` of partition 0 at `isolation`.
+async fn latest(client: &mut WireClient, name: &str, isolation: i8) -> Result<(i16, i64), String> {
+    use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
+    let request = kafka_protocol::messages::ListOffsetsRequest::default()
+        .with_replica_id(kafka_protocol::messages::BrokerId(-1))
+        .with_isolation_level(isolation)
+        .with_topics(vec![
+            ListOffsetsTopic::default()
+                .with_name(topic(name))
+                .with_partitions(vec![
+                    ListOffsetsPartition::default()
+                        .with_partition_index(0)
+                        .with_current_leader_epoch(-1)
+                        .with_timestamp(-1),
+                ]),
+        ]);
+    let list_version = version(client, ApiKey::ListOffsets, 7)?;
+    let response = client
+        .send(&request, list_version)
+        .await
+        .map_err(|error| format!("ListOffsets: {error}"))?;
+    let answer = response
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .ok_or_else(|| "ListOffsets answered no partition".to_string())?;
+    Ok((answer.error_code, answer.offset))
+}
+
+/// `read_committed` on one partition: a commit, an abort, and an open transaction with a plain
+/// record after it. The open one holds the last stable offset, the aborted one is listed, and a
+/// consumer keeps only committed records; once the open one commits, everything up to the high
+/// watermark is stable.
+pub async fn read_committed(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let name = cx.name("read_committed", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let transactional_id = cx.name("read_committed", "tx");
+    find_coordinator(client, &transactional_id).await?;
+    let (error, producer_id, epoch) = init(client, &transactional_id, 60_000).await?;
+    if error != 0 {
+        return Err(format!("InitProducerId answered {error}"));
+    }
+    let mut producer = Producer {
+        id: transactional_id,
+        producer_id,
+        epoch,
+        sequence: 0,
+    };
+    for (values, commit) in [(&["c1", "c2"][..], true), (&["a1"][..], false)] {
+        add_partitions(client, &producer, &name, &[0]).await?;
+        let batch = txn_batch(&mut producer, values)?;
+        produce_txn(client, &producer, &name, 0, batch).await?;
+        end_settled(client, &producer, commit).await?;
+    }
+    // Both markers in place before the next transaction starts writing.
+    let mut high_watermark = 0;
+    for _ in 0..60 {
+        high_watermark = fetch_raw(client, &name, 0, 0, 0).await?.0.high_watermark;
+        if high_watermark >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("before_open.high_watermark", high_watermark);
+    add_partitions(client, &producer, &name, &[0]).await?;
+    let batch = txn_batch(&mut producer, &["o1"])?;
+    facts.set(
+        "open.produce.error",
+        produce_txn(client, &producer, &name, 0, batch).await?.0,
+    );
+    let plain = super::batch(&[(Some("k"), Some("plain"), &[])], now_ms())?;
+    facts.set(
+        "plain.produce.error",
+        super::produce(client, &name, 0, plain).await?.0,
+    );
+
+    read_at(client, &name, 0, 1, facts, "open.committed").await?;
+    read_at(client, &name, 0, 0, facts, "open.uncommitted").await?;
+    read_at(client, &name, 4, 1, facts, "open.committed_from_marker").await?;
+    let (error, offset) = latest(client, &name, 1).await?;
+    facts.set("open.latest_committed", format!("{error}:{offset}"));
+    let (error, offset) = latest(client, &name, 0).await?;
+    facts.set("open.latest_uncommitted", format!("{error}:{offset}"));
+
+    end_settled(client, &producer, true).await?;
+    let mut stable = 0;
+    for _ in 0..60 {
+        let (answer, _) = fetch_raw(client, &name, 0, 0, 1).await?;
+        stable = answer.last_stable_offset;
+        if stable >= 8 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("after.stable_reached", stable);
+    read_at(client, &name, 0, 1, facts, "after.committed").await?;
+    let (error, offset) = latest(client, &name, 1).await?;
+    facts.set("after.latest_committed", format!("{error}:{offset}"));
+    Ok(())
+}
+
+/// `AddOffsetsToTxn` for `group`, retried while retriable.
+async fn add_offsets(
+    client: &mut WireClient,
+    producer: &Producer,
+    group: &str,
+) -> Result<i16, String> {
+    let add_version = version(client, ApiKey::AddOffsetsToTxn, 3)?.min(3);
+    let request = kafka_protocol::messages::AddOffsetsToTxnRequest::default()
+        .with_transactional_id(TransactionalId(s(&producer.id)))
+        .with_producer_id(ProducerId(producer.producer_id))
+        .with_producer_epoch(producer.epoch)
+        .with_group_id(kafka_protocol::messages::GroupId(s(group)));
+    let mut error = 0;
+    for _ in 0..120 {
+        error = client
+            .send(&request, add_version)
+            .await
+            .map_err(|error| format!("AddOffsetsToTxn: {error}"))?
+            .error_code;
+        if !retriable(error) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(error)
+}
+
+/// `TxnOffsetCommit` of `offset` for partition 0 of `name`, standalone (no member), retried while
+/// retriable. Its code.
+async fn txn_commit(
+    client: &mut WireClient,
+    producer: &Producer,
+    group: &str,
+    name: &str,
+    offset: i64,
+) -> Result<i16, String> {
+    use kafka_protocol::messages::txn_offset_commit_request::{
+        TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+    };
+    let commit_version = version(client, ApiKey::TxnOffsetCommit, 3)?.min(3);
+    let request = kafka_protocol::messages::TxnOffsetCommitRequest::default()
+        .with_transactional_id(TransactionalId(s(&producer.id)))
+        .with_group_id(kafka_protocol::messages::GroupId(s(group)))
+        .with_producer_id(ProducerId(producer.producer_id))
+        .with_producer_epoch(producer.epoch)
+        .with_generation_id(-1)
+        .with_member_id(s(""))
+        .with_topics(vec![
+            TxnOffsetCommitRequestTopic::default()
+                .with_name(topic(name))
+                .with_partitions(vec![
+                    TxnOffsetCommitRequestPartition::default()
+                        .with_partition_index(0)
+                        .with_committed_offset(offset)
+                        .with_committed_leader_epoch(-1),
+                ]),
+        ]);
+    let mut error = 0;
+    for _ in 0..120 {
+        let response = client
+            .send(&request, commit_version)
+            .await
+            .map_err(|error| format!("TxnOffsetCommit: {error}"))?;
+        error = response
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .map_or(-2, |partition| partition.error_code);
+        if !retriable(error) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(error)
+}
+
+/// `OffsetFetch` v7 of partition 0 of `name` for `group`: `"error:offset"` of the partition.
+async fn committed_offset(
+    client: &mut WireClient,
+    group: &str,
+    name: &str,
+    require_stable: bool,
+) -> Result<String, String> {
+    use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic;
+    let fetch_version = version(client, ApiKey::OffsetFetch, 7)?.min(7);
+    let request = kafka_protocol::messages::OffsetFetchRequest::default()
+        .with_group_id(kafka_protocol::messages::GroupId(s(group)))
+        .with_topics(Some(vec![
+            OffsetFetchRequestTopic::default()
+                .with_name(topic(name))
+                .with_partition_indexes(vec![0]),
+        ]))
+        .with_require_stable(require_stable);
+    // A group coordinator loads its partition on first use: 14 and 16 until then.
+    for _ in 0..60 {
+        let response = client
+            .send(&request, fetch_version)
+            .await
+            .map_err(|error| format!("OffsetFetch: {error}"))?;
+        if let Some(partition) = response
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+        {
+            return Ok(format!(
+                "{}:{}",
+                partition.error_code, partition.committed_offset
+            ));
+        }
+        if !retriable(response.error_code) {
+            return Err(format!(
+                "OffsetFetch answered no partition (error {})",
+                response.error_code
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err("OffsetFetch kept answering retriable codes".to_string())
+}
+
+/// Consume-transform-produce on the wire (KIP-98, KIP-447): a transaction writes a record and
+/// commits the input group's offset; the offset is unstable while the transaction is open, and
+/// committed only when it commits. An aborted one leaves the committed offset as it was.
+pub async fn exactly_once(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let input = cx.name("exactly_once", "in");
+    let output = cx.name("exactly_once", "out");
+    for name in [&input, &output] {
+        create_topic(client, name, &[]).await?;
+        await_topic(client, name).await?;
+    }
+    let group = cx.name("exactly_once", "g");
+    find_group_coordinator(client, &group).await?;
+    let transactional_id = cx.name("exactly_once", "tx");
+    find_coordinator(client, &transactional_id).await?;
+    let (error, producer_id, epoch) = init(client, &transactional_id, 60_000).await?;
+    if error != 0 {
+        return Err(format!("InitProducerId answered {error}"));
+    }
+    let mut producer = Producer {
+        id: transactional_id,
+        producer_id,
+        epoch,
+        sequence: 0,
+    };
+
+    facts.set(
+        "commit_without_add.error",
+        txn_commit(client, &producer, &group, &input, 1).await?,
+    );
+    add_partitions(client, &producer, &output, &[0]).await?;
+    let batch = txn_batch(&mut producer, &["out1"])?;
+    produce_txn(client, &producer, &output, 0, batch).await?;
+    facts.set(
+        "add_offsets.error",
+        add_offsets(client, &producer, &group).await?,
+    );
+    facts.set(
+        "txn_commit.error",
+        txn_commit(client, &producer, &group, &input, 2).await?,
+    );
+    facts.set(
+        "open.stable",
+        committed_offset(client, &group, &input, true).await?,
+    );
+    facts.set(
+        "open.unstable_read",
+        committed_offset(client, &group, &input, false).await?,
+    );
+    facts.set("commit.error", end_settled(client, &producer, true).await?);
+    let mut after = String::new();
+    for _ in 0..60 {
+        after = committed_offset(client, &group, &input, true).await?;
+        if !after.starts_with("88:") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("after_commit.stable", after);
+
+    add_partitions(client, &producer, &output, &[0]).await?;
+    let batch = txn_batch(&mut producer, &["out2"])?;
+    produce_txn(client, &producer, &output, 0, batch).await?;
+    add_offsets(client, &producer, &group).await?;
+    txn_commit(client, &producer, &group, &input, 5).await?;
+    facts.set("abort.error", end_settled(client, &producer, false).await?);
+    let mut after = String::new();
+    for _ in 0..60 {
+        after = committed_offset(client, &group, &input, true).await?;
+        if !after.starts_with("88:") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    facts.set("after_abort.stable", after);
+
+    let (_, _, bumped) = init(client, &producer.id, 60_000).await?;
+    facts.set("reinit.epoch_bump", bumped - producer.epoch);
+    let stale = Producer {
+        epoch: producer.epoch,
+        ..clone(&producer)
+    };
+    facts.set(
+        "fenced_add_offsets.error",
+        add_offsets(client, &stale, &group).await?,
+    );
+    facts.set(
+        "fenced_txn_commit.error",
+        txn_commit(client, &stale, &group, &input, 9).await?,
+    );
+    Ok(())
+}
+
+/// `kafka-transactions.sh`'s requests on the wire (KIP-664): `DescribeTransactions`,
+/// `ListTransactions` filtered to one producer, `DescribeProducers`, and the operator's abort of a
+/// hanging transaction with `WriteTxnMarkers`, which a `read_committed` reader then honours.
+#[allow(clippy::too_many_lines)] // one scenario, read top to bottom
+pub async fn transaction_admin(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    use kafka_protocol::messages::describe_producers_request::TopicRequest;
+    use kafka_protocol::messages::write_txn_markers_request::{
+        WritableTxnMarker, WritableTxnMarkerTopic,
+    };
+    use kafka_protocol::messages::{
+        DescribeProducersRequest, DescribeTransactionsRequest, ListTransactionsRequest,
+        WriteTxnMarkersRequest,
+    };
+
+    let name = cx.name("transaction_admin", "t");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    let transactional_id = cx.name("transaction_admin", "tx");
+    find_coordinator(client, &transactional_id).await?;
+    let (error, producer_id, epoch) = init(client, &transactional_id, 600_000).await?;
+    if error != 0 {
+        return Err(format!("InitProducerId answered {error}"));
+    }
+    let mut producer = Producer {
+        id: transactional_id.clone(),
+        producer_id,
+        epoch,
+        sequence: 0,
+    };
+    add_partitions(client, &producer, &name, &[0]).await?;
+    let records = txn_batch(&mut producer, &["hanging"])?;
+    produce_txn(client, &producer, &name, 0, records).await?;
+
+    let describe_version = version(client, ApiKey::DescribeTransactions, 0)?;
+    let described = client
+        .send(
+            &DescribeTransactionsRequest::default().with_transactional_ids(vec![
+                TransactionalId(s(&transactional_id)),
+                TransactionalId(s(&cx.name("transaction_admin", "nobody"))),
+            ]),
+            describe_version,
+        )
+        .await
+        .map_err(|error| format!("DescribeTransactions: {error}"))?;
+    let known = described
+        .transaction_states
+        .iter()
+        .find(|state| state.transactional_id.as_str() == transactional_id)
+        .ok_or("DescribeTransactions left out the id")?;
+    facts.set("describe.error", known.error_code);
+    facts.set("describe.state", known.transaction_state.as_str());
+    facts.set("describe.same_producer", known.producer_id.0 == producer_id);
+    facts.set("describe.epoch", known.producer_epoch);
+    facts.set("describe.timeout_ms", known.transaction_timeout_ms);
+    facts.set(
+        "describe.partitions",
+        format!(
+            "{:?}",
+            known
+                .topics
+                .iter()
+                .map(|topic| topic.partitions.clone())
+                .collect::<Vec<_>>()
+        ),
+    );
+    facts.set(
+        "describe.unknown.error",
+        described
+            .transaction_states
+            .iter()
+            .find(|state| state.transactional_id.as_str() != transactional_id)
+            .map_or(-2, |state| state.error_code),
+    );
+
+    let list_version = version(client, ApiKey::ListTransactions, 1)?.min(1);
+    let listed = client
+        .send(
+            &ListTransactionsRequest::default()
+                .with_state_filters(vec![s("Ongoing"), s("NoSuchState")])
+                .with_producer_id_filters(vec![ProducerId(producer_id)])
+                .with_duration_filter(-1),
+            list_version,
+        )
+        .await
+        .map_err(|error| format!("ListTransactions: {error}"))?;
+    facts.set("list.error", listed.error_code);
+    facts.set(
+        "list.unknown_filters",
+        listed
+            .unknown_state_filters
+            .iter()
+            .map(|filter| filter.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    facts.set(
+        "list.states",
+        listed
+            .transaction_states
+            .iter()
+            .map(|state| {
+                format!(
+                    "{}:{}",
+                    state.transactional_id.as_str() == transactional_id,
+                    state.transaction_state.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+
+    let producers_version = version(client, ApiKey::DescribeProducers, 0)?;
+    let producers_request = DescribeProducersRequest::default().with_topics(vec![
+        TopicRequest::default()
+            .with_name(topic(&name))
+            .with_partition_indexes(vec![0]),
+    ]);
+    let producers = client
+        .send(&producers_request, producers_version)
+        .await
+        .map_err(|error| format!("DescribeProducers: {error}"))?;
+    let partition = producers
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .ok_or("DescribeProducers answered no partition")?;
+    facts.set("producers.error", partition.error_code);
+    let active = partition
+        .active_producers
+        .iter()
+        .find(|active| active.producer_id.0 == producer_id);
+    facts.set("producers.lists_ours", active.is_some());
+    facts.set(
+        "producers.epoch",
+        active.map_or(-1, |active| active.producer_epoch),
+    );
+    facts.set(
+        "producers.last_sequence",
+        active.map_or(-2, |active| active.last_sequence),
+    );
+    facts.set(
+        "producers.txn_start_offset",
+        active.map_or(-2, |active| active.current_txn_start_offset),
+    );
+    let coordinator_epoch = active.map_or(0, |active| active.coordinator_epoch);
+
+    let markers_version = version(client, ApiKey::WriteTxnMarkers, 1)?.min(1);
+    let abort = WriteTxnMarkersRequest::default().with_markers(vec![
+        WritableTxnMarker::default()
+            .with_producer_id(ProducerId(producer_id))
+            .with_producer_epoch(epoch)
+            .with_transaction_result(false)
+            .with_coordinator_epoch(coordinator_epoch)
+            .with_topics(vec![
+                WritableTxnMarkerTopic::default()
+                    .with_name(topic(&name))
+                    .with_partition_indexes(vec![0]),
+            ]),
+    ]);
+    let aborted = client
+        .send(&abort, markers_version)
+        .await
+        .map_err(|error| format!("WriteTxnMarkers: {error}"))?;
+    facts.set(
+        "abort.error",
+        aborted
+            .markers
+            .first()
+            .and_then(|marker| marker.topics.first())
+            .and_then(|topic| topic.partitions.first())
+            .map_or(-2, |partition| partition.error_code),
+    );
+    let (answer, bytes) = fetch_raw(client, &name, 0, 0, 1).await?;
+    facts.set(
+        "after_abort.values",
+        committed_view(&answer, bytes)?.join(","),
+    );
+    facts.set("after_abort.high_watermark", answer.high_watermark);
+    facts.set(
+        "after_abort.stable_is_high",
+        answer.last_stable_offset == answer.high_watermark,
+    );
+    let producers = client
+        .send(&producers_request, producers_version)
+        .await
+        .map_err(|error| format!("DescribeProducers: {error}"))?;
+    facts.set(
+        "after_abort.txn_start_offset",
+        producers
+            .topics
+            .first()
+            .and_then(|topic| topic.partitions.first())
+            .and_then(|partition| {
+                partition
+                    .active_producers
+                    .iter()
+                    .find(|active| active.producer_id.0 == producer_id)
+            })
+            .map_or(-2, |active| active.current_txn_start_offset),
+    );
+    // Tidy: the producer ends its own transaction, as it would.
+    facts.set(
+        "producer_abort.error",
+        end_settled(client, &producer, false).await?,
+    );
+    Ok(())
 }

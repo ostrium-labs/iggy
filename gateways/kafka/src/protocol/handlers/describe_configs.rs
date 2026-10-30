@@ -28,13 +28,16 @@ use kafka_protocol::messages::describe_configs_response::{
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::bridge::{DEFAULT_TOPIC_PARTITIONS, IggyBridge, StreamTopicCache, TopicLoad};
 use crate::protocol::api::{
-    API_KEY_DESCRIBE_CONFIGS, ApiVersionRange, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST,
-    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
-    REQUEST_DEADLINE,
+    API_KEY_DESCRIBE_CONFIGS, ApiVersionRange, ERROR_CLUSTER_AUTHORIZATION_FAILED,
+    ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE,
+    ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    HandleOutcome, REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
 use crate::protocol::handlers::create_topics::SINGLE_BROKER_ID;
@@ -46,7 +49,7 @@ use crate::protocol::handlers::topic_config::{
     bridge_failure, name_reason, topic_cap_and_duplicates, topic_cap_message,
 };
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, is_supported_version, respond_or_close,
+    decode_guarded, encode_message, is_supported_version, may_topic, respond_or_close,
     unsupported_version_response,
 };
 
@@ -58,25 +61,60 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     max_version: 4,
 };
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_DESCRIBE_CONFIGS, api_version) {
         return unsupported_version_response(API_KEY_DESCRIBE_CONFIGS, api_version, |version| {
             encode_error_response(version, ERROR_INVALID_REQUEST)
         });
     }
 
-    let req = match decode_guarded::<DescribeConfigsRequest>(api_version, body, |version, body| {
-        validate_describe_configs_shape(version, body, state.max_frame_size)
-    }) {
-        Ok(req) => req,
-        Err(error) => {
-            tracing::debug!(%error, "Failed to decode DescribeConfigs request");
-            return respond_or_close(
-                encode_error_response(api_version, ERROR_INVALID_REQUEST),
-                "DescribeConfigs",
-            );
+    let mut req =
+        match decode_guarded::<DescribeConfigsRequest>(api_version, body, |version, body| {
+            validate_describe_configs_shape(version, body, state.max_frame_size)
+        }) {
+            Ok(req) => req,
+            Err(error) => {
+                tracing::debug!(%error, "Failed to decode DescribeConfigs request");
+                return respond_or_close(
+                    encode_error_response(api_version, ERROR_INVALID_REQUEST),
+                    "DescribeConfigs",
+                );
+            }
+        };
+
+    // Kafka's DESCRIBE_CONFIGS: on a topic, Iggy's `get_topic` or anything that implies it; on
+    // the broker, the cluster, which Iggy's server read grants. A denied resource is answered,
+    // the others are still described.
+    let mut denied = Vec::new();
+    req.resources.retain(|resource| {
+        let (allowed, code) = if resource.resource_type == RESOURCE_TYPE_TOPIC {
+            (
+                may_topic(
+                    state,
+                    principal,
+                    resource.resource_name.as_str(),
+                    TopicOp::Describe,
+                ),
+                ERROR_TOPIC_AUTHORIZATION_FAILED,
+            )
+        } else {
+            (
+                principal.is_none_or(|principal| {
+                    principal.permissions_known && principal.permissions.read_servers
+                }),
+                ERROR_CLUSTER_AUTHORIZATION_FAILED,
+            )
+        };
+        if !allowed {
+            denied.push(resource_error(resource, code, None, Vec::new()));
         }
-    };
+        allowed
+    });
 
     // Checked before the bridge-availability stub, not inside `describe_all`: the cap is a
     // request-shape policy, not a controller-availability one, and a check that only runs once
@@ -102,7 +140,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             })
             .collect();
         return respond_or_close(
-            encode_message(&response(results), api_version, 256),
+            encode_message(&response([results, denied].concat()), api_version, 256),
             "DescribeConfigs",
         );
     }
@@ -114,7 +152,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
             .map(|resource| resource_error(resource, ERROR_NOT_CONTROLLER, None, Vec::new()))
             .collect();
         return respond_or_close(
-            encode_message(&response(results), api_version, 256),
+            encode_message(&response([results, denied].concat()), api_version, 256),
             "DescribeConfigs",
         );
     };
@@ -122,7 +160,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let results = describe_all(state, bridge, &req, &duplicate_names, deadline).await;
     respond_or_close(
-        encode_message(&response(results), api_version, 256),
+        encode_message(&response([results, denied].concat()), api_version, 256),
         "DescribeConfigs",
     )
 }

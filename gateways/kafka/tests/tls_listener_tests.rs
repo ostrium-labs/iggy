@@ -136,10 +136,8 @@ impl PrincipalResolver for KnownUsers {
             .push(username.to_string());
         self.users
             .get(username)
-            .map(|permissions| AuthenticatedPrincipal {
-                username: username.to_string(),
-                permissions: *permissions,
-                permissions_known: true,
+            .map(|permissions| {
+                AuthenticatedPrincipal::from_projection(username.to_string(), *permissions, true)
             })
             .ok_or(AuthError::Rejected)
     }
@@ -174,11 +172,11 @@ impl PrincipalResolver for SlowUsers {
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
-        Ok(AuthenticatedPrincipal {
-            username: username.to_string(),
-            permissions: topic_reader(),
-            permissions_known: true,
-        })
+        Ok(AuthenticatedPrincipal::from_projection(
+            username.to_string(),
+            topic_reader(),
+            true,
+        ))
     }
 }
 
@@ -195,11 +193,11 @@ impl SaslAuthenticator for FixedCredentials {
     ) -> Result<AuthenticatedPrincipal, AuthError> {
         use secrecy::ExposeSecret;
         if credentials.username == USERNAME && credentials.password.expose_secret() == PASSWORD {
-            Ok(AuthenticatedPrincipal {
-                username: credentials.username.clone(),
-                permissions: topic_reader(),
-                permissions_known: true,
-            })
+            Ok(AuthenticatedPrincipal::from_projection(
+                credentials.username.clone(),
+                topic_reader(),
+                true,
+            ))
         } else {
             Err(AuthError::Rejected)
         }

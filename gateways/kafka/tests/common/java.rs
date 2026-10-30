@@ -35,6 +35,10 @@ const JARS: &[(&str, &str)] = &[
         "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.9.0/kafka-clients-3.9.0.jar",
     ),
     (
+        "kafka-streams-3.9.0.jar",
+        "https://repo1.maven.org/maven2/org/apache/kafka/kafka-streams/3.9.0/kafka-streams-3.9.0.jar",
+    ),
+    (
         "slf4j-api-1.7.36.jar",
         "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar",
     ),

@@ -15,17 +15,15 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With
 > `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
 > that reaches this port can also create topics just by naming them in a `Metadata` request. When
-> the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
-> `DeleteTopics`, `CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs` and `Metadata`
-> auto-creation additionally require it to hold a global `manage_topics` or `manage_streams`;
-> without it every resource of a `DeleteTopics`, `CreatePartitions`, `AlterConfigs` or
-> `IncrementalAlterConfigs` request, and every missing topic a `Metadata` request would create,
-> fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted.
-> `CreateTopics` has no such gate yet - SASL on does not protect it. Every client reads and writes
-> as the bridge's Iggy user. DeleteGroups and OffsetDelete also run as that user. When no listener
-> names a principal, any client can delete committed offsets. When one does (SASL, or client
-> certificates), they also require a global `manage_topics` or `manage_streams`, and without it
-> they answer `GROUP_AUTHORIZATION_FAILED` (30). Iggy's `metadata.partitions_max` defaults to 0
+> a listener names principals (SASL, or client certificates mapped to Iggy users), every request is
+> checked against the principal's own Iggy grants, global, per stream and per topic, with Iggy's
+> own rules, and consumer groups are scoped per principal (KW-10,
+> [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md)): a topic it may not use answers
+> `TOPIC_AUTHORIZATION_FAILED` (29), a group API without any topic read grant
+> `GROUP_AUTHORIZATION_FAILED` (30), and a connection that proved no identity is `ANONYMOUS` and holds
+> nothing. What is allowed still runs as the bridge's Iggy user, the ceiling. When no listener names
+> a principal, nothing is enforced and any client can do what the bridge's user can, delete
+> committed offsets included. Iggy's `metadata.partitions_max` defaults to 0
 > (unlimited), so set it before exposing the gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
@@ -289,7 +287,7 @@ rather than having its records stored as if they were ordinary ones. None of tho
 connection. `docs/SCOPE.md`'s Transactions section has the ordering and the reasoning.
 
 In the Ostrium fork, `IGGY_KAFKA_TRANSACTIONS_ENABLED=true` turns on a transaction coordinator
-instead (KW-T, in steps; `read_committed` is not served yet). `docs/TRANSACTIONS.md` has what is
+instead (KW-T, in steps; `read_committed` is served, consume-transform-produce is not yet). `docs/TRANSACTIONS.md` has what is
 built and what is not.
 
 ## Consumer groups ([#3544](https://github.com/apache/iggy/issues/3544))
@@ -455,23 +453,26 @@ Four things to know before switching it on:
   would let a second connection present any password. Connection churn is therefore server load.
   `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` bounds the checks the gateway runs at once, and a peer
   whose login was rejected is refused for a delay that doubles per rejection, from 0.5s up to 30s.
-- **Authentication and an ACL view, not enforcement.** The gateway verifies the credentials and
-  can describe what Iggy grants the principal, but no operation checks those grants. Produce and
-  Fetch act as the bridge's Iggy user for every client, so any client that signs in reads and
-  writes what that user can.
+- **Each principal's own grants are enforced, the bridge's user is the ceiling.** The gateway
+  verifies the credentials, reads the principal's Iggy grants, and checks every topic and group a
+  request names against them ([docs/ACL_MAPPING.md](docs/ACL_MAPPING.md)). What passes runs as the
+  bridge's Iggy user, so a principal never does more than that user can. Consumer groups live in a
+  namespace per principal. The grants are read when the connection authenticates: a change in Iggy
+  applies when the client reconnects.
 
 ### ACLs
 
 `DescribeAcls` renders the authenticated principal's Iggy permissions as Kafka ACL bindings, so
-`kafka-acls.sh --list` works against the gateway. It is read only: `CreateAcls` and `DeleteAcls`
-are not implemented and not advertised.
+`kafka-acls.sh --list` works against the gateway. It is read only for now: `CreateAcls` and
+`DeleteAcls` are the next KW-10 step and not advertised yet; grants are changed in Iggy.
 
 `--list` here is a snapshot of the caller's own grants, not the broker-wide dump it is against a
 Kafka cluster. A principal sees its own permissions and nobody else's, because the gateway holds no
 administrative credentials, so filtering on another `User:` returns an empty listing whatever that
-user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings, and the view is a snapshot
-taken when the connection authenticated, so a permission changed afterwards is invisible until the
-client reconnects. [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is
+user holds, and root's listing is root's grants rather than a catalog of every binding. Global
+grants render as wildcard bindings and per-stream and per-topic grants on the Kafka topics they
+map to, and the view is a snapshot taken when the connection authenticated, so a permission changed
+afterwards is invisible until the client reconnects. [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is
 deliberately left out.
 
 Full reasoning, including what was rejected and why, is in
@@ -570,7 +571,7 @@ records, in request order. One uncompressed batch per partition.
 | `OFFSET_OUT_OF_RANGE` (1) | Offset below 0. Or an offset still past `high_watermark` after 30 s of 6 on the same connection, counted from its first 6 there. A read there in range starts the 30 s over. A node that lags clears within them. A partition with no offset past 0 never answers 1, because Iggy reports that while it loads, fences or rebuilds one. | Resets its offset (`auto.offset.reset`). |
 | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Topic or partition not in Iggy, or a name Kafka refuses | Refreshes metadata, retries. |
 | `NOT_LEADER_OR_FOLLOWER` (6) | Iggy unreachable, too slow, not signed in, loading the partition, returning no records where it reports some, or an offset past the end (see 1). Alone, it goes out after `max_wait_ms`. | Refreshes metadata, retries. |
-| `TOPIC_AUTHORIZATION_FAILED` (29) | The bridge's Iggy user lacks permission. Fetch reads as that user, not as the client. | Fails. |
+| `TOPIC_AUTHORIZATION_FAILED` (29) | The principal's own grants do not allow reading the topic (KW-10), or the bridge's Iggy user, which every Fetch reads as, lacks permission. | Fails. |
 | `UNKNOWN_SERVER_ERROR` (-1) | Anything else, such as a stored message the gateway cannot map. Alone, it goes out after `max_wait_ms`. Each connection reads the partition again at most once per `max_wait_ms`. | Retries the same offset. |
 | `FETCH_SESSION_ID_NOT_FOUND` (70) | Top level. The request continues a session. | Sends a full request. |
 

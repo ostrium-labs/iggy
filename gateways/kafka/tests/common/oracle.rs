@@ -162,7 +162,7 @@ pub fn env_flag(name: &str) -> bool {
 }
 
 /// The container CLI, `docker` unless `KAFKA_ORACLE_CONTAINER_CLI` names another (`podman`).
-fn container_cli() -> String {
+pub fn container_cli() -> String {
     std::env::var("KAFKA_ORACLE_CONTAINER_CLI").unwrap_or_else(|_| "docker".to_string())
 }
 
@@ -557,6 +557,12 @@ impl ConfluentOracle {
         self.delete_where(|name| name.starts_with(prefix)).await
     }
 
+    /// Every topic with [`RESOURCE_PREFIX`] the cluster lists.
+    pub async fn prefixed_topics(&self) -> Result<Vec<String>, String> {
+        let mut client = WireClient::connect_target(&self.target).await?;
+        Self::listed(&mut client, &|_: &str| true).await
+    }
+
     /// Deletes topics a run left behind more than [`CONFLUENT_STALE_AFTER`] ago: names are
     /// `{RESOURCE_PREFIX}{unix seconds}-...` (see [`run_id`]).
     pub async fn sweep_stale(&self) -> Result<Vec<String>, String> {
@@ -572,22 +578,39 @@ impl ConfluentOracle {
 
     /// Deletes matching topics until a listing shows none. A topic created moments ago can be
     /// missing from one broker's Metadata, so one pass is not enough.
+    ///
+    /// Topic by topic, so one refusal does not stop the others, and a pass that loses its
+    /// connection opens a new one. Fails only when matching topics are still listed at the end.
     async fn delete_where<F: Fn(&str) -> bool + Sync>(
         &self,
         wanted: F,
     ) -> Result<Vec<String>, String> {
         let mut client = WireClient::connect_target(&self.target).await?;
         let mut deleted = Vec::new();
+        let mut refusals = Vec::new();
         for pass in 0..6 {
-            let names = Self::listed(&mut client, &wanted).await?;
+            let names = if let Ok(names) = Self::listed(&mut client, &wanted).await {
+                names
+            } else {
+                client = WireClient::connect_target(&self.target).await?;
+                Self::listed(&mut client, &wanted).await?
+            };
             if names.is_empty() && pass > 0 {
                 return Ok(deleted);
             }
-            if !names.is_empty() {
-                Self::delete_names(&mut client, &names).await?;
-                for name in names {
-                    if !deleted.contains(&name) {
-                        deleted.push(name);
+            refusals.clear();
+            for name in names {
+                match Self::delete_names(&mut client, std::slice::from_ref(&name)).await {
+                    Ok(()) => {
+                        if !deleted.contains(&name) {
+                            deleted.push(name);
+                        }
+                    }
+                    Err(error) => {
+                        refusals.push(error);
+                        if let Ok(fresh) = WireClient::connect_target(&self.target).await {
+                            client = fresh;
+                        }
                     }
                 }
             }
@@ -598,8 +621,9 @@ impl ConfluentOracle {
             Ok(deleted)
         } else {
             Err(format!(
-                "topics still listed after deleting: {}",
-                left.join(", ")
+                "topics still listed after deleting: {} ({})",
+                left.join(", "),
+                refusals.join("; ")
             ))
         }
     }

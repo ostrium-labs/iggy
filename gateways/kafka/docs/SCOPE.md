@@ -184,8 +184,9 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 > **Ostrium fork (KW-T):** with `IGGY_KAFKA_TRANSACTIONS_ENABLED=true` the gateway serves
 > transactions instead: `FindCoordinator` for a transactional id, `InitProducerId` with one,
 > `AddPartitionsToTxn` (24) and `EndTxn` (26) are advertised and answered, transactional Produce is
-> written with its markers, and Fetch serves control batches. `read_committed`, `AddOffsetsToTxn`
-> (25) and `TxnOffsetCommit` (28) are later steps. [`TRANSACTIONS.md`](TRANSACTIONS.md) has what is
+> written with its markers, Fetch serves control batches, and `read_committed` Fetch and
+> `ListOffsets` stop at the last stable offset. `AddOffsetsToTxn` (25) and `TxnOffsetCommit` (28)
+> are a later step. [`TRANSACTIONS.md`](TRANSACTIONS.md) has what is
 > built. What follows is the behaviour with the switch off, the default.
 
 Transactions are not supported and are not planned. There is no last stable offset, no abort
@@ -574,9 +575,14 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
       and answers either one with `ILLEGAL_SASL_STATE` (34) and an empty mechanism list, keeping the
       connection rather than closing it as an unlisted key would. Enabling it later therefore cannot
       silently widen what an unauthenticated client may send
-- [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
-      bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
-      (31) are not implemented and not advertised
+- [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions, global, per
+      stream and per topic, as Kafka ACL bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only:
+      `CreateAcls` (30) and `DeleteAcls` (31) are the next KW-10 step and not advertised yet
+- [x] Per-principal authorization ([#4518](https://github.com/apache/iggy/issues/4518), KW-10):
+      every topic a request names is checked against the principal's own Iggy grants with Iggy's
+      rules (29 per topic, 31 for the cluster), the bridge's Iggy user stays the ceiling, and
+      consumer groups are scoped per principal (30 without any topic read grant)
+      ([`ACL_MAPPING.md`](ACL_MAPPING.md#enforcement))
 - [x] TLS on the gateway listener ([#4510](https://github.com/apache/iggy/issues/4510)):
       Kafka-style listeners, one per security protocol, each advertising its own address;
       rustls with certificate reload; client certificates mapped to Iggy users through

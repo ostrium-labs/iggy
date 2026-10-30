@@ -48,6 +48,7 @@ use crate::limits::RequestLimits;
 use crate::listener::{ListenerConfig, SecurityProtocol};
 use crate::membership::{Announcement, Endpoint, Membership, MembershipConfig, Registry};
 use crate::oauth::{TokenError, TokenValidator};
+use crate::protocol::acl;
 use crate::protocol::api::{
     API_KEY_ALTER_USER_SCRAM_CREDENTIALS, API_KEY_DESCRIBE_ACLS, API_KEY_DESCRIBE_CLIENT_QUOTAS,
     API_KEY_DESCRIBE_USER_SCRAM_CREDENTIALS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE,
@@ -55,7 +56,7 @@ use crate::protocol::api::{
     ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_SASL_AUTHENTICATION_FAILED,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNSUPPORTED_SASL_MECHANISM, ERROR_UNSUPPORTED_VERSION,
     GatewayState, HandleOutcome, SASL_ADVERTISED_DESCRIBE_ACLS_VERSIONS, decode_acl_filter,
-    decode_sasl_auth_bytes, decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key,
+    decode_sasl_auth_bytes, decode_sasl_mechanism, describe_bindings_outcome, encode_error_for_key,
     handle_connection_request, respond_describe_acls_error, sasl_authenticate_outcome,
     sasl_authenticate_reply, sasl_handshake_outcome,
 };
@@ -2017,8 +2018,25 @@ async fn authenticate_plain(
     };
 
     match result {
-        Ok(authenticated) => {
+        Ok(mut authenticated) => {
             ctx.failed_logins.record_success(peer.ip());
+            // The login's own session may not see the streams its grants name, so the bridge
+            // names them. Without that, the per-stream grants would deny what they grant.
+            if authenticated.grants.needs_names() {
+                let Some(resolver) = ctx.resolver else {
+                    warn!(%peer, "no bridge to name the principal's per-stream grants; they grant nothing");
+                    return AuthStep::Done {
+                        principal: authenticated,
+                        auth_bytes: Bytes::new(),
+                        credential_expiry: None,
+                    };
+                };
+                let grants = (*authenticated.grants).clone();
+                match resolver.name_grants(grants).await {
+                    Ok(named) => authenticated.grants = Arc::new(named),
+                    Err(_) => return AuthStep::Fail(HandleOutcome::Close),
+                }
+            }
             AuthStep::Done {
                 principal: authenticated,
                 auth_bytes: Bytes::new(),
@@ -2176,12 +2194,11 @@ fn describe_acls(
         return respond_describe_acls_error(api_version, ERROR_UNKNOWN_SERVER_ERROR, false);
     }
     match decode_acl_filter(api_version, body) {
-        Ok(filter) => describe_acls_outcome(
-            api_version,
-            &principal.username,
-            &principal.permissions,
-            &filter,
-        ),
+        Ok(filter) => {
+            let mapping = ctx.state.bridge.as_deref().map(IggyBridge::topic_mapping);
+            let bindings = acl::all_bindings(&principal.permissions, &principal.grants, mapping);
+            describe_bindings_outcome(api_version, &principal.username, bindings, &filter)
+        }
         Err(error) => {
             debug!(%peer, %error, "failed to decode DescribeAcls filter");
             // Kept open: a client that sent one bad filter may send a good one.

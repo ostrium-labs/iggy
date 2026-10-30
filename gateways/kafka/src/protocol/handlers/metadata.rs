@@ -28,6 +28,7 @@ use kafka_protocol::protocol::{Encodable, StrBytes};
 use uuid::Uuid;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::IggyBridge;
 use crate::bridge::topic_map::is_valid_kafka_topic_name;
 use crate::cluster_id::ClusterId;
@@ -43,7 +44,7 @@ use crate::protocol::auto_topic_creation::is_internal_topic_name;
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, learn_topic_ids, respond_or_close,
+    decode_guarded, encode_message, learn_topic_ids, may_topic, respond_or_close,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -101,42 +102,23 @@ pub async fn handle(
     let per_partition_bytes = template_partition_bytes(api_version);
 
     let results = match requested {
-        None => match tokio::time::timeout(REQUEST_DEADLINE, bridge.list_kafka_topics()).await {
-            Ok(Ok(topics)) => {
-                let results: Vec<TopicResult> = topics.into_iter().map(found_result).collect();
-                truncate_all_topics_to_frame_budget(
-                    results,
-                    state.max_frame_size,
-                    per_partition_bytes,
-                )
-            }
-            Ok(Err(error)) => {
-                // Same "no top-level error field" constraint as a decode failure: there is no
-                // way to answer "the bridge itself is unreachable" for an all-topics request
-                // that doesn't also falsely claim zero topics exist.
-                tracing::warn!(%error, "Failed to list Kafka topics from the Iggy bridge; closing connection");
-                return HandleOutcome::Close;
-            }
-            Err(_elapsed) => {
-                // No per-name cap to answer against here (this is the server-driven all-topics
-                // path), so there is no honest per-topic RETRIABLE list to send back either -
-                // same close as an unreachable bridge, not a different case.
-                tracing::warn!(
-                    deadline_secs = REQUEST_DEADLINE.as_secs(),
-                    "Listing Kafka topics from the Iggy bridge exceeded its deadline; closing \
-                     connection"
-                );
-                return HandleOutcome::Close;
-            }
+        None => match all_topics(state, principal, bridge, per_partition_bytes).await {
+            Some(results) => results,
+            None => return HandleOutcome::Close,
         },
         Some(Requested::Names(names)) => {
             let mut results = resolve_requested_named_topics(bridge, &names).await;
             if allow_auto_topic_creation {
                 auto_create_missing(state, bridge, principal, &mut results);
             }
+            deny_undescribable(state, principal, &mut results);
             results
         }
-        Some(Requested::Ids(ids)) => resolve_requested_topic_ids(state, bridge, &ids).await,
+        Some(Requested::Ids(ids)) => {
+            let mut results = resolve_requested_topic_ids(state, bridge, &ids).await;
+            deny_undescribable(state, principal, &mut results);
+            results
+        }
     };
     register_topic_ids(state, &results);
 
@@ -331,6 +313,50 @@ async fn resolve_requested_topic_ids(
         .collect()
 }
 
+/// Every topic the principal may describe, cut to the frame budget, or `None` when the bridge
+/// could not list them, which closes the connection.
+async fn all_topics(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    bridge: &Arc<IggyBridge>,
+    per_partition_bytes: usize,
+) -> Option<Vec<TopicResult>> {
+    match tokio::time::timeout(REQUEST_DEADLINE, bridge.list_kafka_topics()).await {
+        Ok(Ok(topics)) => {
+            // Kafka leaves out of an all-topics answer every topic the principal may not
+            // describe, rather than naming it with an error.
+            let results: Vec<TopicResult> = topics
+                .into_iter()
+                .filter(|topic| may_topic(state, principal, &topic.kafka_topic, TopicOp::Describe))
+                .map(found_result)
+                .collect();
+            Some(truncate_all_topics_to_frame_budget(
+                results,
+                state.max_frame_size,
+                per_partition_bytes,
+            ))
+        }
+        Ok(Err(error)) => {
+            // Same "no top-level error field" constraint as a decode failure: there is no
+            // way to answer "the bridge itself is unreachable" for an all-topics request
+            // that doesn't also falsely claim zero topics exist.
+            tracing::warn!(%error, "Failed to list Kafka topics from the Iggy bridge; closing connection");
+            None
+        }
+        Err(_elapsed) => {
+            // No per-name cap to answer against here (this is the server-driven all-topics
+            // path), so there is no honest per-topic RETRIABLE list to send back either -
+            // same close as an unreachable bridge, not a different case.
+            tracing::warn!(
+                deadline_secs = REQUEST_DEADLINE.as_secs(),
+                "Listing Kafka topics from the Iggy bridge exceeded its deadline; closing \
+                     connection"
+            );
+            None
+        }
+    }
+}
+
 /// Records the id of every topic a Metadata answer reports, so later requests may name it by id.
 fn register_topic_ids(state: &GatewayState, results: &[TopicResult]) {
     for result in results
@@ -364,24 +390,26 @@ fn auto_create_missing(
     if !results.iter().any(|result| result.missing) {
         return;
     }
-    let refusal = match principal {
-        None => None,
-        Some(principal) if !principal.permissions_known => {
-            tracing::warn!(
-                principal = %principal.username,
-                "Metadata asked to auto-create topics on a connection whose permissions were \
-                 never read; denying"
-            );
-            // Not 29: Java consumers, Streams and producers treat it as fatal, and an unread set
-            // would fail every refresh for the connection's life while Produce and Fetch work.
-            Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION)
-        }
-        Some(principal) if principal.permissions.manage_topics => None,
-        Some(_) => Some(ERROR_TOPIC_AUTHORIZATION_FAILED),
-    };
+    let unread = principal.is_some_and(|principal| !principal.permissions_known);
+    if unread {
+        tracing::warn!(
+            "Metadata asked to auto-create topics on a connection whose permissions were never \
+             read; denying"
+        );
+    }
     for result in results.iter_mut().filter(|result| result.missing) {
         let Some(name) = result.name.as_ref().map(StrBytes::as_str) else {
             continue;
+        };
+        // Kafka's CREATE on the topic: Iggy's `create_topic` on the stream it would land in.
+        let refusal = if unread {
+            // Not 29: Java consumers, Streams and producers treat it as fatal, and an unread set
+            // would fail every refresh for the connection's life while Produce and Fetch work.
+            Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION)
+        } else if may_topic(state, principal, name, TopicOp::Create) {
+            None
+        } else {
+            Some(ERROR_TOPIC_AUTHORIZATION_FAILED)
         };
         if let Some(error_code) = refusal {
             result.error_code = error_code;
@@ -390,6 +418,39 @@ fn auto_create_missing(
         } else if !is_internal_topic_name(name) && !bridge.aliases_an_override(name) {
             let _started = creator.start(bridge, name);
         }
+    }
+}
+
+/// Answers `TOPIC_AUTHORIZATION_FAILED`, with no partitions and no id, for each named or
+/// identified topic the principal may not describe, whether it exists or not, so the answer
+/// reveals nothing about topics the principal cannot see. A missing topic the principal may create
+/// keeps the answer auto-creation gave it, as in Kafka; one asked for by id keeps no name.
+fn deny_undescribable(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    results: &mut [TopicResult],
+) {
+    if principal.is_none() {
+        return;
+    }
+    for result in results.iter_mut() {
+        let Some(name) = result.name.as_ref().map(StrBytes::as_str) else {
+            continue;
+        };
+        let creatable = result.missing && may_topic(state, principal, name, TopicOp::Create);
+        if creatable || may_topic(state, principal, name, TopicOp::Describe) {
+            continue;
+        }
+        if result.error_code == ERROR_UNKNOWN_TOPIC_OR_PARTITION
+            && principal.is_some_and(|principal| !principal.permissions_known)
+        {
+            // Left as auto-creation answered it: see `auto_create_missing`.
+            continue;
+        }
+        result.error_code = ERROR_TOPIC_AUTHORIZATION_FAILED;
+        result.partitions_count = 0;
+        result.topic_id = Uuid::nil();
+        result.missing = false;
     }
 }
 

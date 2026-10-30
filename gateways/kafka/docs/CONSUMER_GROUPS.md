@@ -191,13 +191,24 @@ to delete. The same applies to an override topic that the bridge user has no per
 of them. The log names the topics.
 
 A SASL listener names principals, and so does an `SSL` listener that verifies client certificates.
-When a listener names principals, both APIs require the principal to hold the global Iggy permission
-`manage_topics` or `manage_streams`, as `DeleteTopics` does. Kafka asks for `DELETE` on the group,
-and Iggy has no group permission. Without it, `DeleteGroups` answers `GROUP_AUTHORIZATION_FAILED`
-(30) for every group, `OffsetDelete` answers it for the request, and the gateway deletes nothing. A
-connection that proved no identity is `ANONYMOUS` and holds nothing, also on a `PLAINTEXT` listener
-beside such a listener. When no listener names principals, any client that reaches the gateway can
-delete groups and offsets.
+When a listener names principals, groups are scoped per principal (KW-10, see
+[Groups per principal](#groups-per-principal)), so a principal can only ever delete its own, and
+group access follows topic read access: a principal that may read no topic answers
+`GROUP_AUTHORIZATION_FAILED` (30) for every group, and `OffsetDelete` checks `READ` on each topic
+as a commit does. A connection that proved no identity is `ANONYMOUS` and holds nothing, also on a
+`PLAINTEXT` listener beside such a listener. When no listener names principals, any client that
+reaches the gateway can delete groups and offsets.
+
+## Groups per principal
+
+On a gateway whose listeners name principals, every group API runs in the principal's namespace:
+the group a client names is coordinated, hashed for membership and stored in Iggy as
+`<length>:<principal>/<group>` (its offsets as `kafka.cg.<length>:<principal>/<group>`), and every
+answer names it as the client did. `ListGroups` lists only the principal's own groups. Two tenants
+that both use `orders-app` therefore have two groups, and neither can see, join, commit to or
+delete the other's. The scoped id has to fit Iggy's 255-byte names like any group id, so a
+principal's group ids are shorter by the length of the prefix. Offsets committed before KW-10 under
+an unscoped name stay in Iggy under that name and are not found by a principal's scoped group.
 
 ## Assignment is the client's job
 

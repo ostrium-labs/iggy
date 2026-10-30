@@ -75,6 +75,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::{Instant, timeout_at};
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::authz::TopicOp;
 use crate::bridge::iggy_bridge::in_slot;
 use crate::bridge::{BridgeError, IggyBridge, MAX_TOPIC_PARTITIONS};
 use crate::error::Result;
@@ -91,7 +92,8 @@ use crate::protocol::handlers::topic_config::{
 };
 use crate::protocol::handlers::{
     MAX_REQUEST_TIMEOUT, clamp_request_timeout, decode_guarded, encode_message,
-    handle_versioned_request, is_supported_version, respond_or_close, unsupported_version_response,
+    handle_versioned_request, is_supported_version, may_topic_on, respond_or_close,
+    unsupported_version_response,
 };
 
 /// Every version Kafka itself serves. v0 and v1 are the legacy wire shape, v2 and v3 flexible.
@@ -178,15 +180,17 @@ pub async fn handle(
     let topic_names = req.topics.iter().map(|topic| topic.name.as_str());
     let duplicate_names = find_duplicate_names(topic_names.clone());
     let mut results = duplicate_results(&req.topics, &duplicate_names);
-    let topics: Vec<&CreatePartitionsTopic> = req
+    let mut topics: Vec<&CreatePartitionsTopic> = req
         .topics
         .iter()
         .filter(|topic| !duplicate_names.contains(topic.name.as_str()))
         .collect();
 
-    if let Some(denied) = authorize(principal, &topics) {
+    if let Some(denied) = authorize(state.bridge.as_deref(), principal, &mut topics) {
         results.extend(denied);
-        return respond(api_version, results);
+        if topics.is_empty() {
+            return respond(api_version, results);
+        }
     }
 
     if exceeds_topic_cap(topic_names, state.limits.admin_topics_per_request) {
@@ -261,42 +265,40 @@ fn duplicate_results(
         .collect()
 }
 
-/// Denies every requested topic when `principal` is known but is not allowed to change topics,
-/// or when its permissions could not be read. `None` means SASL is off, which this gateway
-/// treats as no principal to enforce against - the same choice `DeleteTopics` and
-/// `AlterConfigs` make when authentication itself is not configured.
+/// Takes out of `topics`, and answers, each one `principal` may not grow: Kafka's `ALTER` on the
+/// topic, Iggy's `manage_topic` on it (`crate::authz`). Permissions that could not be read deny
+/// every topic. `None` means no listener names principals, so there is nothing to enforce. The
+/// topics allowed still grow. `None` is returned when nothing was denied.
 fn authorize(
+    bridge: Option<&IggyBridge>,
     principal: Option<&AuthenticatedPrincipal>,
-    topics: &[&CreatePartitionsTopic],
+    topics: &mut Vec<&CreatePartitionsTopic>,
 ) -> Option<Vec<CreatePartitionsTopicResult>> {
-    let principal = principal?;
-    if principal.permissions_known && principal.permissions.manage_topics {
-        return None;
-    }
-    if !principal.permissions_known {
+    if principal.is_some_and(|principal| !principal.permissions_known) {
         // The permission read failed after a successful login, so this connection holds no real
         // answer. Denying is the fail-closed choice: granting would authorize a write off a
         // value nothing ever actually read.
         tracing::warn!(
-            principal = %principal.username,
             "CreatePartitions asked on a connection whose permissions were never read; denying"
         );
     }
     let message = StrBytes::from_static_str(
         "the authenticated principal is not authorized to add partitions to topics",
     );
-    Some(
-        topics
-            .iter()
-            .map(|topic| {
-                topic_result(
-                    topic,
-                    ERROR_TOPIC_AUTHORIZATION_FAILED,
-                    Some(message.clone()),
-                )
-            })
-            .collect(),
-    )
+    let mut denied = Vec::new();
+    topics.retain(|topic| {
+        // Kafka's ALTER on the topic: Iggy's `create_partitions`, which is `manage_topic`.
+        if may_topic_on(bridge, principal, topic.name.as_str(), TopicOp::Manage) {
+            return true;
+        }
+        denied.push(topic_result(
+            topic,
+            ERROR_TOPIC_AUTHORIZATION_FAILED,
+            Some(message.clone()),
+        ));
+        false
+    });
+    (!denied.is_empty()).then_some(denied)
 }
 
 /// The two Iggy calls a grow makes, kept behind a trait so the timing and error paths of
@@ -1014,7 +1016,6 @@ mod tests {
     use kafka_protocol::messages::TopicName;
 
     use super::*;
-    use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR};
 
     fn topic(name: &str, count: i32) -> CreatePartitionsTopic {
@@ -1030,14 +1031,14 @@ mod tests {
     }
 
     fn principal(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            username: "alice".to_string(),
-            permissions: PrincipalPermissions {
+        AuthenticatedPrincipal::with_global(
+            "alice",
+            iggy::prelude::GlobalPermissions {
                 manage_topics,
-                ..PrincipalPermissions::default()
+                ..iggy::prelude::GlobalPermissions::default()
             },
             permissions_known,
-        }
+        )
     }
 
     fn topic_state(id: u32, created_at: u64, partitions_count: u32) -> TopicState {
@@ -1162,21 +1163,25 @@ mod tests {
 
     #[test]
     fn no_principal_is_not_gated() {
-        assert!(authorize(None, &[&topic("orders", 2)]).is_none());
+        assert_eq!(authorize(None, None, &mut vec![&topic("orders", 2)]), None);
     }
 
     #[test]
     fn a_principal_with_manage_topics_is_allowed() {
         let principal = principal(true, true);
-        assert!(authorize(Some(&principal), &[&topic("orders", 2)]).is_none());
+        assert_eq!(
+            authorize(None, Some(&principal), &mut vec![&topic("orders", 2)]),
+            None
+        );
     }
 
     #[test]
     fn a_principal_without_manage_topics_is_denied_every_topic() {
         let principal = principal(false, true);
         let results = authorize(
+            None,
             Some(&principal),
-            &[&topic("orders", 2), &topic("payments", 3)],
+            &mut vec![&topic("orders", 2), &topic("payments", 3)],
         )
         .expect("denied");
         assert_eq!(results.len(), 2);
@@ -1189,7 +1194,8 @@ mod tests {
     #[test]
     fn a_principal_whose_permissions_were_never_read_is_denied() {
         let principal = principal(true, false);
-        let results = authorize(Some(&principal), &[&topic("orders", 2)]).expect("denied");
+        let results =
+            authorize(None, Some(&principal), &mut vec![&topic("orders", 2)]).expect("denied");
         assert_eq!(results[0].error_code, ERROR_TOPIC_AUTHORIZATION_FAILED);
     }
 

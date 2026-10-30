@@ -18,6 +18,7 @@
 //! Kafka wire protocol gateway foundation for Apache Iggy.
 
 pub mod auth;
+pub mod authz;
 pub mod bridge;
 pub mod cluster_id;
 pub mod commit_metadata;

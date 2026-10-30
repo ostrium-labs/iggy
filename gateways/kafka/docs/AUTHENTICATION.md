@@ -34,10 +34,11 @@ the only place a credential is defined or verified.
 verified on every connection, against Iggy, and that verification is deliberately not cached. See
 [Verification is per connection](#verification-is-per-connection-and-cannot-be-cached).
 
-**Authorization is meant to stay in Iggy.** The gateway will not implement its own ACL model. The intent is
-to carry the authenticated Iggy identity onto the data plane and let the server's existing permission checks
-decide what it can do. That is later work: today the verified client is shut down as soon as the credential
-clears, and nothing carries the principal past authentication.
+**Authorization is Iggy's grants, enforced by the gateway (KW-10).** The gateway keeps no ACL model of its
+own: the principal's Iggy grants, read when it authenticates, are checked with Iggy's own rules before each
+request, and what passes runs as the bridge's Iggy user, which stays the ceiling
+([`ACL_MAPPING.md`](ACL_MAPPING.md)). The verified client is still shut down as soon as the credential clears;
+the grants are what the connection keeps.
 
 **A client certificate is an identity too, with the same reach.** On an `SSL` listener that verifies client
 certificates, the subject maps to an Iggy username through Kafka's `ssl.principal.mapping.rules` and the
@@ -237,9 +238,9 @@ Two consequences worth naming rather than discovering:
   logins take about 75 ms each, with throughput flattening near 410 per second. The shape is the point,
   latency climbing while throughput plateaus, not the absolute numbers. `MANUAL_TESTING.md` has the table.
 - **Nothing holds the verified session.** The connection that proved a credential drops it at once.
-  Produce and Fetch act as the bridge's Iggy user for every client. A data client per principal needs
-  pooling, a separate question from how credentials are verified. Pooling is gateway-side code over the
-  public SDK and needs no SDK change.
+  Produce and Fetch act as the bridge's Iggy user for every client, after the gateway checked the
+  principal's own grants (KW-10). A data client per principal would need pooling, a separate question from
+  how credentials are verified, and is not needed for authorization.
 
 If either consequence starts to hurt, the lever is below, and it is a smaller change than a credential
 cache because it moves cost off the server without weakening what the gateway checks.
@@ -325,10 +326,11 @@ OAUTHBEARER tokens are checked in the gateway for a few HMACs or one signature, 
 client, so they are not delayed: like Kafka, every SCRAM or OAUTHBEARER attempt is answered on its
 merits, including a right password straight after a wrong one.
 
-### Planned: authorization errors
+### Authorization errors
 
-Not implemented. Today `bridge/error.rs` picks the Kafka code from the Iggy error, and neither 30 nor 31
-is produced anywhere.
+The gateway picks the Kafka code from the operation it checked, not from an Iggy error: 29 for a topic,
+30 for a group, 31 for the cluster (`ACL_MAPPING.md` has the table). A refusal Iggy itself sends the
+bridge's user is still mapped by `bridge/error.rs`.
 
 After authentication, Iggy reports exactly one permission-denied code, `IggyError::Unauthorized` (41,
 `core/common/src/error/iggy_error.rs:97`), alongside `Unauthenticated` (40). Kafka distinguishes
@@ -433,9 +435,7 @@ it is not cached across connections, and nothing acts as it on the data plane ye
 - Presenting a client certificate to Iggy's own transports, which take none
   ([#3930](https://github.com/apache/iggy/issues/3930)); the gateway verifies it and looks the user up
   instead.
-- Authorization. No handler asks Iggy about permissions yet, since the verified identity is not carried
-  onto the data plane; SASL is an admission gate only. The `DescribeAcls` and `CreateAcls` API keys also
-  stay unimplemented.
+- ACL writes (`CreateAcls`, `DeleteAcls`): the next KW-10 step. Grants are changed in Iggy until then.
 
 ## Open questions
 

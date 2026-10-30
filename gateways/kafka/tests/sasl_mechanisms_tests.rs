@@ -113,11 +113,11 @@ struct StubUsers(Vec<&'static str>);
 impl PrincipalResolver for StubUsers {
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
         if self.0.contains(&username) {
-            Ok(AuthenticatedPrincipal {
-                username: username.to_string(),
-                permissions: PrincipalPermissions::default(),
-                permissions_known: true,
-            })
+            Ok(AuthenticatedPrincipal::from_projection(
+                username.to_string(),
+                PrincipalPermissions::default(),
+                true,
+            ))
         } else {
             Err(AuthError::Rejected)
         }

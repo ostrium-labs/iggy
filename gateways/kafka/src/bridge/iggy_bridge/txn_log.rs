@@ -23,6 +23,7 @@
 //! Metadata call. Its permissions protect it as the meta stream's do: only the bridge's user should
 //! hold `send_messages` there, or anyone could forge a commit.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,12 +38,15 @@ use tracing::{info, warn};
 
 use super::fetch::LazyClient;
 use super::{
-    IggyBridge, Producer, REQUEST_TIMEOUT, cluster_id_stream, resolve_blocker, with_request_timeout,
+    IggyBridge, OffsetCalls, Producer, REQUEST_TIMEOUT, cluster_id_stream, resolve_blocker,
+    with_request_timeout,
 };
 use crate::bridge::error::BridgeError;
 use crate::records::control_message;
 use crate::transactions::coordinator::wall_clock_ms;
-use crate::transactions::{DataPlane, LOG_PARTITIONS, Landed, LogRecord, Marker, TxnLog};
+use crate::transactions::{
+    DataPlane, LOG_PARTITIONS, Landed, LogRecord, Marker, TopicPartition, TxnLog,
+};
 
 /// The topic of the transaction log, in the stream `cluster_id_stream` names.
 pub const TXN_STATE_TOPIC: &str = "txn_state";
@@ -289,6 +293,34 @@ impl DataPlane for IggyBridge {
         }
         let watermark = DataPlane::high_watermark(self, &marker.topic, marker.partition).await?;
         Ok(Landed::Below(watermark))
+    }
+
+    async fn commit_offsets(
+        &self,
+        group: &str,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<(), BridgeError> {
+        let targets = offsets
+            .keys()
+            .map(|(topic, _)| self.topic_target(topic))
+            .collect::<Result<Vec<_>, _>>()?;
+        let commits: Vec<(&super::TopicTarget, u32, i64)> = offsets
+            .iter()
+            .zip(&targets)
+            .map(|(((_, partition), offset), target)| {
+                (
+                    target,
+                    u32::try_from(*partition).unwrap_or(u32::MAX),
+                    *offset,
+                )
+            })
+            .collect();
+        let calls = OffsetCalls::new(Instant::now() + MARKER_DEADLINE);
+        self.commit_group_offsets(group, &commits, &calls)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<()>, _>>()
+            .map(|_| ())
     }
 }
 
