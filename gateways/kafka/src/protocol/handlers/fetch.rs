@@ -24,6 +24,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::StreamExt as _;
+use futures::stream::FuturesOrdered;
 use iggy::prelude::{
     IGGY_MESSAGE_HEADER_SIZE, IggyError, IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
     PolledMessages,
@@ -87,16 +89,29 @@ const UNPLACED_GRACE: Duration = Duration::from_secs(30);
 /// How long the last good probe of a topic stands in while its refreshes fail.
 const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
 
-/// Most messages one partition read takes from Iggy, over all its polls.
-const MAX_POLL_COUNT: u32 = 1000;
+/// Most messages one partition read takes from Iggy, over all its polls. The read's byte budget
+/// (`partition_max_bytes`, 1 MiB by default) is what usually ends it: 1000, the old cap, made a
+/// consumer of 100-byte records pay one Fetch round trip per 100 KB.
+const MAX_POLL_COUNT: u32 = 50_000;
 /// Most messages one poll asks for. Iggy caps a poll by count, not by bytes, so this caps what one
 /// poll can load: about 1 GB of the largest messages. A byte cap in Iggy would lift it.
 const MAX_PAGE_COUNT: u32 = 16;
-/// Most messages one poll asks for while the partition's messages are small, so a 1000-message
-/// read costs a handful of round trips to Iggy instead of 63. See [`GROWN_PAGE_MAX_SIZE`].
-const GROWN_PAGE_COUNT: u32 = 250;
+/// Bytes one poll asks for while the partition's messages are small: [`GROWN_PAGE_BYTES`] over the
+/// message size, between [`MAX_PAGE_COUNT`] and [`MAX_GROWN_PAGE_COUNT`] messages, so a 1 MiB read
+/// of 100-byte messages costs two polls instead of 26. See [`GROWN_PAGE_MAX_SIZE`].
+const GROWN_PAGE_BYTES: u64 = 512 * 1024;
+/// Most messages one grown poll asks for.
+const MAX_GROWN_PAGE_COUNT: u32 = 4096;
+/// Pages of one partition read polled at once, each in a read slot of its own, when free slots
+/// allow. Iggy offsets are dense, so page `i` starts `i` pages on, and the pages are added in
+/// offset order: the records keep the partition's order. Each poll costs Iggy a round trip that
+/// waits on its shard, so this, not CPU, set the speed of a read.
+const PARALLEL_PAGES: usize = 4;
+/// Partitions of one Fetch read at once (see `Reader::read_all`). Each takes a read slot and may
+/// take [`PARALLEL_PAGES`] - 1 more if free.
+const PARALLEL_PARTITIONS: usize = 4;
 /// Largest stored message size (the probe's average for the first page, the largest seen after
-/// that) at which a poll may ask for [`GROWN_PAGE_COUNT`] messages. An empty reply to a grown
+/// that) at which a poll may ask for [`grown_page_count`] messages. An empty reply to a grown
 /// poll (Iggy answers empty when the reply passes its u32 frame) drops the read back to
 /// [`MAX_PAGE_COUNT`] for the rest of its polls.
 const GROWN_PAGE_MAX_SIZE: u64 = 8 * 1024;
@@ -856,7 +871,7 @@ fn bytes_waiting(offset: u64, probe: PartitionProbe, budget: usize) -> u64 {
 }
 
 /// Where a requested offset stands against the probe.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Position {
     /// Answer this code, with no records.
     Refused(i16),
@@ -971,33 +986,31 @@ impl<'a> Reader<'a> {
     }
 
     /// One answer per requested partition, in request order, and the slot, if taken.
+    ///
+    /// Partitions with records waiting are read ahead at once, [`PARALLEL_PARTITIONS`] at a time,
+    /// each with the budget a sequential read would give it while the response has room: its
+    /// `partition_max_bytes`, at most the response's. The answers are then taken in request order
+    /// against the response's budget, exactly as a sequential read spends it. An answer that no
+    /// longer fits, or one read owing the first record (KIP-74) when a sequential read would not,
+    /// or the reverse, is read again in turn. So the response keeps the limits a sequential read
+    /// keeps, and every partition's records stay in offset order.
     async fn read_all(mut self, probes: &Probes) -> (Vec<PartitionData>, Option<FetchSlot>) {
         let fetch = self.fetch;
-        let stuck = &fetch.connection.stuck_offsets;
+        let positions: Vec<Position> = fetch
+            .wanted
+            .iter()
+            .map(|want| self.place(want, probes))
+            .collect();
+        let mut ahead = self.read_ahead_partitions(&positions).await;
         let mut answers = Vec::with_capacity(fetch.wanted.len());
         let mut empty = Vec::new();
-        for want in &fetch.wanted {
-            let read = match self.place(want, probes) {
-                Position::Refused(code) => Read::Done(refused(want.partition, code)),
-                Position::CaughtUp { at, probe } => {
-                    self.placed(want, at);
-                    Read::Done(served(want.partition, probe.high_watermark, Bytes::new()))
+        for (index, (want, position)) in fetch.wanted.iter().zip(&positions).enumerate() {
+            let read = match ahead.get_mut(index).and_then(Option::take) {
+                Some((read, owed)) if self.fits(&read, owed) => {
+                    self.spend(&read);
+                    read
                 }
-                Position::Behind { at, offset, .. }
-                | Position::Unsure { at, offset, .. }
-                | Position::Loading { at, offset, .. }
-                    if held(stuck, want.topic, at.index, offset, Instant::now()) =>
-                {
-                    Read::Done(refused(want.partition, ERROR_UNKNOWN_SERVER_ERROR))
-                }
-                Position::Behind { at, offset, probe } => {
-                    let polled = Polled::new(offset, probe.high_watermark);
-                    self.read(want, at, offset, probe, polled).await
-                }
-                Position::Unsure { at, offset, probe }
-                | Position::Loading { at, offset, probe } => {
-                    self.settle(want, at, offset, probe).await
-                }
+                _ => self.read_one(want, *position).await,
             };
             let answer = match read {
                 Read::Done(answer) => answer,
@@ -1015,6 +1028,103 @@ impl<'a> Reader<'a> {
             self.decide(&mut answers, &empty).await;
         }
         (answers, self.slot)
+    }
+
+    /// Reads the partitions that have records waiting (`Behind`, not held) at once, each in a
+    /// reader of its own, when there are two or more. Indexed like the request; `None` where no
+    /// read ahead ran. Each read says whether it owed the first record.
+    async fn read_ahead_partitions(&self, positions: &[Position]) -> Vec<Option<(Read, bool)>> {
+        let fetch = self.fetch;
+        let stuck = &fetch.connection.stuck_offsets;
+        let now = Instant::now();
+        let behind: Vec<usize> = positions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, position)| match *position {
+                Position::Behind { at, offset, .. }
+                    if !held(stuck, fetch.wanted[index].topic, at.index, offset, now) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect();
+        if behind.len() < 2 {
+            return Vec::new();
+        }
+        let first = behind[0];
+        let owed = |index: usize| self.owes_first_record && index == first;
+        let mut queue = behind.into_iter();
+        let mut running = FuturesOrdered::new();
+        for index in queue.by_ref().take(PARALLEL_PARTITIONS) {
+            running.push_back(read_partition(fetch, index, positions[index], owed(index)));
+        }
+        let mut ahead: Vec<Option<(Read, bool)>> = (0..positions.len()).map(|_| None).collect();
+        while let Some((index, read, was_owed)) = running.next().await {
+            ahead[index] = Some((read, was_owed));
+            if let Some(next) = queue.next() {
+                running.push_back(read_partition(fetch, next, positions[next], owed(next)));
+            }
+        }
+        ahead
+    }
+
+    /// Whether a read made ahead is the one a sequential read would make now: its records fit what
+    /// the response has left, and it owed the first record if and only if a sequential read would.
+    fn fits(&self, read: &Read, owed: bool) -> bool {
+        match read {
+            Read::Done(answer) => {
+                let bytes = answer.records.as_ref().map_or(0, Bytes::len);
+                let owing = self.owes_first_record;
+                // Read without owing while a sequential read owes: a record larger than the
+                // budget may have been left out.
+                if owing && !owed && bytes == 0 {
+                    return false;
+                }
+                // Read owing while a sequential read does not: a record past the budget may have
+                // been kept.
+                if owed && !owing {
+                    return false;
+                }
+                owing || bytes <= self.bytes_left
+            }
+            Read::Empty(_) => true,
+        }
+    }
+
+    /// Spends a read made ahead from the response's budget, as [`Self::read`] does.
+    fn spend(&mut self, read: &Read) {
+        if let Read::Done(answer) = read {
+            let bytes = answer.records.as_ref().map_or(0, Bytes::len);
+            self.bytes_left = self.bytes_left.saturating_sub(bytes);
+            self.owes_first_record &= bytes == 0;
+        }
+    }
+
+    /// Reads one partition at `position`.
+    async fn read_one(&mut self, want: &Wanted<'_>, position: Position) -> Read {
+        let stuck = &self.fetch.connection.stuck_offsets;
+        match position {
+            Position::Refused(code) => Read::Done(refused(want.partition, code)),
+            Position::CaughtUp { at, probe } => {
+                self.placed(want, at);
+                Read::Done(served(want.partition, probe.high_watermark, Bytes::new()))
+            }
+            Position::Behind { at, offset, .. }
+            | Position::Unsure { at, offset, .. }
+            | Position::Loading { at, offset, .. }
+                if held(stuck, want.topic, at.index, offset, Instant::now()) =>
+            {
+                Read::Done(refused(want.partition, ERROR_UNKNOWN_SERVER_ERROR))
+            }
+            Position::Behind { at, offset, probe } => {
+                let polled = Polled::new(offset, probe.high_watermark);
+                self.read(want, at, offset, probe, polled).await
+            }
+            Position::Unsure { at, offset, probe } | Position::Loading { at, offset, probe } => {
+                self.settle(want, at, offset, probe).await
+            }
+        }
     }
 
     /// [`position`], with a partition that reads as loading refused 6 for [`UNPLACED_GRACE`].
@@ -1055,6 +1165,12 @@ impl<'a> Reader<'a> {
     ) -> Read {
         let budget = want.max_bytes.min(self.bytes_left);
         if worth_polling(self.owes_first_record, budget, probe.average_size) {
+            if let Some(read) = self
+                .read_ahead(want, at, offset, probe, budget, &mut polled)
+                .await
+            {
+                return read;
+            }
             while let Some(count) = next_page(&polled, budget, probe.average_size) {
                 let asked = Instant::now();
                 let Some(page) = self.poll(want.topic, at.index, polled.next, count).await else {
@@ -1123,6 +1239,79 @@ impl<'a> Reader<'a> {
                 refused(want.partition, ERROR_UNKNOWN_SERVER_ERROR)
             }
         })
+    }
+
+    /// The first pages of a read that spans several, polled at once: the first page in the read
+    /// slot, each page after it in a free slot, as many as are free now (never waiting for one, so
+    /// another Fetch is never held up). The pages are added in offset order and stop at the first
+    /// that is short, empty, failed or not contiguous; the paged loop in [`Self::read`] goes on
+    /// from there, with its rules for empty and failed polls. `Some` only when the first page alone
+    /// decides the read (no records, or an error), as the loop would.
+    // The extra slots are moved into their polls; the lint cannot see that.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn read_ahead(
+        &mut self,
+        want: &Wanted<'_>,
+        at: ProbeAt,
+        offset: u64,
+        probe: PartitionProbe,
+        budget: usize,
+        polled: &mut Polled,
+    ) -> Option<Read> {
+        let first = next_page(polled, budget, probe.average_size)?;
+        let ahead = ahead_pages(polled, first, budget, probe.average_size);
+        if ahead.is_empty() {
+            return None;
+        }
+        let fetch = self.fetch;
+        let mut slots = Vec::with_capacity(ahead.len());
+        for _ in &ahead {
+            match fetch.bridge.try_fetch_slot() {
+                Some(slot) => slots.push(slot),
+                None => break,
+            }
+        }
+        if slots.is_empty() {
+            return None;
+        }
+        let asked = Instant::now();
+        let start = polled.next;
+        let first_poll = self.poll(want.topic, at.index, start, first);
+        let others = futures::future::join_all(slots.into_iter().zip(&ahead).map(
+            |(slot, &(from, count))| poll_page(fetch, slot, want.topic, at.index, from, count),
+        ));
+        let (first_page, pages) = tokio::join!(first_poll, others);
+        match first_page? {
+            Ok(page) if page.messages.is_empty() => {
+                // An empty grown poll shrinks the read; the loop asks again in small pages.
+                if first > MAX_PAGE_COUNT && !polled.shrunk {
+                    polled.shrunk = true;
+                    return None;
+                }
+                return Some(Read::Empty(EmptyRead {
+                    at,
+                    offset,
+                    before: probe,
+                    asked,
+                }));
+            }
+            Ok(page) => polled.add(page, first),
+            Err(error) => return Some(Read::Done(self.refuse(want, at, offset, &error))),
+        }
+        for (from, count, page) in pages {
+            match page {
+                Some(Ok(page))
+                    if !polled.done
+                        && from == polled.next
+                        && page.messages.first().map(|m| m.header.offset) == Some(from) =>
+                {
+                    polled.add(page, count);
+                }
+                // Short, empty, failed, timed out or out of line: the loop takes over.
+                _ => break,
+            }
+        }
+        None
     }
 
     /// Reads a partition the probe cannot place, with a poll at `offset`.
@@ -1782,7 +1971,7 @@ impl Polled {
         if self.shrunk || size > GROWN_PAGE_MAX_SIZE {
             MAX_PAGE_COUNT
         } else {
-            GROWN_PAGE_COUNT
+            grown_page_count(size)
         }
     }
 
@@ -1802,6 +1991,83 @@ impl Polled {
         }
         self.messages.extend(page.messages);
     }
+}
+
+/// Messages one grown poll asks for when messages take `size` bytes: [`GROWN_PAGE_BYTES`] of them.
+fn grown_page_count(size: u64) -> u32 {
+    let count = GROWN_PAGE_BYTES / size.max(1);
+    u32::try_from(count)
+        .unwrap_or(MAX_GROWN_PAGE_COUNT)
+        .clamp(MAX_PAGE_COUNT, MAX_GROWN_PAGE_COUNT)
+}
+
+/// One partition read ahead in a reader of its own (see `Reader::read_ahead_partitions`). Its
+/// slot goes back to the pool when it ends.
+///
+/// Not an `async fn`: the explicit `Send` bound is what lets the connection's future stay `Send`
+/// with these futures held across awaits.
+#[allow(clippy::manual_async_fn)]
+fn read_partition<'a>(
+    fetch: &'a Fetch<'a>,
+    index: usize,
+    position: Position,
+    owed: bool,
+) -> impl Future<Output = (usize, Read, bool)> + Send + 'a {
+    async move {
+        let mut reader = Reader::new(fetch);
+        reader.owes_first_record = owed;
+        let read = reader.read_one(&fetch.wanted[index], position).await;
+        drop(reader);
+        (index, read, owed)
+    }
+}
+
+/// One page read ahead in `slot` (see `Reader::read_ahead`). The slot goes back to the pool when
+/// the poll ends, whatever came. Not an `async fn`, for the reason [`read_partition`] gives.
+#[allow(clippy::manual_async_fn)]
+fn poll_page<'a>(
+    fetch: &'a Fetch<'a>,
+    slot: FetchSlot,
+    topic: &'a str,
+    partition: u32,
+    from: u64,
+    count: u32,
+) -> impl Future<
+    Output = (
+        u64,
+        u32,
+        Option<core::result::Result<PolledMessages, BridgeError>>,
+    ),
+> + Send
++ 'a {
+    async move {
+        let polled = fetch
+            .bridge
+            .poll(slot, topic, partition, from, count, fetch.give_up_at)
+            .await;
+        (from, count, polled.map(|(page, _slot)| page))
+    }
+}
+
+/// The pages after the first that one partition read can poll at once: their start offsets and
+/// counts, each `count` messages on from the last, up to what the budget and the partition hold.
+/// Empty when the read fits one page or more than one page is not worth it.
+fn ahead_pages(polled: &Polled, first: u32, budget: usize, average_size: u64) -> Vec<(u64, u32)> {
+    if !polled.messages.is_empty() || first <= MAX_PAGE_COUNT {
+        return Vec::new();
+    }
+    let waiting = polled.high_watermark.saturating_sub(polled.next);
+    let fits = u64::try_from(budget).unwrap_or(u64::MAX) / average_size.max(1);
+    let total = waiting.min(fits).min(u64::from(MAX_POLL_COUNT));
+    let mut pages = Vec::new();
+    let mut next = polled.next.saturating_add(u64::from(first));
+    let end = polled.next.saturating_add(total);
+    while next < end && pages.len() + 1 < PARALLEL_PAGES {
+        let count = u32::try_from((end - next).min(u64::from(first))).unwrap_or(first);
+        pages.push((next, count));
+        next = next.saturating_add(u64::from(count));
+    }
+    pages
 }
 
 /// Messages to ask for in the next poll of one partition read, or `None` when it is done.
@@ -2220,7 +2486,7 @@ mod tests {
         let mib = 1024 * 1024;
         assert_eq!(
             next_page(&Polled::new(0, 10_000), mib, 100),
-            Some(GROWN_PAGE_COUNT)
+            Some(grown_page_count(100))
         );
         assert_eq!(
             next_page(&Polled::new(0, 10_000), 64 * mib, 16 * 1024),
@@ -2240,11 +2506,61 @@ mod tests {
     }
 
     #[test]
+    fn given_a_message_size_when_sizing_a_grown_page_should_ask_for_its_byte_budget() {
+        assert_eq!(grown_page_count(128), 4096);
+        assert_eq!(grown_page_count(1024), 512);
+        assert_eq!(grown_page_count(8 * 1024), 64);
+        assert_eq!(grown_page_count(0), MAX_GROWN_PAGE_COUNT, "never unbounded");
+        assert_eq!(
+            grown_page_count(u64::MAX),
+            MAX_PAGE_COUNT,
+            "never below a small page"
+        );
+    }
+
+    #[test]
+    fn given_a_read_of_several_pages_when_reading_ahead_should_plan_contiguous_pages() {
+        let mib = 1024 * 1024;
+        let polled = Polled::new(100, 100 + 10_000);
+        // 1 MiB of 164-byte messages: 6393 messages, pages of 1000 after the first.
+        let ahead = ahead_pages(&polled, 1000, mib, 164);
+        assert_eq!(ahead, vec![(1100, 1000), (2100, 1000), (3100, 1000)]);
+        assert_eq!(ahead.len(), PARALLEL_PAGES - 1);
+        // Only what waits.
+        let short = Polled::new(0, 2500);
+        assert_eq!(
+            ahead_pages(&short, 1000, mib, 100),
+            vec![(1000, 1000), (2000, 500)]
+        );
+        // One page holds it all, or the messages are big: nothing ahead.
+        assert_eq!(
+            ahead_pages(&Polled::new(0, 800), 1000, mib, 100),
+            Vec::<(u64, u32)>::new()
+        );
+        assert_eq!(
+            ahead_pages(&Polled::new(0, 10_000), MAX_PAGE_COUNT, mib, 64 * 1024),
+            Vec::<(u64, u32)>::new()
+        );
+        // A read that already holds messages pages one at a time.
+        let mut started = Polled::new(0, 10_000);
+        started.add(page(0, &[100; 16], 9_999), 16);
+        assert_eq!(
+            ahead_pages(&started, 1000, mib, 100),
+            Vec::<(u64, u32)>::new()
+        );
+    }
+
+    #[test]
     fn given_small_messages_when_sizing_later_pages_should_grow_to_the_cap() {
         let mut polled = Polled::new(0, 10_000);
         polled.add(page(0, &[100; 16], 15), 16);
         assert_eq!(polled.next, 16);
-        assert_eq!(next_page(&polled, 1024 * 1024, 100), Some(GROWN_PAGE_COUNT));
+        // Later pages go by the largest stored message: 100 bytes and its header.
+        let stored = u64::try_from(polled.largest).unwrap();
+        assert_eq!(
+            next_page(&polled, 1024 * 1024, 100),
+            Some(grown_page_count(stored))
+        );
     }
 
     #[test]
@@ -2265,8 +2581,10 @@ mod tests {
 
     #[test]
     fn given_the_count_cap_when_sizing_the_next_page_should_not_pass_it() {
-        let mut polled = Polled::new(0, 10_000);
-        polled.add(page(0, &[1; 990], 989), 990);
+        let taken = MAX_POLL_COUNT - 10;
+        let mut polled = Polled::new(0, 100_000);
+        let sizes = vec![1; usize::try_from(taken).unwrap()];
+        polled.add(page(0, &sizes, u64::from(taken) - 1), taken);
         assert_eq!(next_page(&polled, usize::MAX, 1), Some(10));
     }
 

@@ -37,9 +37,11 @@ use super::{
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 
-/// Fetch reads that poll at once. Each has its own Iggy client, so a poll that Iggy holds up
-/// stalls only its own slot, and only until the request deadline.
-const FETCH_SLOTS: usize = 4;
+/// Fetch polls in flight at once, over all connections. Each has its own Iggy client, so a poll
+/// that Iggy holds up stalls only its own slot, and only until the request deadline. A partition
+/// read polls up to `PARALLEL_PAGES` (4) pages at once in free slots, so 16 lets four consumers
+/// read ahead together.
+const FETCH_SLOTS: usize = 16;
 
 /// The Fetch read slots, with a client for each.
 pub(super) struct FetchPool {
@@ -64,6 +66,21 @@ impl FetchPool {
     /// once and drop the slot's client.
     async fn take(self: &Arc<Self>, deadline: Instant) -> Option<FetchSlot> {
         let permit = permit_by(&self.permits, deadline).await?;
+        let client = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()?;
+        Some(FetchSlot {
+            client,
+            pool: Arc::clone(self),
+            _permit: permit,
+        })
+    }
+
+    /// A slot that is free now, or `None`. Never waits.
+    fn try_take(self: &Arc<Self>) -> Option<FetchSlot> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
         let client = self
             .idle
             .lock()
@@ -362,6 +379,12 @@ impl IggyBridge {
     /// A Fetch read slot, with its own client. `None` if none frees by `deadline`.
     pub(crate) async fn fetch_slot(&self, deadline: Instant) -> Option<FetchSlot> {
         self.fetch_pool.take(deadline).await
+    }
+
+    /// A Fetch read slot that is free now, or `None`. For polls that read ahead: they never wait
+    /// for a slot another Fetch could use.
+    pub(crate) fn try_fetch_slot(&self) -> Option<FetchSlot> {
+        self.fetch_pool.try_take()
     }
 
     /// Probes every partition of the topic `kafka_topic` maps to, with one `get_topic` call, or
