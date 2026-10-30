@@ -61,7 +61,7 @@ use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProdu
 use kafka_protocol::messages::sync_group_request::SyncGroupRequestAssignment;
 use kafka_protocol::messages::{
     ApiKey, BrokerId, CreateTopicsRequest, DeleteRecordsRequest, DescribeConfigsRequest,
-    FetchRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest,
+    DescribeGroupsRequest, FetchRequest, FindCoordinatorRequest, GroupId, HeartbeatRequest,
     IncrementalAlterConfigsRequest, InitProducerIdRequest, JoinGroupRequest, LeaveGroupRequest,
     ListOffsetsRequest, MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, ProduceRequest,
     ProducerId, SyncGroupRequest, TopicName, TransactionalId,
@@ -133,6 +133,7 @@ enum Scenario {
     DeleteRecords,
     ClassicGroup,
     StandaloneCommit,
+    OffsetMetadata,
     InitProducerId,
     IdempotentProducer,
     IdempotentRestart,
@@ -146,7 +147,7 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::ApiVersions,
         Self::TopicAdmin,
         Self::ProduceFetch,
@@ -155,6 +156,7 @@ impl Scenario {
         Self::DeleteRecords,
         Self::ClassicGroup,
         Self::StandaloneCommit,
+        Self::OffsetMetadata,
         Self::InitProducerId,
         Self::IdempotentProducer,
         Self::IdempotentRestart,
@@ -177,6 +179,7 @@ impl Scenario {
             Self::DeleteRecords => "delete_records",
             Self::ClassicGroup => "classic_group",
             Self::StandaloneCommit => "standalone_commit",
+            Self::OffsetMetadata => "offset_metadata",
             Self::InitProducerId => "init_producer_id",
             Self::IdempotentProducer => "idempotent_producer",
             Self::IdempotentRestart => "idempotent_restart",
@@ -192,7 +195,7 @@ impl Scenario {
 
     /// Whether the scenario restarts the target's broker, which only a local target allows.
     const fn restarts_a_broker(self) -> bool {
-        matches!(self, Self::IdempotentRestart)
+        matches!(self, Self::IdempotentRestart | Self::OffsetMetadata)
     }
 
     async fn run(self, cx: &Context) -> Result<Facts, String> {
@@ -207,6 +210,7 @@ impl Scenario {
             Self::DeleteRecords => delete_records(cx, &mut client, &mut facts).await?,
             Self::ClassicGroup => classic_group(cx, &mut client, &mut facts).await?,
             Self::StandaloneCommit => standalone_commit(cx, &mut client, &mut facts).await?,
+            Self::OffsetMetadata => offset_metadata(cx, &mut client, &mut facts).await?,
             Self::InitProducerId => init_producer_id(cx, &mut client, &mut facts).await?,
             Self::IdempotentProducer => idempotent_producer(cx, &mut client, &mut facts).await?,
             Self::IdempotentRestart => idempotent_restart(cx, &mut client, &mut facts).await?,
@@ -1208,6 +1212,46 @@ async fn sync(
     Ok(())
 }
 
+/// KW-12: what `DescribeGroups` reports for the one member: the client id the request header
+/// carried, an address the way Java prints one (hosts differ between targets, so only its shape
+/// is compared), and a member id shaped `clientId-...`.
+async fn describe_member(
+    client: &mut WireClient,
+    group_id: &str,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let request = DescribeGroupsRequest::default().with_groups(vec![group(group_id)]);
+    let version = version(client, ApiKey::DescribeGroups, 5)?;
+    let response = client.send(&request, version).await?;
+    let described = response
+        .groups
+        .first()
+        .ok_or_else(|| "DescribeGroups answered no group".to_string())?;
+    facts.set("describe.error", described.error_code);
+    facts.set("describe.state", described.group_state.as_str());
+    facts.set("describe.members", described.members.len());
+    if let Some(member) = described.members.first() {
+        facts.set(
+            "describe.client_id_is_the_header_client_id",
+            member.client_id.as_str() == oracle::CLIENT_ID,
+        );
+        let host = member.client_host.as_str();
+        facts.set(
+            "describe.client_host_is_a_slash_and_an_address",
+            host.strip_prefix('/')
+                .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok()),
+        );
+        facts.set(
+            "describe.member_id_starts_with_the_client_id",
+            member
+                .member_id
+                .as_str()
+                .starts_with(&format!("{}-", oracle::CLIENT_ID)),
+        );
+    }
+    Ok(())
+}
+
 async fn classic_group(
     cx: &Context,
     client: &mut WireClient,
@@ -1255,6 +1299,7 @@ async fn classic_group(
         facts,
     )
     .await?;
+    describe_member(client, &group_id, facts).await?;
     facts.set(
         "heartbeat.error",
         heartbeat(client, &group_id, joined.generation_id, &member_id).await?,
@@ -1346,6 +1391,120 @@ async fn standalone_commit(
         facts,
         "after_reset",
         &fetch_offsets(client, &group_id, &name).await?,
+    );
+    Ok(())
+}
+
+/// Commits partition 0 and 1 of `name` outside the group protocol, each with its own offset and
+/// metadata string, and returns each partition's code.
+async fn commit_with_metadata(
+    client: &mut WireClient,
+    group_id: &str,
+    name: &str,
+    partitions: &[(i32, i64, Option<&str>)],
+) -> Result<Vec<i16>, String> {
+    let request = OffsetCommitRequest::default()
+        .with_group_id(group(group_id))
+        .with_generation_id_or_member_epoch(-1)
+        .with_member_id(s(""))
+        .with_retention_time_ms(-1)
+        .with_topics(vec![
+            OffsetCommitRequestTopic::default()
+                .with_name(topic(name))
+                .with_partitions(
+                    partitions
+                        .iter()
+                        .map(|&(index, offset, metadata)| {
+                            OffsetCommitRequestPartition::default()
+                                .with_partition_index(index)
+                                .with_committed_offset(offset)
+                                .with_committed_leader_epoch(-1)
+                                .with_committed_metadata(metadata.map(s))
+                        })
+                        .collect(),
+                ),
+        ]);
+    let version = version(client, ApiKey::OffsetCommit, 8)?;
+    let response = client.send(&request, version).await?;
+    let mut codes: Vec<(i32, i16)> = response
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.partitions)
+        .map(|partition| (partition.partition_index, partition.error_code))
+        .collect();
+    codes.sort_unstable();
+    Ok(codes.into_iter().map(|(_, code)| code).collect())
+}
+
+/// KW-12: the string committed with an offset comes back with it, also after the broker (or the
+/// gateway) restarts; a string past `offset.metadata.max.bytes` is refused on its partition;
+/// a null string reads back as `""`, and a commit without one clears the old one.
+async fn offset_metadata(
+    cx: &Context,
+    client: &mut WireClient,
+    facts: &mut Facts,
+) -> Result<(), String> {
+    let restart = cx
+        .restart
+        .clone()
+        .ok_or_else(|| format!("no way to restart {}", cx.target.kind))?;
+    let name = cx.name("offset_metadata", "t");
+    let group_id = cx.name("offset_metadata", "g");
+    create_topic(client, &name, &[]).await?;
+    await_topic(client, &name).await?;
+    find_group_coordinator(client, &group_id).await?;
+    let codes = commit_with_metadata(
+        client,
+        &group_id,
+        &name,
+        &[(0, 5, Some("task 0_1; ts=1700000000000")), (1, 6, None)],
+    )
+    .await?;
+    facts.set("commit.errors", format!("{codes:?}"));
+    set_offsets(
+        facts,
+        "committed",
+        &fetch_offsets(client, &group_id, &name).await?,
+    );
+
+    restart().await?;
+    let mut client = WireClient::connect_target(&cx.target).await?;
+    // A broker loads its offsets on first use after a restart; clients retry these codes.
+    let mut fetched = Vec::new();
+    for _ in 0..120 {
+        find_group_coordinator(&mut client, &group_id).await?;
+        fetched = fetch_offsets(&mut client, &group_id, &name).await?;
+        if !fetched
+            .first()
+            .is_some_and(|(error, _, _)| coordinator_loading(*error))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    set_offsets(facts, "after_restart", &fetched);
+
+    let too_long = "x".repeat(4097);
+    let codes = commit_with_metadata(
+        &mut client,
+        &group_id,
+        &name,
+        &[(0, 7, Some(too_long.as_str())), (1, 8, Some("fits"))],
+    )
+    .await?;
+    facts.set("too_large.errors", format!("{codes:?}"));
+    set_offsets(
+        facts,
+        "after_too_large",
+        &fetch_offsets(&mut client, &group_id, &name).await?,
+    );
+
+    let codes = commit_with_metadata(&mut client, &group_id, &name, &[(0, 9, Some(""))]).await?;
+    facts.set("cleared.errors", format!("{codes:?}"));
+    set_offsets(
+        facts,
+        "after_cleared",
+        &fetch_offsets(&mut client, &group_id, &name).await?,
     );
     Ok(())
 }

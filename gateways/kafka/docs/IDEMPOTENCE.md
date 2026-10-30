@@ -279,7 +279,7 @@ Kafka rebuilds its producer state from its log on start. The gateway does the sa
   id, epoch and first and last sequence, and says `kafka.v` 2 (`docs/BRIDGE_MAPPING.md`, "Batch-level
   fields"). Fetch shows the record unchanged.
 - Before a gateway checks the first idempotent batch for a partition, it reads the marks in the
-  partition's last `DEFAULT_RECOVERY_RECORDS` (10,000) records and rebuilds each producer seen
+  partition's last `IGGY_KAFKA_PRODUCER_STATE_RECOVERY_RECORDS` (10,000 by default) records and rebuilds each producer seen
   there: its newest epoch and its last five batches with their offsets
   (`ProducerStates::restore`, `IggyBridge::producer_marks`). Once per partition and gateway run.
   If the scan fails, the batch answers as the bridge failed (retriable) and nothing is written:

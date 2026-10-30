@@ -21,6 +21,8 @@
 //! (`docs/OFFSET_STORAGE.md`). The response has no top-level error, so a group answer goes on
 //! every partition.
 
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use kafka_protocol::messages::offset_commit_response::{
     OffsetCommitResponsePartition, OffsetCommitResponseTopic,
@@ -29,13 +31,15 @@ use kafka_protocol::messages::{OffsetCommitRequest, OffsetCommitResponse};
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::authz::TopicOp;
-use crate::bridge::{IggyBridge, OffsetCalls};
+use crate::bridge::{IggyBridge, OffsetCalls, TopicTarget};
+use crate::commit_metadata::{CommitMetadata, Committed, MetadataRecord, kafka_length};
 use crate::error::Result;
 use crate::group::CommitRequest;
 use crate::protocol::api::{
     API_KEY_OFFSET_COMMIT, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
-    ERROR_NONE, ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, is_supported_version,
+    ERROR_NONE, ERROR_OFFSET_METADATA_TOO_LARGE, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
+    is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_offset_commit_shape;
 use crate::protocol::handlers::{
@@ -96,7 +100,11 @@ pub async fn handle(
             // The commit stays counted until none of its Iggy calls can land, also past the
             // deadline, so a deletion of the group's offsets waits for them.
             let calls = OffsetCalls::new(offset_deadline(state, connection).await).keeping(commit);
-            commit_all(bridge, &request, &calls).await
+            let metadata = MetadataPolicy {
+                store: state.commit_metadata.as_deref(),
+                max_len: state.limits.offset_metadata_max_bytes,
+            };
+            commit_all(bridge, &request, &calls, metadata).await
         }
         (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
         (_, Err(error)) => same_code(&request, error),
@@ -105,12 +113,26 @@ pub async fn handle(
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }
 
+/// Where commit metadata goes, and how long it may be.
+#[derive(Clone, Copy)]
+struct MetadataPolicy<'a> {
+    store: Option<&'a CommitMetadata>,
+    /// Kafka's `offset.metadata.max.bytes`, in Java string length.
+    max_len: usize,
+}
+
 /// Stores every requested offset. The slots run at once, each one partition at a time, and a
 /// partition that the deadline leaves out answers 14 and makes no call.
+///
+/// A metadata string longer than the cap answers `OFFSET_METADATA_TOO_LARGE` (12) and stores
+/// nothing for its partition, as in Kafka. The strings of the rest go to the metadata log first
+/// (KW-12): a partition whose string cannot be kept is not committed either, and answers the
+/// log's error, so a client never reads back an offset without the string it committed.
 async fn commit_all(
     bridge: &IggyBridge,
     request: &OffsetCommitRequest,
     calls: &OffsetCalls,
+    metadata: MetadataPolicy<'_>,
 ) -> Vec<OffsetCommitResponseTopic> {
     let group = request.group_id.0.as_str();
     let targets: Vec<_> = request
@@ -124,9 +146,14 @@ async fn commit_all(
     let mut positions = Vec::new();
     for (topic_at, (topic, target)) in request.topics.iter().zip(&targets).enumerate() {
         for (partition_at, partition) in topic.partitions.iter().enumerate() {
+            let too_large = partition
+                .committed_metadata
+                .as_ref()
+                .is_some_and(|text| kafka_length(text) > metadata.max_len);
             let code = match (target, u32::try_from(partition.partition_index)) {
                 (Err(error), _) => error.to_offset_error_code(),
                 (Ok(_), Err(_)) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                (Ok(_), Ok(_)) if too_large => ERROR_OFFSET_METADATA_TOO_LARGE,
                 (Ok(target), Ok(index)) => {
                     commits.push((target, index, partition.committed_offset));
                     positions.push((topic_at, partition_at));
@@ -135,6 +162,10 @@ async fn commit_all(
             };
             topics[topic_at].partitions[partition_at].error_code = code;
         }
+    }
+
+    if let Some(store) = metadata.store {
+        (commits, positions) = keep_metadata(store, request, commits, positions, &mut topics).await;
     }
 
     let results = bridge.commit_group_offsets(group, &commits, calls).await;
@@ -168,6 +199,64 @@ async fn commit_all(
         );
     }
     topics
+}
+
+/// Appends the metadata records the commits at `positions` need, and returns the commits and
+/// positions that may go ahead. When the append fails, the partitions that needed a record answer
+/// its error and are left out; the rest commit as usual.
+async fn keep_metadata<'a>(
+    store: &CommitMetadata,
+    request: &OffsetCommitRequest,
+    commits: Vec<(&'a TopicTarget, u32, i64)>,
+    positions: Vec<(usize, usize)>,
+    topics: &mut [OffsetCommitResponseTopic],
+) -> (Vec<(&'a TopicTarget, u32, i64)>, Vec<(usize, usize)>) {
+    let group = request.group_id.0.as_str();
+    let committed: Vec<Committed<'_>> = positions
+        .iter()
+        .map(|&(topic_at, partition_at)| {
+            let topic = &request.topics[topic_at];
+            let partition = &topic.partitions[partition_at];
+            Committed {
+                topic: topic.name.0.as_str(),
+                partition: partition.partition_index,
+                offset: partition.committed_offset,
+                metadata: partition.committed_metadata.as_deref(),
+            }
+        })
+        .collect();
+    let records = store.records_for(group, &committed);
+    let Err(error) = store.append(&records).await else {
+        return (commits, positions);
+    };
+    let code = error.to_offset_error_code();
+    tracing::warn!(
+        group,
+        %error,
+        "could not keep Kafka commit metadata; refusing those commits"
+    );
+    let failed: HashSet<(&str, i32)> = records
+        .iter()
+        .filter_map(|record| match record {
+            MetadataRecord::Partition {
+                topic, partition, ..
+            } => Some((topic.as_str(), *partition)),
+            MetadataRecord::GroupDeleted { .. } => None,
+        })
+        .collect();
+    let mut kept_commits = Vec::with_capacity(commits.len());
+    let mut kept_positions = Vec::with_capacity(positions.len());
+    for (commit, (topic_at, partition_at)) in commits.into_iter().zip(positions) {
+        let topic = &request.topics[topic_at];
+        let index = topic.partitions[partition_at].partition_index;
+        if failed.contains(&(topic.name.0.as_str(), index)) {
+            topics[topic_at].partitions[partition_at].error_code = code;
+        } else {
+            kept_commits.push(commit);
+            kept_positions.push((topic_at, partition_at));
+        }
+    }
+    (kept_commits, kept_positions)
 }
 
 /// Every requested topic and partition, in request order, with `code`.

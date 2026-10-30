@@ -57,8 +57,10 @@ consumers stopped, because that group is `Empty` while it holds offsets. Without
 `DeleteGroups` and `OffsetDelete` ([below](#deleting-groups-and-offsets)). See
 [OFFSET_STORAGE.md](OFFSET_STORAGE.md) for offset behavior and limits.
 
-Member `client_id` and `client_host` are empty. The coordinator does not keep the request
-header's client id or the connection's peer address. `include_authorized_operations` is answered
+Each member reports the `client_id` of the request header it joined with (up to 1024 bytes) and
+`client_host`, the peer address as Java prints it (`/127.0.0.1`), so `kafka-consumer-groups
+--describe` shows hosts. Its member id is `clientId-UUID`, as in Kafka, or `groupInstanceId-UUID`
+for a static member. `include_authorized_operations` is answered
 with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
 `classic`, which is the only protocol this coordinator runs.
 
@@ -415,7 +417,8 @@ short `session.timeout.ms`, or Java 4.1+ `CloseOptions.LEAVE_GROUP`.
 
 ## Capacity caps
 
-`GroupCoordinatorConfig` (no environment variables yet; `GatewayConfig.group`):
+`GroupCoordinatorConfig` (`GatewayConfig.group`), each one moved by the variable in the README's
+[limits table](../README.md#limits-that-differ-from-kafka-4530):
 
 | Setting | Default | Meaning |
 | --- | --- | --- |

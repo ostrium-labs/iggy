@@ -69,14 +69,6 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// First version that may name a topic by id.
 const TOPIC_ID_MIN_VERSION: i16 = 6;
 
-/// Cap on topic names one `DeleteTopics` request may address through the bridge.
-///
-/// Same rationale as `create_topics`'s own `MAX_CONFIG_TOPICS`-based cap, but counted differently: every
-/// name here costs its own bridge round trip against the single lockstep `IggyClient` every
-/// Kafka connection on this gateway shares, duplicates included, so this charges the raw count
-/// rather than the distinct one `CreateTopics` charges.
-const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
-
 pub async fn handle(
     state: &GatewayState,
     principal: Option<&AuthenticatedPrincipal>,
@@ -137,14 +129,19 @@ pub async fn handle(
         return respond_or_close(encode_message(&resp, api_version, 256), "DeleteTopics");
     }
 
-    if topic_names.len() > MAX_BRIDGE_BACKED_TOPICS {
+    // The cap `CreateTopics` applies (`IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST`), but counted
+    // differently: every name here costs its own bridge round trip against the single lockstep
+    // `IggyClient` every Kafka connection on this gateway shares, duplicates included, so this
+    // charges the raw count rather than the distinct one `CreateTopics` charges.
+    let max_topics = state.limits.admin_topics_per_request;
+    if topic_names.len() > max_topics {
         tracing::warn!(
             requested_topics = topic_names.len(),
-            max = MAX_BRIDGE_BACKED_TOPICS,
+            max = max_topics,
             "DeleteTopics request addresses too many topics; rejecting"
         );
         let message = StrBytes::from(format!(
-            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} topic names per DeleteTopics request"
+            "this gateway addresses at most {max_topics} topic names per DeleteTopics request"
         ));
         let results = topic_names
             .iter()

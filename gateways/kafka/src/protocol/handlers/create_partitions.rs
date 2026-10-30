@@ -193,14 +193,17 @@ pub async fn handle(
         }
     }
 
-    if exceeds_topic_cap(topic_names) {
+    if exceeds_topic_cap(topic_names, state.limits.admin_topics_per_request) {
         tracing::warn!(
             requested_topics = req.topics.len(),
             "CreatePartitions request addresses too many distinct topics; rejecting"
         );
         // A server-imposed limit, not a malformed request. INVALID_REQUEST would blame the
         // client for a request Kafka itself would accept.
-        let message = StrBytes::from(topic_cap_message("CreatePartitions"));
+        let message = StrBytes::from(topic_cap_message(
+            "CreatePartitions",
+            state.limits.admin_topics_per_request,
+        ));
         results.extend(
             topics
                 .iter()

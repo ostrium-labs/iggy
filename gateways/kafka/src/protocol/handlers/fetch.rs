@@ -1778,7 +1778,7 @@ impl Polled {
     }
 
     /// Messages one poll may ask for, given the size of the biggest message it may hold.
-    fn page_cap(&self, size: u64) -> u32 {
+    const fn page_cap(&self, size: u64) -> u32 {
         if self.shrunk || size > GROWN_PAGE_MAX_SIZE {
             MAX_PAGE_COUNT
         } else {

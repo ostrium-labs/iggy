@@ -66,7 +66,7 @@ pub const DEFAULT_EXPIRY: Duration = Duration::from_hours(24);
 /// Records at a partition's tail read to rebuild its producers' state and to find a batch.
 ///
 /// A producer whose last batches are older than this is not known, and is accepted at any
-/// sequence. The plan's `producer_state_recovery_records`; configurable with KW-12.
+/// sequence. `IGGY_KAFKA_PRODUCER_STATE_RECOVERY_RECORDS` moves it ([`crate::limits`]).
 pub const DEFAULT_RECOVERY_RECORDS: u32 = 10_000;
 
 /// Where a batch's write stands.
@@ -187,6 +187,14 @@ impl ProducerStates {
             restored: Mutex::default(),
             recovery_records: DEFAULT_RECOVERY_RECORDS,
         }
+    }
+
+    /// The same states, rebuilding from the last `records` records of a partition instead of
+    /// [`DEFAULT_RECOVERY_RECORDS`].
+    #[must_use]
+    pub const fn with_recovery_records(mut self, records: u32) -> Self {
+        self.recovery_records = records;
+        self
     }
 
     /// The records at a partition's tail read to rebuild state and to find a batch.

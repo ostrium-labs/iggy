@@ -47,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig, SyncRequest};
+use iggy_gateway_kafka::limits;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_DESCRIBE_GROUPS, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP,
     API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_SYNC_GROUP, BrokerAdvertise,
@@ -1371,6 +1372,34 @@ async fn given_a_group_at_its_size_cap_when_joining_should_return_group_max_size
     assert_eq!(rejected.error, ERROR_GROUP_MAX_SIZE_REACHED);
 }
 
+/// KW-12: `IGGY_KAFKA_GROUP_MAX_SIZE` and `IGGY_KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS` read through
+/// `limits::apply_group_env` are what the coordinator enforces.
+#[tokio::test(start_paused = true)]
+async fn given_group_limits_from_the_environment_when_joining_should_enforce_them() {
+    let mut config = immediate_config();
+    limits::apply_group_env(&mut config, |key| match key {
+        limits::GROUP_MAX_SIZE => Some("1".to_string()),
+        limits::GROUP_MIN_SESSION_TIMEOUT_MS => Some("11000".to_string()),
+        _ => None,
+    })
+    .expect("valid limits");
+    let state = test_state(config);
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+
+    let too_short = join(&state, 3, &join_params("", protocols)).await;
+    assert_eq!(too_short.error, ERROR_INVALID_SESSION_TIMEOUT);
+
+    let long_enough = JoinGroupParams {
+        session_timeout_ms: 12_000,
+        ..join_params("", protocols)
+    };
+    assert_eq!(join(&state, 3, &long_enough).await.error, ERROR_NONE);
+    assert_eq!(
+        join(&state, 3, &long_enough).await.error,
+        ERROR_GROUP_MAX_SIZE_REACHED
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn given_an_oversized_subscription_when_joining_should_return_invalid_request() {
     let state = test_state(GroupCoordinatorConfig {
@@ -1498,6 +1527,9 @@ struct Described {
 }
 
 struct DescribedMember {
+    member_id: String,
+    client_id: String,
+    client_host: String,
     metadata: Bytes,
     assignment: Bytes,
 }
@@ -1525,20 +1557,21 @@ impl DescribeResponse {
             let member_count = read_array_count(&mut decoder, flexible);
             let mut members = Vec::with_capacity(member_count);
             for _ in 0..member_count {
-                let _member_id = read_nullable(&mut decoder, flexible);
+                let member_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
                 if version >= 4 {
                     let _instance_id = read_nullable(&mut decoder, flexible);
                 }
-                let client_id = read_nullable(&mut decoder, flexible);
-                let client_host = read_nullable(&mut decoder, flexible);
-                assert_eq!(client_id.as_deref(), Some(""));
-                assert_eq!(client_host.as_deref(), Some(""));
+                let client_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
+                let client_host = read_nullable(&mut decoder, flexible).unwrap_or_default();
                 let metadata = read_bytes_field(&mut decoder, flexible);
                 let assignment = read_bytes_field(&mut decoder, flexible);
                 if flexible {
                     decoder.read_tagged_fields().unwrap();
                 }
                 members.push(DescribedMember {
+                    member_id,
+                    client_id,
+                    client_host,
                     metadata,
                     assignment,
                 });
@@ -2255,6 +2288,18 @@ async fn given_a_live_group_over_tcp_should_describe_and_list_it_through_the_rea
     assert_eq!(described.groups[0].group_id, GROUP);
     assert_eq!(described.groups[0].state, "Stable");
     assert_eq!(described.groups[0].members.len(), 1);
+    // KW-12: the header's client id and the peer address, as Kafka reports them, and a member
+    // id shaped `clientId-UUID`.
+    let described_member = &described.groups[0].members[0];
+    assert_eq!(described_member.client_id, "consumer-group-test");
+    assert_eq!(described_member.client_host, "/127.0.0.1");
+    assert!(
+        described_member
+            .member_id
+            .starts_with("consumer-group-test-"),
+        "{}",
+        described_member.member_id
+    );
 
     write_request(
         &mut stream,

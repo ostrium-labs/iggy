@@ -45,7 +45,11 @@ leaves it behind.
   an empty id is refused in OffsetCommit and OffsetFetch too.
 - Negative offset: delete the key. A missing key or group counts as success. Kafka consumers read any
   negative offset as none.
-- Metadata string and leader epoch: dropped. OffsetFetch returns `""` and -1.
+- Leader epoch: dropped. OffsetFetch returns -1.
+- Metadata string: kept in the gateway's own log, not in Iggy's offset (see
+  [Commit metadata](#commit-metadata)). Longer than `IGGY_KAFKA_OFFSET_METADATA_MAX_BYTES` (4096,
+  Kafka's `offset.metadata.max.bytes`, counted as Java counts a string) is
+  `OFFSET_METADATA_TOO_LARGE` (12) on that partition, and nothing is stored there.
 - No key, unknown group or unknown topic: OffsetFetch returns -1 and no error.
 - Any other failed read fails the whole group in OffsetFetch. A lost read never goes back as -1,
   because the consumer then resets its position. A read that its owning shard does not answer in
@@ -162,3 +166,28 @@ Reads from the primary are [#4409](https://github.com/apache/iggy/issues/4409). 
 - Record mapping: [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md)
 - Scope: [`SCOPE.md`](SCOPE.md)
 - Offset API: `core/common/src/traits/consumer_offset_client.rs`
+
+## Commit metadata
+
+Iggy's `ExternalGroup` offset is a `u64`, so the string a client commits with an offset (Kafka
+Streams keeps its task metadata there) lives beside it, in the Iggy topic `offset_metadata` of the
+gateway's meta stream: one partition, `persisted`, no expiry, created by the first commit that
+needs it. This is the owner's ruling of 2026-10-24 (KW-12): no server change, the way Kafka keeps
+it in `__consumer_offsets`.
+
+- A record names the group, topic, partition, the offset the string came with, and the string.
+  Only a non-empty string writes one, or a commit over a partition that has one (to clear it); the
+  Java consumer's commits carry `""` and write nothing.
+- The record is written before the offset. If it cannot be written, that partition answers the
+  log's error (retriable `COORDINATOR_LOAD_IN_PROGRESS` (14) for a timeout) and its offset is not
+  committed, so no offset reads back without its string.
+- The gateway replays the log at startup, before it serves, and every `OffsetFetch` reads the
+  records added since (by this gateway or another) before it answers. A replay that fails fails the
+  group with the same codes as an offset read.
+- OffsetFetch reports the string only while Iggy's offset is the one it was committed with. An
+  offset stored some other way (an Iggy-native client, a reset) reads back with `""`.
+- `DeleteGroups` and `OffsetDelete` clear the strings of what they delete.
+- The log is never compacted yet: each commit with a string adds about 90 bytes (Iggy's message header included) plus the names
+  and the string. Kafka Streams commits every 30 s per task by default. Compaction comes with
+  KW-6; until then an operator can delete the topic while no client relies on the strings (the
+  next commit recreates it).

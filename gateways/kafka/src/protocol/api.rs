@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -30,8 +31,10 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::cluster_id::ClusterId;
+use crate::commit_metadata::CommitMetadata;
 use crate::error::Result;
-use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
+use crate::group::{ClientIdentity, GroupCoordinator, GroupCoordinatorConfig, GroupMember};
+use crate::limits::RequestLimits;
 use crate::listener::SecurityProtocol;
 use crate::membership::Membership;
 use crate::producer_state::ProducerStates;
@@ -99,6 +102,8 @@ pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = ResponseError::UnknownServerError.co
 pub const ERROR_NONE: i16 = 0;
 /// Fetch: the offset is negative or past the high watermark. The client resets its position.
 pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = ResponseError::OffsetOutOfRange.code();
+/// A commit's metadata string is longer than `offset.metadata.max.bytes`. Not retriable.
+pub const ERROR_OFFSET_METADATA_TOO_LARGE: i16 = ResponseError::OffsetMetadataTooLarge.code();
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = ResponseError::UnknownTopicOrPartition.code();
 /// Retriable, nothing written. The Produce stub, and a partition refused because the request
 /// budget ran out.
@@ -409,6 +414,11 @@ pub struct GatewayState {
     /// The transaction coordinator, present only while `IGGY_KAFKA_TRANSACTIONS_ENABLED` is on
     /// (KW-T). Without it, transactions are refused as `docs/IDEMPOTENCE.md` describes.
     pub transactions: Option<Arc<TransactionCoordinator>>,
+    /// The per-request caps an operator can move ([`crate::limits`]).
+    pub limits: RequestLimits,
+    /// Offset-commit metadata strings, kept in a gateway-owned Iggy topic (KW-12). Present
+    /// with the bridge.
+    pub commit_metadata: Option<Arc<CommitMetadata>>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -450,7 +460,31 @@ impl GatewayState {
             topic_ids: TopicIds::default(),
             membership: Arc::default(),
             transactions: None,
+            limits: RequestLimits::default(),
+            commit_metadata: None,
         }
+    }
+
+    /// Keeps offset-commit metadata in `store`.
+    #[must_use]
+    pub fn with_commit_metadata(mut self, store: Arc<CommitMetadata>) -> Self {
+        self.commit_metadata = Some(store);
+        self
+    }
+
+    /// Enforces `limits` instead of the defaults. Call it before the state is shared: it
+    /// replaces the producer states, which are empty until then.
+    #[must_use]
+    pub fn with_limits(mut self, limits: RequestLimits) -> Self {
+        self.producer_states = Arc::new(
+            ProducerStates::new(
+                crate::producer_state::DEFAULT_MAX_ENTRIES,
+                limits.producer_id_expiration,
+            )
+            .with_recovery_records(limits.producer_state_recovery_records),
+        );
+        self.limits = limits;
+        self
     }
 
     /// Takes part in `membership` instead of running alone.
@@ -561,6 +595,9 @@ pub struct ConnectionState {
     /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
     /// session, since its next heartbeat waits behind the call.
     heartbeat_member: Mutex<Option<GroupMember>>,
+    /// The request header's latest `client_id` and the peer address, which a member that joins
+    /// here reports in `DescribeGroups`.
+    client: Mutex<ClientIdentity>,
     /// Keys the Produce session of a producer without a producer id that this gateway gave out.
     id: ConnectionId,
 }
@@ -631,6 +668,37 @@ impl ConnectionState {
     #[must_use]
     pub fn security_protocol(&self) -> SecurityProtocol {
         self.protocol.unwrap_or(SecurityProtocol::Plaintext)
+    }
+
+    /// The same state, for a connection from `peer`.
+    #[must_use]
+    pub fn with_peer(self, peer: SocketAddr) -> Self {
+        *self.client.lock().unwrap_or_else(PoisonError::into_inner) =
+            ClientIdentity::new(None, Some(peer));
+        self
+    }
+
+    /// Notes the `client_id` of a request header. Clients send the same one on every request,
+    /// so this copies it only when it changes.
+    pub fn note_client_id(&self, client_id: Option<&str>) {
+        let mut client = self.client.lock().unwrap_or_else(PoisonError::into_inner);
+        let client_id = client_id.unwrap_or_default();
+        if client.client_id.as_str() != client_id {
+            let host = client.client_host.clone();
+            *client = ClientIdentity {
+                client_host: host,
+                ..ClientIdentity::new(Some(client_id), None)
+            };
+        }
+    }
+
+    /// The client id and address a member joining on this connection reports.
+    #[must_use]
+    pub fn client(&self) -> ClientIdentity {
+        self.client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn note_heartbeat(&self, member: GroupMember) {

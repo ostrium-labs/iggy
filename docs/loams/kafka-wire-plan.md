@@ -214,7 +214,7 @@ breadth. Status is `Planned` unless noted.
 | KW-9 | SASL OAUTHBEARER, then SCRAM | #4512 | **Built** (fork PR #12; auth oracle and real-client e2e green in local CI; see "As built") | KW-1 | Yes |
 | KW-10 | Per-principal authorization, ACL admin | #4518 | **Built, in review** (fork PR for parts 1-4: enforcement, group namespace, DescribeAcls of scoped grants); ACL writes (CreateAcls/DeleteAcls) next | KW-9 | Yes (design first) |
 | KW-11 | Repeated header names and header order | #4517 | **Built** (this PR) | KW-1 | Yes |
-| KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Started** (branch `kw12-limits`, not built or tested) | KW-0 | Yes |
+| KW-12 | Configurable limits; member client id and host | #4530, #4511 | **Built** (branch `kw12-limits`; commit metadata log, client id and host, limit variables) | KW-0 | Yes |
 | KW-13 | KIP-848 consumer groups | #4523 | **Started, not wired** (branch `kw13-kip848-draft`) | KW-8 | Yes |
 | KW-14 | DescribeLogDirs, read-only `__consumer_offsets` | #4524 | Planned | KW-7 | Yes |
 | KW-15 | Remaining admin APIs | #4526 | Planned | KW-3, KW-8 | Yes |
@@ -276,7 +276,7 @@ and #4525, the harness surfaced two documented behaviours that differ from
 Kafka and that Loams' clients can notice:
 
 - **Commit metadata is dropped** (#3542, `OFFSET_STORAGE.md`): OffsetFetch
-  answers `""`. Kafka Streams stores task metadata there. Added to KW-12.
+  answers `""`. Kafka Streams stores task metadata there. Added to KW-12, and kept since.
 - **Lookups by time search Iggy's append time**, not the producer timestamp
   (#4516, `BRIDGE_MAPPING.md`): backfilled or replayed records with old
   `CreateTime` resolve to the wrong offset. Flink's "start from timestamp" and
@@ -450,7 +450,7 @@ restarts Apache Kafka (and Redpanda nightly) and the gateway mid-sequence. Still
 unknown-outcome batch whose request is gone and that is not in the scanned tail or lands after the
 scan, and a late landing from a dead gateway after the next one scanned (needs KW-5's fence).
 Still open: the Java producer and franz-go e2e under injected timeouts, KIP-360's epoch bump on
-InitProducerId with an existing id, and a configurable window (KW-12).
+InitProducerId with an existing id. The window is configurable since KW-12.
 
 ### KW-4. Topic configurations frameworks send
 
@@ -919,23 +919,25 @@ consumers (hosts normalised).
 **Exit.** Every limit in #4530 has a variable and a documented Kafka
 counterpart; `kafka-consumer-groups --describe` shows hosts.
 
-**Status (2026-10-24).** Started and stopped on the owner's instruction. Branch
-`kw12-limits` holds an unbuilt first cut: `src/limits.rs` (group caps and
-session timeouts as `IGGY_KAFKA_GROUP_*`, and
-`IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST` for the 100-topic cap of
-CreateTopics, CreatePartitions, DeleteTopics and the config APIs), with unit
-tests, and the handlers reading the cap. Left: wire `limits` into `main.rs`
-(`apply_group_env`, `set_admin_topics_per_request`, `KNOWN_ENV_VARS` in the
-unknown-variable check), the README limits table (the 1000-partition cap is
-Iggy's `TooManyPartitions`, not a gateway setting; the 246-byte group id
-follows Iggy's 255-byte names), member `client_id`/`client_host` in
-DescribeGroups (the header's `client_id` is cleared in `server.rs` before
-routing and the peer address is not passed to handlers), and commit metadata.
-Commit metadata cannot go in Iggy's `ExternalGroup` offset (a `u64`; changing
-it is the state-save path, which needs the owner's OK), so the default is a
-gateway-owned Iggy topic replayed into memory at startup, like Kafka's
-`__consumer_offsets`. **Approved (owner, 2026-10-24):** commit metadata is stored
-in that gateway-owned Iggy topic and reloaded at startup, with no server change.
+**Approved (owner, 2026-10-24):** commit metadata is stored in a gateway-owned Iggy topic and
+reloaded at startup, with no server change.
+
+**As built (2026-10-26, branch `kw12-limits`).** `src/limits.rs` reads `IGGY_KAFKA_GROUP_*` (session
+timeouts, rebalance ceiling, initial delay, group, member and byte caps),
+`IGGY_KAFKA_MAX_ADMIN_TOPICS_PER_REQUEST` (CreateTopics, CreatePartitions, DeleteTopics and the
+config APIs), `IGGY_KAFKA_OFFSET_METADATA_MAX_BYTES` (`OFFSET_METADATA_TOO_LARGE`, 12),
+`IGGY_KAFKA_PRODUCER_ID_EXPIRATION_MS` and `IGGY_KAFKA_PRODUCER_STATE_RECOVERY_RECORDS` (KW-3's
+window); each is in the unknown-variable check and in the README's limits table next to its Kafka
+setting, with the fixed limits (1000 partitions, 246-byte group ids, Fetch's 1000 messages). Members
+keep the header's `client_id` and the peer as `/ip`, and their id is `clientId-UUID`, as in Kafka.
+Commit metadata goes to the topic `offset_metadata` of the meta stream (`src/commit_metadata.rs`,
+`IggyMetadataLog`) before the offset; it is replayed at startup and before each OffsetFetch, and
+reported only with the offset it was committed with (`docs/OFFSET_STORAGE.md`). Tests: unit tests for
+the variables, the record codec and the replay; `commit_metadata_real_bridge_tests.rs` (restart,
+two gateways, the cap); the TCP DescribeGroups test; the oracle scenario `offset_metadata`
+(commit, broker or gateway restart, too large, cleared) and DescribeGroups facts in
+`classic_group` match Apache Kafka 4.3.1, and the four commit-metadata differences are gone from
+`allowed_differences.toml`. Left: the log is not compacted (KW-6).
 
 ### KW-13. KIP-848 consumer groups
 
