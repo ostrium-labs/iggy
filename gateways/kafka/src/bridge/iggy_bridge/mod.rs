@@ -43,6 +43,7 @@ mod coordinator_log;
 mod fetch;
 mod group_index;
 mod group_offsets;
+mod log_start;
 mod offsets;
 mod produce;
 mod producer_ids;
@@ -62,6 +63,8 @@ use group_index::GroupIndex;
 pub use group_index::{OffsetGroupSource, OffsetGroups, ScannedGroups};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls, OffsetGroupListing};
+pub use log_start::LOG_START_GROUP;
+use log_start::LogStarts;
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{PartitionBatch, ProduceTurn, Producer};
@@ -211,6 +214,8 @@ pub struct IggyBridge {
     issued_producer_ids: producer_ids::IssuedProducerIds,
     /// The pings that say whether the bridge reaches Iggy. See [`IggyBridge::reach`].
     reach: ReachProbe,
+    /// The `DeleteRecords` watermarks read lately. See `log_start.rs`.
+    log_starts: LogStarts,
 }
 
 /// The task that follows the change log. Dropping it stops the task.
@@ -307,6 +312,7 @@ impl IggyBridge {
             id_client: LazyClient::default(),
             issued_producer_ids: producer_ids::IssuedProducerIds::default(),
             reach: ReachProbe::default(),
+            log_starts: LogStarts::default(),
         };
         bridge.follow_change_log().await;
         Ok(bridge)
@@ -657,6 +663,7 @@ impl IggyBridge {
             id_client: LazyClient::default(),
             issued_producer_ids: producer_ids::IssuedProducerIds::default(),
             reach: ReachProbe::default(),
+            log_starts: LogStarts::default(),
         }
     }
 }

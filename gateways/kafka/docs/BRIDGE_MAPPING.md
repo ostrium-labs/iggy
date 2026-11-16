@@ -39,6 +39,7 @@ Produce, per record:
 | record value | `payload` |
 | record key | `kafka.key` user header, `Raw` |
 | record header `name` | `kafka.h.<name>` user header, `Raw` |
+| record header order, when not sorted by name | `kafka.ho` user header, one byte per header |
 | record timestamp (CreateTime), milliseconds | `origin_timestamp`, microseconds, plus `kafka.ts` when that cannot hold it |
 | record offset | partition offset, assigned by Iggy |
 | partition index | partition index, both 0-based |
@@ -155,10 +156,16 @@ A record takes the fallback when any of these hold:
 - a header name, prefixed with `kafka.h.`, is longer than 255 bytes
 - a header value is null, empty, or longer than 255 bytes
 - the headers together would exceed the 100 KB user-header budget
+- two headers share a name (KafkaJS array headers, Spring's repeated trace headers)
+- the headers are not in name order and there are more than 255 of them, too many for
+  `kafka.ho` (see Header order)
 
-A repeated header name is refused with `INVALID_RECORD` (87). Kafka allows one, but
-`kafka_protocol` decodes headers into an `IndexMap` and keeps only the last value. The gateway
-checks the raw record bytes first (`scan_records`).
+A repeated name needs the envelope because Iggy keys headers in a map. It also gets past
+`kafka_protocol`, which decodes headers into an `IndexMap` and keeps only the last value of a
+name: Produce reads the full list from the raw record bytes (`scan_records`) and hands it to the
+encoder beside the `Record`, and Fetch writes the list back into the encoded batch
+(`records::headers::splice`), fixing the record length, the batch length and the CRC. The record
+reaches the consumer with every header, in send order, byte for byte as Kafka would serve it.
 
 Such a record is stored with a `kafka.envelope` header whose value is one byte, the byte layout
 version, currently `1`. The payload holds the key, the value and the headers in the layout below.
@@ -300,57 +307,53 @@ example for a request it classifies as a duplicate, in which case the response c
 rather than a guessed offset; Kafka clients surface that as an unknown offset.
 
 ListOffsets LATEST is the high watermark of the topic probe `IggyBridge::partition_probes` reads
-on the bridge's probe client. EARLIEST has no
-server-side field today (`Partition` carries no log start offset), so it answers `0`. The
-`(messages_count, current_offset) == (0, 0)` ambiguity documented on `high_watermark` in
-`src/bridge/iggy_bridge/offsets.rs` applies to LATEST.
+on the bridge's probe client. The `(messages_count, current_offset) == (0, 0)` ambiguity
+documented on `high_watermark` in `src/bridge/iggy_bridge/offsets.rs` applies to LATEST.
 
-ListOffsets by timestamp ([#4516](https://github.com/apache/iggy/issues/4516)) polls one record
-by time and answers its offset and its timestamp as Fetch reports it: the producer timestamp when
-one was set, otherwise the append time.
+EARLIEST is the log start offset ([#4525](https://github.com/apache/iggy/issues/4525)): the first
+record Iggy keeps, read with one poll, or the `DeleteRecords` watermark if that is higher (see
+`SCOPE.md`, "DeleteRecords and the log start offset"). A partition whose watermark reaches its high
+watermark, or whose high watermark is 0, answers without a poll. An empty poll answers the high
+watermark where the probe counted no message, and `NOT_LEADER_OR_FOLLOWER` (6) otherwise. EARLIEST
+never answers `-1`: the async Java consumer throws on that.
+
+ListOffsets by timestamp ([#4516](https://github.com/apache/iggy/issues/4516)) answers the first
+record whose timestamp is at or after the time, with its offset and its timestamp as Fetch
+reports them: the producer timestamp when one was set, otherwise the append time. A Kafka broker
+searches a `CreateTime` topic the same way, so a backfill or a replay with old producer timestamps
+resolves where Flink's `OffsetsInitializer.timestamp()` and `--reset-offsets --to-datetime`
+expect it. Iggy's own lookup by time matches the append time, so the gateway does not use it: it
+reads the last record, then runs a binary search between the `DeleteRecords` watermark and it,
+one record per read, about 30 reads for a billion records. A read at an offset retention removed
+returns the first record after it, so the search skips the hole.
 
 | Request | Answer |
 | --- | --- |
-| A timestamp | The first record Iggy appended at or after it |
+| A timestamp | The first record whose timestamp is at or after it |
 | A timestamp past the last record, or any time on a partition that retains no message | No error, offset and timestamp `-1`, as Kafka answers |
 | A lookup that polls empty without proof that no record matches (below) | `NOT_LEADER_OR_FOLLOWER` (6), which clients retry |
 | `MAX_TIMESTAMP` (`-3`, a v7 sentinel, answered at every version) | The last record |
 | A negative time other than the sentinels | The first record, as on a Kafka broker |
 
-Iggy searches by the time it appended each batch, not by the producer timestamp. A Kafka broker
-searches a `CreateTime` topic by producer timestamps, so the two differ when producer clocks
-disagree with Iggy's or records arrive late: a record stamped earlier by its producer but
-appended after the time is found here and skipped there. With clocks in step the difference is
-the delay between send and append. `MAX_TIMESTAMP` is the last record for the same reason, where
-Kafka would name the record with the largest producer timestamp.
-
-The timestamp answered is the producer timestamp when one was set, while the search runs on
-append time. So on a `CreateTime` topic the answer can carry a timestamp earlier than the one
-asked for, which a Kafka broker never sends. Clients seek by the offset, but
-`OffsetAndTimestamp.timestamp()` shows the timestamp to applications as it is.
+The search is exact when timestamps do not decrease along the log, which holds for records stamped
+as they are written and for a backfill replayed in order. Where they go back and forth, it finds a
+record at or after the time whose neighbour in the search is before it, where a Kafka broker finds
+the first such record of the whole log. `MAX_TIMESTAMP` is the last record, where Kafka names the
+record with the largest timestamp.
 
 Iggy can poll empty while records remain: on a read fault, or before a partition seeds its commit
 point. In a cluster the polls can also reach a node behind the one the probe read, which serves a
-shorter tail. An empty lookup therefore answers `-1` only when:
-
-- a poll of the last record shows it was appended before the time and its offset + 1 reaches the
-  probed high watermark, so the polled node is not behind the probe; or
-- the probe counted no message and the poll of the last record comes back empty too.
-
-Otherwise it answers 6 and the client asks again, since a `-1` would make
-`kafka-consumer-groups --to-datetime` fall back to LATEST and skip the records.
+shorter tail. So a lookup reads the last record first, and answers 6 when it falls short of the
+probed high watermark, or when the poll is empty while the probe counted messages. An empty read
+inside the search answers 6 too. A `-1` would make `kafka-consumer-groups --to-datetime` fall back
+to LATEST and skip the records.
 
 The server reports a message count of 0 both when retention removed every message and when it has
 no stats for the partition, with the high watermark above 0 in both. So a count of 0 alone answers
-nothing, and the lookup polls. When both polls come back empty as well, it answers `-1`, as Kafka
-does for a partition that retains nothing. A node that has no stats for a partition and also polls
-it empty while it holds records answers `-1` too: nothing the probe or the polls return tells the
-two apart, and answering 6 instead would never let a reset by time finish on an expired partition.
-
-A partition Iggy is still loading can read `(messages_count, current_offset) == (0, 0)`, the same
-as an empty one, and the probe cannot tell them apart without a server-side signal. A lookup by
-time in that window still polls, and answers `-1` only when the polls come back empty as well. A
-reset by time there then moves to LATEST.
+nothing, and the lookup polls. When the poll of the last record comes back empty as well, it
+answers `-1`, as Kafka does for a partition that retains nothing. A node that has no stats for a
+partition and also polls it empty while it holds records answers `-1` too: nothing the probe or
+the polls return tells the two apart.
 
 The lookups by time of one request share one Fetch read slot, however many partitions the request
 names, and up to 8 run at once. Each poll gets the time of a Fetch poll, 2 s or more for a
@@ -363,13 +366,23 @@ partition and time are looked up once.
 
 ### Header order
 
-Kafka carries record headers as an ordered list. Iggy keys them in a `BTreeMap`, so Fetch emits
-them sorted by name and the producer's order is gone.
+Kafka carries record headers as an ordered list. Iggy keys them in a `BTreeMap`, so a record
+stored natively comes back with its headers sorted by name.
 
-There is no fallback for this, because the gateway cannot tell whether a record's header order
-carries meaning. The envelope does preserve order, since it stores the headers as a list, but a
-record only reaches the envelope for one of the reasons above. A consumer that depends on header
-order therefore sees a different order through the gateway than a real broker would give it.
+When the producer's order is not that sorted order, Produce adds a `kafka.ho` header: one byte
+per header, in send order, each the header's rank in name order. `[2, 0, 1]` on headers sent as
+`zulu, alpha, mike` says the first header sent is the third by name. Fetch reorders by it. The
+common record, with no headers, one header or headers already in name order, carries no
+`kafka.ho` and pays nothing.
+
+One byte ranks at most 255 headers, which is also one header value's cap. A record with more
+headers than that, out of order, takes the envelope, which stores the headers as a list and so
+keeps any order.
+
+A `kafka.ho` that is not a permutation of the record's stored headers fails Fetch with
+`INVALID_RECORD`, like any other malformed marker on a message that says the gateway wrote it.
+A gateway built before `kafka.ho` existed ignores it and serves the headers sorted by name; the
+mapping version stays `1`, because nothing an older build reads changed meaning.
 
 ### Header name collisions
 
@@ -378,14 +391,11 @@ An Iggy header key is bytes plus a kind, and the key orders on kind before bytes
 different kinds are therefore two stored headers. A Kafka header name is a string, so both map to
 one name.
 
-Kafka carries headers as a list and holds both. A `kafka_protocol` `Record` keys them in an
-`IndexMap`, so nothing here keeps the pair, and the later key in stored order wins.
+Kafka carries headers as a list and holds both. On a message an Iggy client wrote, Fetch serves
+both, in stored key order, through the same full-list path a repeated Kafka name takes.
 
 On a message the gateway wrote this cannot happen, because `to_iggy` writes one key kind. Fetch
-therefore refuses such a message, rather than dropping a header from it quietly. On a message an
-Iggy client wrote it can happen, and Fetch keeps one header and loses the other. Refusing that
-message lets one Iggy writer stall the partition for every Kafka consumer of it, which is the
-worse of the two.
+therefore refuses such a message rather than guess which of the two is the header it wrote.
 
 ## Partitioning
 

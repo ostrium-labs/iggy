@@ -829,7 +829,9 @@ async fn given_every_supported_version_when_fetching_should_decode() {
         assert_eq!(partition.error_code, ERROR_NONE, "v{version}");
         assert_eq!(partition.high_watermark, 2, "v{version}");
         assert_eq!(partition.last_stable_offset, 2, "v{version}");
-        assert_eq!(partition.log_start_offset, UNKNOWN_OFFSET, "v{version}");
+        // v5 is the first version that carries log_start_offset; below it the decoder's default.
+        let log_start = if version >= 5 { 0 } else { UNKNOWN_OFFSET };
+        assert_eq!(partition.log_start_offset, log_start, "v{version}");
         assert_eq!(offsets(partition), vec![0, 1], "v{version}");
         assert_eq!(
             values(partition),

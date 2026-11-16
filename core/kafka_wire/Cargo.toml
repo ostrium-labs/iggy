@@ -33,6 +33,8 @@ publish = false
 # Required by kafka-protocol: its custom-decompression hook is typed on anyhow::Result.
 anyhow = { workspace = true }
 bytes = { workspace = true }
+# Repairs the CRC of a batch header after Fetch rewrites its records.
+crc32c = { workspace = true }
 # The four codecs are driven from `records::decompress` rather than through kafka-protocol,
 # whose decompressors materialize the whole stream before a budget can see it.
 flate2 = { workspace = true }
@@ -46,8 +48,6 @@ thiserror = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
-# Repairs the CRC of a batch header a test rewrote, which the decoder checks first.
-crc32c = { workspace = true }
 # The client half, so a test encodes requests the way a Kafka client does.
 kafka-protocol = { workspace = true, features = ["client"] }
 

@@ -57,7 +57,8 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::{PROBE_INTERVAL, Snapshot, recent};
 use crate::records::{
-    BATCH_HEADER_BYTES, RecordCodecError, encode_batch, from_iggy, record_size_bound,
+    BATCH_HEADER_BYTES, RecordCodecError, RepeatedHeaders, encode_batch_with, from_iggy_with,
+    record_size_bound_with,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -248,6 +249,7 @@ async fn fetch(
         // Kafka reads again when the wait ends, too.
         (answers, slot) = fetch.read(&probes).await;
     }
+    fetch.stamp_log_starts(&probes, &mut answers);
     (group(request, &fetch.wanted, answers), slot)
 }
 
@@ -553,6 +555,37 @@ impl<'a> Fetch<'a> {
     async fn read(&self, probes: &Probes) -> (Vec<PartitionData>, Option<FetchSlot>) {
         Reader::new(self).read_all(probes).await
     }
+
+    /// The `DeleteRecords` watermark of `partition` of `topic`: the probe's, or a later one this
+    /// gateway wrote or read.
+    fn deleted_below(&self, topic: &str, partition: u32, probe: Option<PartitionProbe>) -> u64 {
+        let probed = probe.map_or(0, |probe| probe.deleted_below);
+        probed.max(self.bridge.deleted_below(topic, partition))
+    }
+
+    /// Sets `log_start_offset` on each answer that served, from its probe. See
+    /// [`PartitionProbe::log_start`]. -1 where neither the count nor a watermark tells it.
+    fn stamp_log_starts(&self, probes: &Probes, answers: &mut [PartitionData]) {
+        for (want, answer) in self.wanted.iter().zip(answers) {
+            if answer.error_code != ERROR_NONE {
+                continue;
+            }
+            let Ok(at) = want.probe_at else {
+                continue;
+            };
+            let probe = probes[at.topic]
+                .as_ref()
+                .ok()
+                .and_then(|in_hand| in_hand.probe.get(at.index));
+            let deleted_below = self.deleted_below(want.topic, at.index, probe);
+            let start = match probe.and_then(|probe| probe.log_start()) {
+                Some(start) => start.max(deleted_below),
+                None if deleted_below > 0 => deleted_below,
+                None => continue,
+            };
+            answer.log_start_offset = i64::try_from(start).unwrap_or(UNKNOWN_OFFSET);
+        }
+    }
 }
 
 /// One requested partition.
@@ -739,8 +772,12 @@ fn position(want: &Wanted<'_>, probes: &Probes) -> Position {
     if probe.is_loading() {
         return Position::Loading { at, offset, probe };
     }
-    // Below the oldest retained offset is in range: Iggy reads from the first retained message,
-    // and Kafka consumers accept the gap.
+    // Below the `DeleteRecords` watermark is out of range, as below Kafka's log start offset. A
+    // read below the oldest retained offset finds the first retained message, which
+    // `Reader::read` answers out of range too.
+    if offset < probe.deleted_below {
+        return Position::Refused(ERROR_OFFSET_OUT_OF_RANGE);
+    }
     if offset == probe.high_watermark && !stale {
         Position::CaughtUp { at, probe }
     } else if offset < probe.high_watermark && probe.messages_count > 0 {
@@ -894,6 +931,16 @@ impl<'a> Reader<'a> {
     /// Past the grace a poll decides a load, so counters that drifted cannot stall a consumer.
     fn place(&self, want: &Wanted<'_>, probes: &Probes) -> Position {
         let position = position(want, probes);
+        // A `DeleteRecords` this gateway answered after the probe was taken.
+        if let Position::CaughtUp { at, .. }
+        | Position::Behind { at, .. }
+        | Position::Unsure { at, .. }
+        | Position::Loading { at, .. } = position
+            && u64::try_from(want.fetch_offset)
+                .is_ok_and(|offset| offset < self.fetch.deleted_below(want.topic, at.index, None))
+        {
+            return Position::Refused(ERROR_OFFSET_OUT_OF_RANGE);
+        }
         if let Position::Loading { at, .. } = position
             && self.fetch.loading(want.topic, at.index)
         {
@@ -1056,6 +1103,12 @@ impl<'a> Reader<'a> {
             }
         }
 
+        if starts_past(&polled.messages, offset) {
+            // Retention removed the offsets from `offset` to the first record kept, so `offset` is
+            // below the log start offset. Iggy keeps offsets dense, so no other gap starts a read.
+            // Log compaction (apache/iggy#4521) must keep this to reads below the first record.
+            return Read::Done(refused(want.partition, ERROR_OFFSET_OUT_OF_RANGE));
+        }
         let keep_one = self.owes_first_record;
         let encoded = off_worker(polled.bytes >= CODEC_OFF_WORKER_BYTES, || {
             encode_records(&polled.messages, offset, budget, keep_one)
@@ -2396,6 +2449,7 @@ fn encode_records(
     keep_one: bool,
 ) -> core::result::Result<Bytes, RecordCodecError> {
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
+    let mut repeated = RepeatedHeaders::new();
     let mut size = BATCH_HEADER_BYTES;
     for message in messages
         .iter()
@@ -2404,19 +2458,31 @@ fn encode_records(
         let Ok(kafka_offset) = i64::try_from(message.header.offset) else {
             break;
         };
-        let record = match from_iggy(message, kafka_offset) {
-            Ok(record) => record,
+        let (record, headers) = match from_iggy_with(message, kafka_offset) {
+            Ok(decoded) => decoded,
             Err(error) if records.is_empty() => return Err(error),
             // The next Fetch starts at this message and reports it.
             Err(_) => break,
         };
-        size = size.saturating_add(record_size_bound(&record));
+        size = size.saturating_add(record_size_bound_with(&record, headers.as_deref()));
         if size > budget && !(keep_one && records.is_empty()) {
             break;
         }
+        if let Some(headers) = headers {
+            repeated.push((records.len(), headers));
+        }
         records.push(record);
     }
-    encode_batch(&mut records)
+    encode_batch_with(&mut records, &repeated)
+}
+
+/// Whether the first of `messages` at or past `offset` comes after it: the read found no record at
+/// `offset`.
+fn starts_past(messages: &[IggyMessage], offset: u64) -> bool {
+    messages
+        .iter()
+        .find(|message| message.header.offset >= offset)
+        .is_some_and(|message| message.header.offset > offset)
 }
 
 /// The Fetch code for a bridge error.
@@ -2552,6 +2618,7 @@ mod tests {
             high_watermark,
             average_size,
             messages_count: if average_size == 0 { 0 } else { high_watermark },
+            deleted_below: 0,
         }
     }
 
@@ -3047,6 +3114,7 @@ mod tests {
             high_watermark: 1,
             average_size: 10,
             messages_count: 50,
+            deleted_below: 0,
         };
         let probes = probes(&[(0, reloading)]);
         for offset in [0, 1, 500] {
@@ -3120,6 +3188,7 @@ mod tests {
             high_watermark: 1,
             average_size: 10,
             messages_count: 50,
+            deleted_below: 0,
         };
         assert_eq!(empty_poll(10, before, Some(loading)), EmptyPoll::Loading);
         assert_eq!(
